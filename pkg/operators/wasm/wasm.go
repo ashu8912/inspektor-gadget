@@ -227,6 +227,14 @@ func (i *wasmOperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 
 	env.NewFunctionBuilder().
 		WithGoModuleFunction(
+			wapi.GoModuleFunc(i.fieldAccessorGetUint32),
+			[]wapi.ValueType{wapi.ValueTypeI32, wapi.ValueTypeI32}, // Accessor, Data
+			[]wapi.ValueType{wapi.ValueTypeI32},                    // Uint32
+		).
+		Export("fieldAccessorGetUint32")
+
+	env.NewFunctionBuilder().
+		WithGoModuleFunction(
 			wapi.GoModuleFunc(i.fieldAccessorSetString),
 			[]wapi.ValueType{wapi.ValueTypeI32, wapi.ValueTypeI32, wapi.ValueTypeI64}, // Accessor, Data
 			[]wapi.ValueType{},

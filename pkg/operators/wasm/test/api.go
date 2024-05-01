@@ -78,6 +78,9 @@ func dataSourceAddField(ds DataSource, name String) Field
 //export fieldAccessorGetString
 func fieldAccessorGetString(acc Field, data Data) String
 
+//export fieldAccessorGetUint32
+func fieldAccessorGetUint32(acc Field, data Data) uint32
+
 //export fieldAccessorSetString
 func fieldAccessorSetString(acc Field, data Data, str String)
 
@@ -136,6 +139,10 @@ func (f Field) String(data Data) (res string) {
 	res = str.String()
 	str.Free()
 	return
+}
+
+func (f Field) Uint32(data Data) uint32 {
+	return fieldAccessorGetUint32(f, data)
 }
 
 func (f Field) SetString(data Data, str string) {

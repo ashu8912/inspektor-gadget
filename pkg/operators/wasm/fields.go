@@ -22,6 +22,40 @@ import (
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
 )
 
+func (i *wasmOperatorInstance) fieldAccessorGetUint32(_ context.Context, _ wapi.Module, stack []uint64) {
+	acc, ok := i.getFromMemMap(wapi.DecodeU32(stack[0])).(datasource.FieldAccessor)
+	if !ok {
+		stack[0] = 0
+		i.gadgetCtx.Logger().Warnf("accessor not present")
+		return
+	}
+	data, ok := i.getFromMemMap(wapi.DecodeU32(stack[1])).(datasource.Data)
+	if !ok {
+		stack[0] = 0
+		i.gadgetCtx.Logger().Warnf("data not present")
+		return
+	}
+
+	ret := acc.Uint32(data)
+
+	//malloc := m.ExportedFunction("malloc")
+	//res, err := malloc.Call(ctx, uint64(len(bytes)))
+	//if err != nil {
+	//	i.gadgetCtx.Logger().Warnf("malloc failed: %v", err)
+	//	stack[0] = 0
+	//	return
+	//}
+
+	//if !m.Memory().Write(uint32(res[0]), bytes) {
+	//	// log.Panicf("out of range of memory size")
+	//	stack[0] = 0
+	//	return
+	//}
+
+	//stack[0] = uint64(len(bytes))<<32 | uint64(res[0])
+	stack[0] = uint64(ret)
+}
+
 func (i *wasmOperatorInstance) fieldAccessorGetString(ctx context.Context, m wapi.Module, stack []uint64) {
 	acc, ok := i.getFromMemMap(wapi.DecodeU32(stack[0])).(datasource.FieldAccessor)
 	if !ok {

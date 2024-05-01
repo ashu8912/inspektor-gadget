@@ -67,7 +67,10 @@ require (
 	sigs.k8s.io/yaml v1.4.0
 )
 
-require github.com/google/gopacket v1.1.19
+require (
+	github.com/google/gopacket v1.1.19
+	github.com/tetratelabs/wazero v1.7.1
+)
 
 require (
 	github.com/AdaLogics/go-fuzz-headers v0.0.0-20230811130428-ced1acdcaa24 // indirect
