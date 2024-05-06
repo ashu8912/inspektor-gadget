@@ -71,6 +71,7 @@ require (
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/google/gopacket v1.1.19
 	github.com/sigstore/sigstore v1.8.3
+	github.com/tetratelabs/wazero v1.7.1
 )
 
 require (
