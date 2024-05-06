@@ -54,7 +54,7 @@ struct event_t {
 
 	__u64 latency_ns; // Set only if qr is 1 (response) and pkt_type is 0 (Host).
 
-	__u8 name[MAX_DNS_NAME];
+	char name[MAX_DNS_NAME];
 
 	__u16 ancount;
 	__u16 anaddrcount;

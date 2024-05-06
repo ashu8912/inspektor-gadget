@@ -1,2 +1,2 @@
-github.com/wapc/wapc-guest-tinygo v0.3.3 h1:jLebiwjVSHLGnS+BRabQ6+XOV7oihVWAc05Hf1SbeR0=
-github.com/wapc/wapc-guest-tinygo v0.3.3/go.mod h1:mzM3CnsdSYktfPkaBdZ8v88ZlfUDEy5Jh5XBOV3fYcw=
+github.com/mauriciovasquezbernal/inspektor-gadget v0.27.1-0.20240503022722-7261f01b725f h1:qCl22RZNpNGlzj2uLdHCBogEWORoCquxahOrbVl4sYU=
+github.com/mauriciovasquezbernal/inspektor-gadget v0.27.1-0.20240503022722-7261f01b725f/go.mod h1:LpZ5jfxOZnfxuaI+mdBqc4Sw8TV7WiQ7CxRJg6RFVAU=
