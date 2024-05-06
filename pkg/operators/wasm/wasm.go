@@ -103,6 +103,8 @@ func (i *wasmOperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 
 	env := i.rt.NewHostModuleBuilder("env")
 
+	i.addLogFuncs(env)
+
 	if _, err := env.Instantiate(ctx); err != nil {
 		return fmt.Errorf("instantiating host module: %w", err)
 	}
