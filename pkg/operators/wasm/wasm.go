@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -57,6 +58,7 @@ func (w *wasmOperator) InstantiateImageOperator(
 	return &wasmOperatorInstance{
 		desc:      desc,
 		gadgetCtx: gadgetCtx,
+		handleMap: map[uint32]any{},
 		logger:    gadgetCtx.Logger(),
 	}, nil
 }
@@ -71,6 +73,13 @@ type wasmOperatorInstance struct {
 
 	// malloc function exported by the guest
 	guestMalloc wapi.Function
+
+	dsCallback wapi.Function
+
+	// Golang objects are exposed to the wasm module by using a handleID
+	handleMap  map[uint32]any
+	handleCtr  uint32
+	handleLock sync.RWMutex
 }
 
 func (i *wasmOperatorInstance) Name() string {
@@ -94,6 +103,44 @@ func (i *wasmOperatorInstance) ExtraParams(gadgetCtx operators.GadgetContext) ap
 	return nil
 }
 
+func (i *wasmOperatorInstance) addHandle(obj any) uint32 {
+	if obj == nil {
+		return 0
+	}
+
+	i.handleLock.Lock()
+	defer i.handleLock.Unlock()
+	i.handleCtr++
+	if i.handleCtr == 0 { // 0 is reserved
+		i.handleCtr++
+	}
+	xctr := 0
+	for {
+		if xctr > 1<<32 {
+			// exhausted; TODO: report somehow
+			return 0
+		}
+		if _, ok := i.handleMap[i.handleCtr]; !ok {
+			// register new entry
+			i.handleMap[i.handleCtr] = obj
+			return i.handleCtr
+		}
+		xctr++
+	}
+}
+
+func (i *wasmOperatorInstance) getHandle(handleID uint32) any {
+	i.handleLock.RLock()
+	defer i.handleLock.RUnlock()
+	return i.handleMap[handleID]
+}
+
+func (i *wasmOperatorInstance) delHandle(handleID uint32) {
+	i.handleLock.Lock()
+	defer i.handleLock.Unlock()
+	delete(i.handleMap, handleID)
+}
+
 func (i *wasmOperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 	ctx := gadgetCtx.Context()
 	rtConfig := wazero.NewRuntimeConfig().
@@ -104,6 +151,7 @@ func (i *wasmOperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 	env := i.rt.NewHostModuleBuilder("env")
 
 	i.addLogFuncs(env)
+	i.addDataSourceFuncs(env)
 
 	if _, err := env.Instantiate(ctx); err != nil {
 		return fmt.Errorf("instantiating host module: %w", err)
@@ -135,6 +183,8 @@ func (i *wasmOperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 	if i.guestMalloc == nil {
 		return errors.New("wasm module doesn't export malloc")
 	}
+
+	i.dsCallback = mod.ExportedFunction("dsCallback")
 
 	return err
 }
@@ -170,6 +220,12 @@ func (i *wasmOperatorInstance) Start(gadgetCtx operators.GadgetContext) error {
 }
 
 func (i *wasmOperatorInstance) Stop(gadgetCtx operators.GadgetContext) error {
+	defer func() {
+		i.handleLock.Lock()
+		i.handleMap = nil
+		i.handleLock.Unlock()
+	}()
+
 	fn := i.mod.ExportedFunction("stop")
 	if fn == nil {
 		return nil
