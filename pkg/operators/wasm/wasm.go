@@ -152,6 +152,7 @@ func (i *wasmOperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 
 	i.addLogFuncs(env)
 	i.addDataSourceFuncs(env)
+	i.addFieldFuncs(env)
 
 	if _, err := env.Instantiate(ctx); err != nil {
 		return fmt.Errorf("instantiating host module: %w", err)
