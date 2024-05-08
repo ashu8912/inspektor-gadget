@@ -138,20 +138,28 @@ func (i *wasmOperatorInstance) fieldAccessorSet(ctx context.Context, m wapi.Modu
 
 	switch api.Kind(stack[2]) {
 	case api.Kind_Int8:
+		acc.Set(data, make([]byte, 1))
 		acc.PutInt8(data, int8(stack[3]))
 	case api.Kind_Int16:
+		acc.Set(data, make([]byte, 2))
 		acc.PutInt16(data, int16(stack[3]))
 	case api.Kind_Int32:
+		acc.Set(data, make([]byte, 4))
 		acc.PutInt32(data, int32(stack[3]))
 	case api.Kind_Int64:
+		acc.Set(data, make([]byte, 8))
 		acc.PutInt64(data, int64(stack[3]))
 	case api.Kind_Uint8:
+		acc.Set(data, make([]byte, 1))
 		acc.PutUint8(data, uint8(stack[3]))
 	case api.Kind_Uint16:
+		acc.Set(data, make([]byte, 2))
 		acc.PutUint16(data, uint16(stack[3]))
 	case api.Kind_Uint32:
+		acc.Set(data, make([]byte, 4))
 		acc.PutUint32(data, uint32(stack[3]))
 	case api.Kind_Uint64:
+		acc.Set(data, make([]byte, 8))
 		acc.PutUint64(data, uint64(stack[3]))
 	case api.Kind_String:
 		str, err := stringFromStack(m, stack[3])
