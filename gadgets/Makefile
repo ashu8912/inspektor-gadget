@@ -1,5 +1,7 @@
 SHELL := /bin/bash
 
+ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+
 GADGET_TAG ?= $(shell ../tools/image-tag branch)
 GADGET_REPOSITORY ?= ghcr.io/inspektor-gadget/gadget
 BUILDER_IMAGE ?= ghcr.io/inspektor-gadget/ebpf-builder:latest
@@ -34,7 +36,9 @@ build: $(GADGETS)
 .PHONY: $(GADGETS)
 $(GADGETS):
 	@echo "Building $@"
-	@sudo -E IG_EXPERIMENTAL=true $(IG) image build \
+	@sudo -E IG_EXPERIMENTAL=true \
+		INSPEKTOR_GADGET_PATH=$(shell realpath $(ROOT_DIR)/..) \
+		$(IG) image build \
 		--builder-image $(BUILDER_IMAGE) \
 		-t $(GADGET_REPOSITORY)/$@:$(GADGET_TAG) \
 		$$GADGET_BUILD_PARAMS \
