@@ -42,6 +42,7 @@ func main() {
 		Use:   filepath.Base(os.Args[0]),
 		Short: "Collection of gadgets for containers",
 	}
+	common.AddConfigHandling(rootCmd)
 	common.AddVerboseFlag(rootCmd)
 
 	skipInfo := false

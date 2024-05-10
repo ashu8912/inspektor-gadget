@@ -57,6 +57,7 @@ func main() {
 		log.Info("Experimental features enabled")
 	}
 
+	common.AddConfigHandling(rootCmd)
 	common.AddVerboseFlag(rootCmd)
 
 	// Some commands don't need the gadget namespace. Run then before to avoid

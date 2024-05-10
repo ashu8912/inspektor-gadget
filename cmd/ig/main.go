@@ -58,6 +58,7 @@ func main() {
 		Use:   "ig",
 		Short: "Collection of gadgets for containers",
 	}
+	common.AddConfigHandling(rootCmd)
 	common.AddVerboseFlag(rootCmd)
 
 	host.AddFlags(rootCmd)
