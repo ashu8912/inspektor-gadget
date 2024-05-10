@@ -57,6 +57,7 @@ import (
 	seccompprofileapi "sigs.k8s.io/security-profiles-operator/api/seccompprofile/v1beta1"
 	"sigs.k8s.io/yaml"
 
+	"github.com/inspektor-gadget/inspektor-gadget/cmd/common"
 	commonutils "github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
 	"github.com/inspektor-gadget/inspektor-gadget/cmd/kubectl-gadget/utils"
 	"github.com/inspektor-gadget/inspektor-gadget/internal/version"
@@ -227,6 +228,9 @@ func init() {
 	deployCmd.PersistentFlags().StringVarP(
 		&publicKey,
 		"public-key", "", resources.InspektorGadgetPublicKey, "Public key used to verify the container image")
+	// this will override the parent PersistentPreRunE function regarding config handling
+	// to ensure all the deploy flags can also be set via config file
+	common.AddConfigHandling(deployCmd)
 	rootCmd.AddCommand(deployCmd)
 }
 

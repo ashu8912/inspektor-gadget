@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 
+	"github.com/inspektor-gadget/inspektor-gadget/cmd/common"
 	commonutils "github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
 	"github.com/inspektor-gadget/inspektor-gadget/cmd/kubectl-gadget/utils"
 	"github.com/inspektor-gadget/inspektor-gadget/internal/deployinfo"
@@ -62,6 +63,9 @@ var clusterImagePolicyResource = schema.GroupVersionResource{
 }
 
 func init() {
+	// this will override the parent PersistentPreRunE function regarding config handling
+	// to ensure all the undeploy flags can also be set via config file
+	common.AddConfigHandling(deployCmd)
 	rootCmd.AddCommand(undeployCmd)
 	undeployCmd.PersistentFlags().BoolVarP(
 		&undeployWait,
