@@ -1363,6 +1363,7 @@ jobs:
       - build-ig
       - build-helper-images
       - build-and-push-gadgets
+      - check-secrets
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -1390,6 +1391,7 @@ jobs:
     - name: Gadgets tests
       run: |
           make \
+          GADGET_VERIFY_IMAGE=${{ needs.check-secrets.outputs.cosign }} \
           GADGET_REPOSITORY=${{ steps.set-repo-determine-image-tag.outputs.gadget-repository }} \
           GADGET_TAG=${{ steps.set-repo-determine-image-tag.outputs.gadget-tag }} \
           -C gadgets/ test -o build
