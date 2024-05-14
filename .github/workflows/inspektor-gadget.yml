@@ -715,7 +715,6 @@ jobs:
     if: github.event_name != 'pull_request'
     needs:
       - build-gadget-container-images
-      - public-key-check
       - check-secrets
     runs-on: ubuntu-latest
     permissions:
@@ -1229,11 +1228,12 @@ jobs:
     # to secrets.
     # Also, unless specified in the secrets configuration, dependabot cannot access
     # to secrets.
-    # So, we skip this job when run by dependabot and from a PR coming from a
-    # fork.
+    # So, this job will be skipped when run by dependabot (if no secrets configured) and
+    # from a PR coming from a fork.
     # We still need to run this job on push, otherwise it will not be run when
-    # we merge something on main.
-    if: github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') && needs.check-secrets.outputs.cosign == 'true'
+    # we merge something on main. Also, we ensure this job will always run on
+    # for 'inspektor-gadget/inspektor-gadget' respository
+    if: needs.check-secrets.outputs.cosign == 'true' || (github.event_name == 'push' && github.repository == 'inspektor-gadget/inspektor-gadget')
     steps:
       - uses: actions/checkout@v4
       - name: Install Cosign
@@ -1303,7 +1303,6 @@ jobs:
       - build-ig
       - build-helper-images
       - check-secrets
-      - public-key-check
     runs-on: ubuntu-latest
     permissions:
       # allow publishing container image
@@ -1885,6 +1884,7 @@ jobs:
       - check-secrets
       - scan-gadget-container-images
       - publish-gadget-images-manifest
+      - public-key-check
     runs-on: ubuntu-latest
     permissions:
       contents: write
