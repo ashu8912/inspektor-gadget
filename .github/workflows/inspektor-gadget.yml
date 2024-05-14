@@ -1782,6 +1782,7 @@ jobs:
       - build-gadget-container-images
       - build-helper-images
       - build-and-push-gadgets
+      - check-secrets
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -1825,6 +1826,7 @@ jobs:
         dnstester_image: ${{ needs.build-helper-images.outputs.dnstester_image }}
         gadget_repository: ${{ steps.set-repo-determine-image-tag.outputs.gadget-repository }}
         gadget_tag: ${{ steps.set-repo-determine-image-tag.outputs.gadget-tag }}
+        gadget_verify_image: ${{ needs.check-secrets.outputs.cosign }}
         test_summary_suffix: ${{ matrix.runtime }}
     - if: ${{ matrix.runtime == 'docker' }}
       name: Check that README is up-to-date

@@ -107,7 +107,7 @@ func TestRunTraceMount(t *testing.T) {
 		RunTestSteps(commands, t, WithCbBeforeCleanup(PrintLogsFn(ns)))
 	})
 
-	cmd := fmt.Sprintf("$KUBECTL_GADGET run %s/trace_mount:%s -n %s -o json", *gadgetRepository, *gadgetTag, ns)
+	cmd := fmt.Sprintf("$KUBECTL_GADGET run %s/trace_mount:%s --verify-image=%t -n %s -o json", *gadgetRepository, *gadgetTag, *gadgetVerifyImage, ns)
 
 	runTraceMount(t, ns, cmd)
 }
