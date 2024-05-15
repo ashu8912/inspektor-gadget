@@ -27,6 +27,7 @@ import (
 	"github.com/tetratelabs/wazero"
 	wapi "github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
+	"oras.land/oras-go/v2"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
@@ -50,12 +51,14 @@ func (w *wasmOperator) Description() string {
 
 func (w *wasmOperator) InstantiateImageOperator(
 	gadgetCtx operators.GadgetContext,
+	target oras.ReadOnlyTarget,
 	desc ocispec.Descriptor,
 	paramValues api.ParamValues,
 ) (
 	operators.ImageOperatorInstance, error,
 ) {
 	return &wasmOperatorInstance{
+		target:    target,
 		desc:      desc,
 		gadgetCtx: gadgetCtx,
 		handleMap: map[uint32]any{},
@@ -64,6 +67,7 @@ func (w *wasmOperator) InstantiateImageOperator(
 }
 
 type wasmOperatorInstance struct {
+	target    oras.ReadOnlyTarget
 	desc      ocispec.Descriptor
 	rt        wazero.Runtime
 	gadgetCtx operators.GadgetContext
@@ -162,7 +166,7 @@ func (i *wasmOperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 		return fmt.Errorf("instantiating WASI: %w", err)
 	}
 
-	reader, err := oci.GetContentFromDescriptor(gadgetCtx.Context(), i.desc)
+	reader, err := oci.GetContentFromDescriptor(gadgetCtx.Context(), i.target, i.desc)
 	if err != nil {
 		return fmt.Errorf("getting wasm program: %w", err)
 	}
