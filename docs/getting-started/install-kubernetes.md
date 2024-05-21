@@ -25,6 +25,7 @@ description: >
 - [Installing `ig`](#installing-ig)
   - [Install a specific release](#install-a-specific-release-1)
   - [Compile from source](#compile-from-source-1)
+  - [Using ig without installation](#using-ig-without-installation)
 - [Experimental features](#experimental-features)
 <!-- /toc -->
 
@@ -269,6 +270,20 @@ about installing dependencies:
 $ make ig
 $ sudo cp ig /usr/local/bin/
 ```
+
+### Using ig without installation
+
+It is also possible to use `ig` without installing it using [kubectl node debug](https://kubernetes.io/docs/tasks/debug/debug-cluster/kubectl-node-debug/):
+
+```bash
+$ kubectl debug node/minikube-docker -ti --image=ghcr.io/inspektor-gadget/ig -- ig --auto-sd-unit-restart trace exec
+Creating debugging pod node-debugger-minikube-docker-c2wfw with container debugger on node minikube-docker.
+If you don't see a command prompt, try pressing enter.
+RUNTIME.CONTAINERNAME          PID              PPID             COMM             RET ARGS
+k8s_shell_shell_default_b4ebb… 3186934          3186270          cat              0   /bin/cat file
+```
+
+For more information on how to use `ig` without installation, please refer to the [ig documentation](../ig.md#using-ig-with-kubectl-debug-node).
 
 ## Experimental features
 
