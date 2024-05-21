@@ -16,6 +16,7 @@ package image
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -34,6 +35,7 @@ import (
 
 func NewListCmd() *cobra.Command {
 	var noTrunc bool
+	var outputJSON bool
 	cmd := &cobra.Command{
 		Use:          "list",
 		Short:        "List gadget images on the host",
@@ -64,13 +66,22 @@ func NewListCmd() *cobra.Command {
 					return ""
 				})
 			}
-			formatter := textcolumns.NewFormatter(cols.GetColumnMap(), textcolumns.WithShouldTruncate(!noTrunc && isTerm))
-			formatter.WriteTable(cmd.OutOrStdout(), images)
+			if outputJSON {
+				bytes, err := json.Marshal(images)
+				if err != nil {
+					return fmt.Errorf("marshalling images to JSON: %w")
+				}
+				fmt.Fprint(cmd.OutOrStdout(), string(bytes))
+			} else {
+				formatter := textcolumns.NewFormatter(cols.GetColumnMap(), textcolumns.WithShouldTruncate(!noTrunc && isTerm))
+				formatter.WriteTable(cmd.OutOrStdout(), images)
+			}
 			return nil
 		},
 	}
 
 	cmd.Flags().BoolVar(&noTrunc, "no-trunc", false, "Don't truncate output, this option is only valid when used in a terminal")
+	cmd.Flags().BoolVar(&outputJSON, "json", false, "Output as JSON")
 
 	return utils.MarkExperimental(cmd)
 }
