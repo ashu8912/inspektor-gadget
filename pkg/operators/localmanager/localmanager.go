@@ -370,9 +370,24 @@ func (l *localManagerTrace) PreGadgetRun() error {
 		}
 
 		if host {
+			pidOne := uint32(1)
+			mntns, err := containerutils.GetMntNs(int(pidOne))
+			if err != nil {
+				return fmt.Errorf("getting mount namespace ID for host PID %d: %w", pidOne, err)
+			}
+
 			// We need to attach this fake container for gadget which rely only on the
-			// Attacher concept.
-			containers = append(containers, &containercollection.Container{Pid: 1})
+			// Attacher concept:
+			// * Network gadget will get the netns corresponding to PID 1 on their
+			//   own.
+			// * Others, like traceloop or advise seccomp-profile, need the mount
+			//   namespace ID to bet set.
+			fakeContainer := &containercollection.Container{
+				Pid:   pidOne,
+				Mntns: mntns,
+			}
+
+			containers = append(containers, fakeContainer)
 		}
 
 		for _, container := range containers {
@@ -401,9 +416,20 @@ func (l *localManagerTrace) PostGadgetRun() error {
 			}
 
 			if host {
+				pidOne := uint32(1)
+				mntns, err := containerutils.GetMntNs(int(pidOne))
+				if err != nil {
+					return fmt.Errorf("getting mount namespace ID for host PID %d: %w", pidOne, err)
+				}
+
+				fakeContainer := &containercollection.Container{
+					Pid:   pidOne,
+					Mntns: mntns,
+				}
+
 				// Reciprocal operation of attaching fake container with PID 1 which is
 				// needed by gadgets relying on the Attacher concept.
-				l.attacher.DetachContainer(&containercollection.Container{Pid: 1})
+				l.attacher.DetachContainer(fakeContainer)
 			}
 		}
 	}
