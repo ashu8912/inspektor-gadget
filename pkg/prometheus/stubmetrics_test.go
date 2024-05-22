@@ -45,13 +45,14 @@ func (s *stubMeterProvider) Meter(name string, opts ...metric.MeterOption) metri
 
 func NewStubMeter(t *testing.T) *stubMeter {
 	return &stubMeter{
-		t:                 t,
-		int64counters:     make(map[string]*stubInt64Counter),
-		float64counters:   make(map[string]*stubFloat64Counter),
-		int64gauges:       make(map[string]*stubInt64ObservableGauge),
-		float64gauges:     make(map[string]*stubFloat64ObservableGauge),
-		int64histograms:   make(map[string]*stubInt64Histogram),
-		float64histograms: make(map[string]*stubFloat64Histogram),
+		t:                       t,
+		int64counters:           make(map[string]*stubInt64Counter),
+		float64counters:         make(map[string]*stubFloat64Counter),
+		int64gauges:             make(map[string]*stubInt64ObservableGauge),
+		float64gauges:           make(map[string]*stubFloat64Gauge),
+		float64observablegauges: make(map[string]*stubFloat64ObservableGauge),
+		int64histograms:         make(map[string]*stubInt64Histogram),
+		float64histograms:       make(map[string]*stubFloat64Histogram),
 	}
 }
 
@@ -59,14 +60,15 @@ type stubMeter struct {
 	embedded.Meter
 	t *testing.T
 
-	int64counters     map[string]*stubInt64Counter
-	float64counters   map[string]*stubFloat64Counter
-	int64gauges       map[string]*stubInt64ObservableGauge
-	float64gauges     map[string]*stubFloat64ObservableGauge
-	int64histograms   map[string]*stubInt64Histogram
-	float64histograms map[string]*stubFloat64Histogram
-	callbacks         []metric.Callback
-	mu                sync.Mutex
+	int64counters           map[string]*stubInt64Counter
+	float64counters         map[string]*stubFloat64Counter
+	int64gauges             map[string]*stubInt64ObservableGauge
+	float64observablegauges map[string]*stubFloat64ObservableGauge
+	float64gauges           map[string]*stubFloat64Gauge
+	int64histograms         map[string]*stubInt64Histogram
+	float64histograms       map[string]*stubFloat64Histogram
+	callbacks               []metric.Callback
+	mu                      sync.Mutex
 }
 
 func (s *stubMeter) Int64Counter(name string, options ...metric.Int64CounterOption) (metric.Int64Counter, error) {
@@ -125,6 +127,17 @@ func (s *stubMeter) Float64Counter(name string, options ...metric.Float64Counter
 	return c, nil
 }
 
+func (s *stubMeter) Float64Gauge(name string, options ...metric.Float64GaugeOption) (metric.Float64Gauge, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c := &stubFloat64Gauge{
+		values: make(map[string]float64),
+	}
+	s.float64gauges[name] = c
+	return c, nil
+}
+
 func (s *stubMeter) Float64UpDownCounter(name string, options ...metric.Float64UpDownCounterOption) (metric.Float64UpDownCounter, error) {
 	return nil, nil
 }
@@ -155,7 +168,7 @@ func (s *stubMeter) Float64ObservableGauge(name string, options ...metric.Float6
 	c := &stubFloat64ObservableGauge{
 		values: make(map[string]float64),
 	}
-	s.float64gauges[name] = c
+	s.float64observablegauges[name] = c
 	return c, nil
 }
 
@@ -237,6 +250,14 @@ type stubInt64ObservableGauge struct {
 type stubFloat64ObservableGauge struct {
 	embedded.Float64ObservableGauge
 	metric.Float64Observable
+
+	values map[string]float64
+	mu     sync.Mutex
+}
+
+type stubFloat64Gauge struct {
+	embedded.Float64Gauge
+	metric.Float64
 
 	values map[string]float64
 	mu     sync.Mutex
