@@ -30,7 +30,18 @@ const (
 	TypeUndefined Type = iota
 	TypeSingle
 	TypeArray
-	TypeMetrics
+)
+
+type dsError string
+
+func (err dsError) Error() string {
+	return string(err)
+}
+
+const (
+	// ErrDiscard can be returned on subscription callbacks to tell the datasource to discard the entity (packet, array
+	// or single event, depending on the subscription)
+	ErrDiscard = dsError("discarded")
 )
 
 type Data interface {
@@ -53,6 +64,9 @@ type DataArray interface {
 
 	// Get returns the element at the given index
 	Get(int) Data
+
+	// Swap swaps two elements of the array by their index
+	Swap(i, j int)
 }
 
 type Packet interface {

@@ -1,9 +1,9 @@
 # Artifact Hub package metadata file
-version: 0.28.1
+version: 0.30.0
 name: "trace tcpdrop"
 category: monitoring-logging
 displayName: "trace tcpdrop"
-createdAt: "2024-03-25T14:32:05+01:00"
+createdAt: "2024-07-01T09:22:04Z"
 description: "trace TCP packets dropped by the kernel"
 logoURL: "https://inspektor-gadget.io/media/brand-icon.svg"
 license: ""

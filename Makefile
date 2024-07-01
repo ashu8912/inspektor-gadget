@@ -8,6 +8,7 @@ MINIKUBE ?= minikube
 KUBERNETES_DISTRIBUTION ?= ""
 GADGET_TAG ?= $(shell ./tools/image-tag branch)
 GADGET_REPOSITORY ?= ghcr.io/inspektor-gadget/gadget
+GADGET_VERIFY_IMAGE ?= true
 TEST_COMPONENT ?= inspektor-gadget
 
 GOHOSTOS ?= $(shell go env GOHOSTOS)
@@ -24,7 +25,7 @@ BPFTOOL ?= bpftool
 ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/' | sed 's/ppc64le/powerpc/' | sed 's/mips.*/mips/')
 
 # This version number must be kept in sync with CI workflow lint one.
-LINTER_VERSION ?= v1.54.2
+LINTER_VERSION ?= v1.59.0
 
 EBPF_BUILDER ?= ghcr.io/inspektor-gadget/ebpf-builder:latest
 
@@ -285,6 +286,7 @@ integration-tests: kubectl-gadget
 			-dnstester-image $(DNSTESTER_IMAGE) \
 			-gadget-repository $(GADGET_REPOSITORY) \
 			-gadget-tag $(GADGET_TAG) \
+			-gadget-verify-image=$(GADGET_VERIFY_IMAGE) \
 			-test-component $(TEST_COMPONENT) \
 			$$INTEGRATION_TESTS_PARAMS
 

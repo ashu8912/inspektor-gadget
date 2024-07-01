@@ -41,4 +41,10 @@ typedef __u64 gadget_timestamp;
 // as string.
 typedef __u32 gadget_signal;
 
+// gadget_syscall is used to represent a unix syscall. A field is automatically added that contains the name
+// as string.
+typedef __u64 gadget_syscall;
+
+typedef __u32 gadget_kernel_stack;
+
 #endif /* __TYPES_H */

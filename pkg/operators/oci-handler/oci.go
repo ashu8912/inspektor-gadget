@@ -41,6 +41,7 @@ const (
 	pullSecret            = "pull-secret"
 	verifyImage           = "verify-image"
 	publicKey             = "public-key"
+	allowedDigests        = "allowed-digests"
 )
 
 type ociHandler struct{}
@@ -112,6 +113,12 @@ func (o *ociHandler) InstanceParams() api.Params {
 			Description:  "Public key used to verify the image based gadget",
 			DefaultValue: resources.InspektorGadgetPublicKey,
 			TypeHint:     api.TypeString,
+		},
+		{
+			Key:         allowedDigests,
+			Title:       "Allowed Digests",
+			Description: "List of allowed digests, if image digest is not part of it, execution will be denied. By default, all digests are allowed",
+			TypeHint:    api.TypeString,
 		},
 	}
 }
@@ -186,23 +193,38 @@ func (o *OciHandlerInstance) init(gadgetCtx operators.GadgetContext) error {
 			VerifyPublicKey: o.ociParams.Get(verifyImage).AsBool(),
 			PublicKey:       o.ociParams.Get(publicKey).AsString(),
 		},
+		AllowedDigestsOptions: oci.AllowedDigestsOptions{
+			AllowedDigests: o.ociParams.Get(allowedDigests).AsStringSlice(),
+		},
 	}
 
-	// Make sure the image is available, either through pulling or by just accessing a local copy
-	// TODO: add security constraints (e.g. don't allow pulling - add GlobalParams for that)
-	err := oci.EnsureImage(gadgetCtx.Context(), gadgetCtx.ImageName(), imgOpts, o.ociParams.Get(pullParam).AsString())
-	if err != nil {
-		return fmt.Errorf("ensuring image: %w", err)
+	target := gadgetCtx.OrasTarget()
+	// If the target wasn't explicitly set, use the local store. In this case we
+	// need to be sure the image is available.
+	if target == nil {
+		var err error
+		target, err = oci.GetLocalOciStore()
+		if err != nil {
+			return fmt.Errorf("getting local oci store: %w", err)
+		}
+
+		// Make sure the image is available, either through pulling or by just accessing a local copy
+		// TODO: add security constraints (e.g. don't allow pulling - add GlobalParams for that)
+		err = oci.EnsureImage(gadgetCtx.Context(), gadgetCtx.ImageName(),
+			imgOpts, o.ociParams.Get(pullParam).AsString())
+		if err != nil {
+			return fmt.Errorf("ensuring image: %w", err)
+		}
 	}
 
-	manifest, err := oci.GetManifestForHost(gadgetCtx.Context(), gadgetCtx.ImageName())
+	manifest, err := oci.GetManifestForHost(gadgetCtx.Context(), target, gadgetCtx.ImageName())
 	if err != nil {
 		return fmt.Errorf("getting manifest: %w", err)
 	}
 
 	log := gadgetCtx.Logger()
 
-	r, err := oci.GetContentFromDescriptor(gadgetCtx.Context(), manifest.Config)
+	r, err := oci.GetContentFromDescriptor(gadgetCtx.Context(), target, manifest.Config)
 	if err != nil {
 		return fmt.Errorf("getting metadata: %w", err)
 	}
@@ -219,7 +241,6 @@ func (o *OciHandlerInstance) init(gadgetCtx operators.GadgetContext) error {
 	viper := viper.New()
 	viper.SetConfigType("yaml")
 	err = viper.ReadConfig(bytes.NewReader(metadata))
-
 	if err != nil {
 		return fmt.Errorf("unmarshalling metadata: %w", err)
 	}
@@ -234,7 +255,7 @@ func (o *OciHandlerInstance) init(gadgetCtx operators.GadgetContext) error {
 		}
 
 		log.Debugf("found image op %q", op.Name())
-		opInst, err := op.InstantiateImageOperator(gadgetCtx, layer, o.paramValues.ExtractPrefixedValues(op.Name()))
+		opInst, err := op.InstantiateImageOperator(gadgetCtx, target, layer, o.paramValues.ExtractPrefixedValues(op.Name()))
 		if err != nil {
 			log.Errorf("instantiating operator %q: %v", op.Name(), err)
 		}
@@ -253,8 +274,7 @@ func (o *OciHandlerInstance) init(gadgetCtx operators.GadgetContext) error {
 	for _, opInst := range o.imageOperatorInstances {
 		err := opInst.Prepare(o.gadgetCtx)
 		if err != nil {
-			o.gadgetCtx.Logger().Errorf("preparing operator %q: %v", opInst.Name(), err)
-			continue
+			return fmt.Errorf("preparing operator %q: %w", opInst.Name(), err)
 		}
 
 		// Add gadget params prefixed with operators' name

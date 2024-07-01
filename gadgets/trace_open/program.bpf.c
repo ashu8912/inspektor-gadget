@@ -22,7 +22,7 @@ struct args_t {
 };
 
 struct event {
-	gadget_timestamp timestamp;
+	gadget_timestamp timestamp_raw;
 	/* user terminology for pid: */
 	__u32 pid;
 	__u32 uid;
@@ -30,8 +30,8 @@ struct event {
 	gadget_mntns_id mntns_id;
 	__s32 err;
 	__u32 fd;
-	int flags;
-	__u16 mode;
+	int flags_raw;
+	__u16 mode_raw;
 	char comm[TASK_COMM_LEN];
 	char fname[NAME_MAX];
 };
@@ -156,12 +156,12 @@ static __always_inline int trace_exit(struct syscall_trace_exit *ctx)
 	event->gid = (u32)(uid_gid >> 32);
 	bpf_get_current_comm(&event->comm, sizeof(event->comm));
 	bpf_probe_read_user_str(&event->fname, sizeof(event->fname), ap->fname);
-	event->flags = ap->flags;
-	event->mode = ap->mode;
+	event->flags_raw = ap->flags;
+	event->mode_raw = ap->mode;
 	event->err = errval;
 	event->fd = fd;
 	event->mntns_id = gadget_get_mntns_id();
-	event->timestamp = bpf_ktime_get_boot_ns();
+	event->timestamp_raw = bpf_ktime_get_boot_ns();
 
 	/* emit event */
 	gadget_submit_buf(ctx, &events, event, sizeof(*event));

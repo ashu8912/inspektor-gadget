@@ -34,15 +34,16 @@ func runTraceOOMKill(t *testing.T, ns string, cmd string) {
 			})
 
 			expectedTraceOOMKillJsonObj := map[string]interface{}{
-				"fpid":      0,
-				"fuid":      0,
-				"fgid":      0,
-				"tpid":      0,
-				"pages":     0,
-				"mntns_id":  0,
-				"timestamp": "",
-				"fcomm":     "",
-				"tcomm":     "tail",
+				"fpid":          0,
+				"fuid":          0,
+				"fgid":          0,
+				"tpid":          0,
+				"pages":         0,
+				"mntns_id":      0,
+				"timestamp":     "",
+				"timestamp_raw": 0,
+				"fcomm":         "",
+				"tcomm":         "tail",
 			}
 
 			expectedJsonObj := MergeJsonObjs(t, expectedBaseJsonObj, expectedTraceOOMKillJsonObj)
@@ -63,6 +64,7 @@ func runTraceOOMKill(t *testing.T, ns string, cmd string) {
 				m["pages"] = uint32(0)
 				m["mntns_id"] = 0
 				m["timestamp"] = ""
+				m["timestamp_raw"] = 0
 			}
 
 			ExpectEntriesToMatchObj(t, output, normalize, expectedJsonObj)
@@ -127,7 +129,7 @@ func TestRunTraceOOMKill(t *testing.T) {
 		RunTestSteps(commands, t, WithCbBeforeCleanup(PrintLogsFn(ns)))
 	})
 
-	cmd := fmt.Sprintf("$KUBECTL_GADGET run %s/trace_oomkill:%s -n %s -o json", *gadgetRepository, *gadgetTag, ns)
+	cmd := fmt.Sprintf("$KUBECTL_GADGET run %s/trace_oomkill:%s --verify-image=%t -n %s -o json", *gadgetRepository, *gadgetTag, *gadgetVerifyImage, ns)
 
 	runTraceOOMKill(t, ns, cmd)
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	. "github.com/inspektor-gadget/inspektor-gadget/integration"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/testing/match"
 )
 
 func TestPrometheus(t *testing.T) {
@@ -135,13 +136,13 @@ EOF
 
 					expectedEntry := &Result{
 						Metric: map[string]string{
-							"__name__":        "executed_processes_total",
-							"k8s_container":   "test-pod",
-							"job":             "gadget",
-							"k8s_namespace":   ns,
-							"k8s_pod":         "test-pod",
-							"instance":        "",
-							"otel_scope_name": "",
+							"__name__":          "executed_processes_total",
+							"k8s_containerName": "test-pod",
+							"job":               "gadget",
+							"k8s_namespace":     ns,
+							"k8s_podName":       "test-pod",
+							"instance":          "",
+							"otel_scope_name":   "",
 						},
 						Value: []interface{}{nil, "100"},
 					}
@@ -152,7 +153,7 @@ EOF
 						r.Metric["otel_scope_name"] = ""
 					}
 
-					ExpectEntriesInArrayToMatch(t, string(prometheusResponse.Data.Result), normalize, expectedEntry)
+					match.MatchEntries(t, match.JSONSingleArrayMode, string(prometheusResponse.Data.Result), normalize, expectedEntry)
 				},
 			},
 		}

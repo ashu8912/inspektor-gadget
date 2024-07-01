@@ -46,10 +46,13 @@ import (
 	// Blank import for some operators
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/btfgen"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/ebpf"
+	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/filter"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/formatters"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/kubemanager"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/socketenricher"
+	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/sort"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/uidgidresolver"
+	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/wasm"
 
 	gadgetservice "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
@@ -289,6 +292,11 @@ func main() {
 			log.Fatalf("Detecting net namespace: %v", err)
 		}
 		log.Infof("HostNetwork=%t", hostNetNs)
+		hostCgroupNs, err := host.IsHostCgroupNs()
+		if err != nil {
+			log.Fatalf("Detecting cgroup namespace: %v", err)
+		}
+		log.Infof("HostCgroup=%t", hostCgroupNs)
 
 		node := os.Getenv("NODE_NAME")
 		if node == "" {
@@ -310,7 +318,6 @@ func main() {
 			HookMode:            hookMode,
 			FallbackPodInformer: fallbackPodInformer,
 		})
-
 		if err != nil {
 			log.Fatalf("failed to create Gadget Tracer Manager server: %v", err)
 		}
@@ -336,7 +343,8 @@ func main() {
 		if err != nil {
 			log.Fatalf("Parsing EVENTS_BUFFER_LENGTH %q: %v", stringBufferLength, err)
 		}
-		service := gadgetservice.NewService(log.StandardLogger(), bufferLength)
+		service := gadgetservice.NewService(log.StandardLogger())
+		service.SetEventBufferLength(bufferLength)
 
 		socketType, socketPath, err := api.ParseSocketAddress(gadgetServiceHost)
 		if err != nil {

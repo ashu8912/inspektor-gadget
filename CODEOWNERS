@@ -32,6 +32,7 @@
 /pkg/container-hook/ @alban
 /pkg/container-utils/ @blanquicet @mqasimsarfraz
 /pkg/container-utils/containerd/ @burak-ok
+/pkg/datasource/ @flyth
 /pkg/gadget-context/ @flyth
 /pkg/gadget-registry/ @flyth
 /pkg/gadget-service/ @flyth
@@ -64,7 +65,6 @@
 /pkg/ig-manager/ @blanquicet
 /pkg/kallsyms/ @alban
 /pkg/kfilefields/ @alban @mqasimsarfraz
-/pkg/netnsenter/ @alban
 /pkg/networktracer/ @alban @blanquicet
 /pkg/operators/ @flyth
 /pkg/operators/kubeipresolver/ @burak-ok
@@ -80,8 +80,9 @@
 /pkg/standardgadgets/ @mauriciovasquezbernal
 /pkg/tracer-collection/ @alban
 /pkg/types/ @blanquicet
-/pkg/uprobetracer/ @alban @i-Pear
+/pkg/uprobetracer/ @alban
 /pkg/utils/bpf-iter-ns/ @alban
 /pkg/utils/host/ @alban
+/pkg/utils/nsenter/ @alban
 /tools/ @mqasimsarfraz
 /tools/demos/ @alban

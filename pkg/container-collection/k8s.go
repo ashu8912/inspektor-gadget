@@ -16,22 +16,26 @@ package containercollection
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
 
+	securejoin "github.com/cyphar/filepath-securejoin"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	kubeletconfigv1beta1 "k8s.io/kubelet/config/v1beta1"
 
 	containerutils "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils"
 	runtimeclient "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/runtime-client"
 	containerutilsTypes "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/types"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
 )
 
 type K8sClient struct {
@@ -53,6 +57,16 @@ func NewK8sClient(nodeName string) (*K8sClient, error) {
 
 	fieldSelector := fields.OneTermEqualSelector("spec.nodeName", nodeName).String()
 
+	socketPath, err := getContainerRuntimeSocketPath(clientset, nodeName)
+	if err != nil {
+		log.Warnf("Failed to retrieve socket path for runtime client from kubelet: %v. Falling back to default container runtime", err)
+	} else {
+		socketPath, err = securejoin.SecureJoin(host.HostRoot, socketPath)
+		if err != nil {
+			log.Warnf("securejoin failed: %s. Falling back to default container runtime", err)
+		}
+	}
+
 	node, err := clientset.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("getting node %w", err)
@@ -63,7 +77,9 @@ func NewK8sClient(nodeName string) (*K8sClient, error) {
 	list := strings.SplitN(node.Status.NodeInfo.ContainerRuntimeVersion, "://", 2)
 	runtimeClient, err := containerutils.NewContainerRuntimeClient(
 		&containerutilsTypes.RuntimeConfig{
-			Name: types.String2RuntimeName(list[0]),
+			Name:            types.String2RuntimeName(list[0]),
+			SocketPath:      socketPath,
+			RuntimeProtocol: containerutilsTypes.RuntimeProtocolCRI,
 		})
 	if err != nil {
 		return nil, err
@@ -180,4 +196,49 @@ func (k *K8sClient) ListContainers() (arr []Container, err error) {
 		arr = append(arr, containers...)
 	}
 	return arr, nil
+}
+
+func getContainerRuntimeSocketPath(clientset *kubernetes.Clientset, nodeName string) (string, error) {
+	kubeletConfig, err := getCurrentKubeletConfig(clientset, nodeName)
+	if err != nil {
+		return "", fmt.Errorf("getting /configz: %w", err)
+	}
+	socketPath, found := strings.CutPrefix(kubeletConfig.ContainerRuntimeEndpoint, "unix://")
+	if !found {
+		return "", fmt.Errorf("socket path does not start with unix://")
+	}
+	log.Infof("using the detected container runtime socket path from Kubelet's config: %s", socketPath)
+	return socketPath, nil
+}
+
+// The /configz endpoint isn't officially documented. It was introduced in Kubernetes 1.26 and been around for a long time
+// as stated in https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/component-base/configz/OWNERS
+func getCurrentKubeletConfig(clientset *kubernetes.Clientset, nodeName string) (*kubeletconfigv1beta1.KubeletConfiguration, error) {
+	resp, err := clientset.CoreV1().RESTClient().Get().Resource("nodes").
+		Name(nodeName).Suffix("proxy", "configz").DoRaw(context.TODO())
+	if err != nil {
+		return nil, fmt.Errorf("fetching /configz from %q: %w", nodeName, err)
+	}
+	kubeCfg, err := decodeConfigz(resp)
+	if err != nil {
+		return nil, err
+	}
+	return kubeCfg, nil
+}
+
+// Decodes the http response from /configz and returns the kubelet configuration
+func decodeConfigz(respBody []byte) (*kubeletconfigv1beta1.KubeletConfiguration, error) {
+	// This hack because /configz reports the following structure:
+	// {"kubeletconfig": {the JSON representation of kubeletconfigv1beta1.KubeletConfiguration}}
+	type configzWrapper struct {
+		ComponentConfig kubeletconfigv1beta1.KubeletConfiguration `json:"kubeletconfig"`
+	}
+
+	configz := configzWrapper{}
+	err := json.Unmarshal(respBody, &configz)
+	if err != nil {
+		return nil, err
+	}
+
+	return &configz.ComponentConfig, nil
 }

@@ -15,19 +15,23 @@
 package formatters
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/hashicorp/go-multierror"
 	"golang.org/x/sys/unix"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/params"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/annotations"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/syscalls"
 )
 
 // Keep this aligned with include/gadget/types.h
@@ -43,6 +47,15 @@ const (
 
 	// Name of the type to store a signal
 	SignalTypeName = "gadget_signal"
+
+	// Name of the type to store a syscall
+	SyscallTypeName = "gadget_syscall"
+)
+
+const (
+	timestampTargetAnnotation = "formatters.timestamp.target"
+	syscallTargetAnnotation   = "formatters.syscall.target"
+	signalTargetAnnotation    = "formatters.signal.target"
 )
 
 type formattersOperator struct{}
@@ -79,7 +92,7 @@ func (f *formattersOperator) InstantiateDataOperator(gadgetCtx operators.GadgetC
 			}
 			logger.Debugf("> found %d fields for replacer %v", len(fields), r.selectors)
 			for _, field := range fields {
-				replFunc, err := r.replace(ds, field)
+				replFunc, err := r.replace(logger, ds, field)
 				if err != nil {
 					logger.Debugf(">  skipping field %q: %v", field.Name(), err)
 					continue
@@ -121,7 +134,7 @@ type replacer struct {
 	selectors []string
 
 	// replace will be called for incoming data with the source and target fields set
-	replace func(datasource.DataSource, datasource.FieldAccessor) (func(datasource.Data) error, error)
+	replace func(logger.Logger, datasource.DataSource, datasource.FieldAccessor) (func(datasource.Data) error, error)
 
 	// priority to be used when subscribing to the DataSource
 	priority int
@@ -132,18 +145,19 @@ var replacers = []replacer{
 	{
 		name:      "signal",
 		selectors: []string{"type:" + SignalTypeName},
-		replace: func(ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
-			oldName := in.Name()
-
-			if err := in.Rename(oldName + "_raw"); err != nil {
-				return nil, fmt.Errorf("renaming field: %w", err)
-			}
-			in.SetHidden(true, false)
-
-			signalField, err := ds.AddField(oldName, api.Kind_String)
+		replace: func(logger logger.Logger, ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
+			outName, err := annotations.GetTargetNameFromAnnotation(logger, "formatters.signal", in, signalTargetAnnotation)
 			if err != nil {
 				return nil, err
 			}
+
+			signalField, err := ds.AddField(outName, api.Kind_String)
+			if err != nil {
+				return nil, err
+			}
+
+			in.SetHidden(true, false)
+
 			return func(data datasource.Data) error {
 				inBytes := in.Get(data)
 				switch len(inBytes) {
@@ -160,29 +174,68 @@ var replacers = []replacer{
 		priority: 0,
 	},
 	{
+		name:      "syscall",
+		selectors: []string{"type:" + SyscallTypeName},
+		replace: func(logger logger.Logger, ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
+			if in.Type() != api.Kind_Uint64 {
+				return nil, fmt.Errorf("checking field %q: expected uint64", in.Name())
+			}
+
+			outName, err := annotations.GetTargetNameFromAnnotation(logger, "formatters.syscall", in, syscallTargetAnnotation)
+			if err != nil {
+				return nil, err
+			}
+
+			syscallField, err := ds.AddField(outName, api.Kind_String)
+			if err != nil {
+				return nil, err
+			}
+
+			in.SetHidden(true, false)
+
+			return func(data datasource.Data) error {
+				syscallNumber, err := in.Uint64(data)
+				if err != nil {
+					return err
+				}
+
+				syscallName, exist := syscalls.GetSyscallNameByNumber(int(syscallNumber))
+				if !exist {
+					syscallName = "unknown"
+				}
+				syscallField.PutString(data, "SYS_"+strings.ToUpper(syscallName))
+
+				return nil
+			}, nil
+		},
+		priority: 0,
+	},
+	{
 		name:      "timestamp",
 		selectors: []string{"type:" + TimestampTypeName},
-		replace: func(ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
-			// Read annotations to allow user-defined behavior; this needs to be documented // TODO
-			annotations := in.Annotations()
-
-			// remove reference to old field for backwards compatibility
-			in.RemoveReference(false)
-
+		replace: func(logger logger.Logger, ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
 			timestampFormat := "2006-01-02T15:04:05.000000000Z07:00"
-			if format := annotations["formatters.timestamp.format"]; format != "" {
+			if format := in.Annotations()["formatters.timestamp.format"]; format != "" {
+				logger.Debugf("formatter.timestamp: using custom timestamp format %q for field %q", format, in.Name())
 				timestampFormat = format
 			}
 
-			outName := in.Name()
-			if out := annotations["formatters.timestamp.target"]; out != "" {
-				outName = out
+			outName, err := annotations.GetTargetNameFromAnnotation(logger, "formatters.timestamp", in, timestampTargetAnnotation)
+			if err != nil {
+				return nil, err
 			}
 
-			out, err := ds.AddField(outName, api.Kind_String)
-			if err != nil {
-				return nil, nil
+			opts := []datasource.FieldOption{
+				datasource.WithAnnotations(map[string]string{
+					"columns.template": "timestamp",
+				}),
 			}
+			out, err := ds.AddField(outName, api.Kind_String, opts...)
+			if err != nil {
+				return nil, err
+			}
+
+			in.SetHidden(true, false)
 
 			return func(data datasource.Data) error {
 				inBytes := in.Get(data)
@@ -190,11 +243,20 @@ var replacers = []replacer{
 				default:
 					return nil
 				case 8:
+					var result error
+
 					// TODO: WallTimeFromBootTime() converts too much for this, create a new func that does less
 					correctedTime := gadgets.WallTimeFromBootTime(ds.ByteOrder().Uint64(inBytes))
 					ds.ByteOrder().PutUint64(inBytes, uint64(correctedTime))
 					t := time.Unix(0, int64(correctedTime))
-					return out.Set(data, []byte(t.Format(timestampFormat)))
+					if err := out.Set(data, []byte(t.Format(timestampFormat))); err != nil {
+						multierror.Append(result, err)
+					}
+					if err := in.PutUint64(data, uint64(correctedTime)); err != nil {
+						multierror.Append(result, err)
+					}
+
+					return result
 				}
 			}, nil
 		},
@@ -203,7 +265,7 @@ var replacers = []replacer{
 	{
 		name:      "l3endpoint",
 		selectors: []string{"type:" + L3EndpointTypeName},
-		replace: func(ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
+		replace: func(logger logger.Logger, ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
 			// We do some length checks in here - since we expect the in field to be part of an eBPF struct that
 			// is always sized statically, we can avoid checking the individual entries later on.
 			in.SetHidden(true, false)
@@ -249,7 +311,7 @@ var replacers = []replacer{
 	{
 		name:      "l4endpoint",
 		selectors: []string{"type:" + L4EndpointTypeName},
-		replace: func(ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
+		replace: func(logger logger.Logger, ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
 			// We do some length checks in here - since we expect the in field to be part of an eBPF struct that
 			// is always sized statically, we can avoid checking the individual entries later on.
 			in.SetHidden(true, false)
@@ -277,7 +339,7 @@ var replacers = []replacer{
 				return nil, fmt.Errorf("adding string field: %w", err)
 			}
 			return func(entry datasource.Data) error {
-				port := binary.BigEndian.Uint16(ports[0].Get(entry))
+				port, _ := ports[0].Uint16(entry)
 				out.Set(entry, []byte(fmt.Sprintf("%s:%d", string(l3strings[0].Get(entry)), port)))
 				return nil
 			}, nil

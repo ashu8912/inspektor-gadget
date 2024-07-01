@@ -170,7 +170,7 @@ The "kubectl debug node" command is documented in
 Examples of commands:
 
 ```bash
-$ kubectl debug node/minikube-docker -ti --image=ghcr.io/inspektor-gadget/ig -- ig --auto-sd-unit-restart trace exec
+$ kubectl debug --profile=sysadmin node/minikube-docker -ti --image=ghcr.io/inspektor-gadget/ig -- ig trace exec
 Creating debugging pod node-debugger-minikube-docker-c2wfw with container debugger on node minikube-docker.
 If you don't see a command prompt, try pressing enter.
 RUNTIME.CONTAINERNAME          PID              PPID             COMM             RET ARGS
@@ -178,22 +178,11 @@ k8s_shell_shell_default_b4ebb… 3186934          3186270          cat          
 ```
 
 ```bash
-$ kubectl debug node/minikube-docker -ti --image=ghcr.io/inspektor-gadget/ig -- ig --auto-sd-unit-restart list-containers -o json
+$ kubectl debug --profile=sysadmin node/minikube-docker -ti --image=ghcr.io/inspektor-gadget/ig -- ig list-containers -o json
 ```
 
-As of today, the `kubectl debug` command does not have a way to give enough privileges to the debugging pod to be able
-to use `ig`.
-This might change in the future: the Kubernetes Enhancement Proposal 1441
-([KEP-1441](https://github.com/kubernetes/enhancements/tree/master/keps/sig-cli/1441-kubectl-debug))
-suggests to implement Debugging Profiles (`--profile=`) to be able to give the necessary privileges.
-kubectl v1.27 implements some of those profiles but not yet the "sysadmin" profile, so it is not possible to use
-`--profile=` yet.
-
-Meanwhile, `ig` provides the `--auto-sd-unit-restart` flag. The flag is `false` by default. When it is set to `true`,
-`ig` will detect if it does not have enough privileges and it can transparently
-re-execute itself in a privileged systemd unit if necessary.
-This is possible because the "kubectl debug node" gives access to the systemd socket (`/run/systemd/private`) via the
-/host volume.
+This requires Kubernetes v1.30.0.
+It is also working on older versions as long as kubectl (client) is v1.30.0 or greater.
 
 ### Using ig as a daemon
 
@@ -306,7 +295,6 @@ Example of command:
 ```bash
 $ docker run -ti --rm \
     --privileged \
-    -v /run:/run \
     -v /:/host \
     --pid=host \
     ghcr.io/inspektor-gadget/ig \
@@ -317,7 +305,6 @@ heuristic_yonath         3329233    3329211    ls               0   /bin/ls
 
 List of flags:
 - `--privileged` gives all capabilities such as `CAP_SYS_ADMIN`. It is required to run eBPF programs.
-- `-v /run:/run` gives access to the container runtimes sockets (docker, containerd, CRI-O).
 - `-v /:/host` gives access to the host filesystem. This is used to access the host processes via /host/proc, and access
   container runtime hooks (rootfs and config.json).
 - `--pid=host` runs in the host PID namespace. Optional on Linux. This is necessary on Docker Desktop on Windows because

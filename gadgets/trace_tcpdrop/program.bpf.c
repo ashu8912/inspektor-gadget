@@ -18,6 +18,7 @@
 #include <gadget/types.h>
 #include <gadget/macros.h>
 #include <gadget/core_fixes.bpf.h>
+#include <gadget/kernel_stack_map.h>
 
 #define GADGET_TYPE_TRACING
 #include <gadget/sockets-map.h>
@@ -42,15 +43,27 @@ enum tcp_state {
 	tcp_max_states = 13,
 };
 
+enum tcp_flags_set : __u8 {
+	FIN = 0x01,
+	SYN = 0x02,
+	RST = 0x04,
+	PSH = 0x08,
+	ACK = 0x10,
+	URG = 0x20,
+	ECE = 0x40,
+	CWR = 0x80,
+};
+
 struct event {
 	struct gadget_l4endpoint_t src;
 	struct gadget_l4endpoint_t dst;
 
-	gadget_timestamp timestamp;
-	enum tcp_state state;
-	__u8 tcpflags;
-	enum skb_drop_reason reason;
+	gadget_timestamp timestamp_raw;
+	enum tcp_state state_raw;
+	enum tcp_flags_set tcpflags_raw;
+	enum skb_drop_reason reason_raw;
 	gadget_netns_id netns;
+	gadget_kernel_stack kernel_stack_raw;
 
 	// The original gadget has instances of these fields for both process context and
 	// socket context. Since sub-structures in the `event` are not yet supported, we only use
@@ -106,17 +119,18 @@ static __always_inline int __trace_tcp_drop(void *ctx, struct sock *sk,
 	if (!event)
 		return 0;
 
-	event->timestamp = bpf_ktime_get_boot_ns();
-	event->state = BPF_CORE_READ(sk, __sk_common.skc_state);
-	event->reason = reason;
-	bpf_probe_read_kernel(&event->tcpflags, sizeof(event->tcpflags),
+	event->timestamp_raw = bpf_ktime_get_boot_ns();
+	event->state_raw = BPF_CORE_READ(sk, __sk_common.skc_state);
+	event->reason_raw = reason;
+	event->kernel_stack_raw = gadget_get_kernel_stack(ctx);
+	bpf_probe_read_kernel(&event->tcpflags_raw, sizeof(event->tcpflags_raw),
 			      &tcphdr->flags);
 
-	BPF_CORE_READ_INTO(&event->dst.port, sk, __sk_common.skc_dport);
+	event->dst.port = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
 	if (event->dst.port == 0)
 		goto cleanup;
 
-	BPF_CORE_READ_INTO(&event->src.port, sockp, inet_sport);
+	event->src.port = bpf_ntohs(BPF_CORE_READ(sockp, inet_sport));
 	if (event->src.port == 0)
 		goto cleanup;
 

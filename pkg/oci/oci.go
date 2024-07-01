@@ -17,6 +17,7 @@ package oci
 import (
 	"archive/tar"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto"
 	"crypto/x509"
@@ -27,10 +28,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/distribution/reference"
 	"github.com/docker/cli/cli/config"
@@ -58,9 +62,14 @@ type VerifyOptions struct {
 	PublicKey       string
 }
 
+type AllowedDigestsOptions struct {
+	AllowedDigests []string
+}
+
 type ImageOptions struct {
 	AuthOptions
 	VerifyOptions
+	AllowedDigestsOptions
 }
 
 const (
@@ -80,7 +89,7 @@ const (
 	localhost = "localhost"
 )
 
-// getLocalOciStore returns a single local oci store. oci.Store is concurrently safe only
+// GetLocalOciStore returns a single local oci store. oci.Store is concurrently safe only
 // against its own instance inside the same go program
 var getLocalOciStore = sync.OnceValues(func() (*oci.Store, error) {
 	if err := os.MkdirAll(filepath.Dir(defaultOciStore), 0o700); err != nil {
@@ -88,6 +97,10 @@ var getLocalOciStore = sync.OnceValues(func() (*oci.Store, error) {
 	}
 	return oci.New(defaultOciStore)
 })
+
+func GetLocalOciStore() (*oci.Store, error) {
+	return getLocalOciStore()
+}
 
 // GadgetImageDesc is the description of a gadget image.
 type GadgetImageDesc struct {
@@ -111,7 +124,7 @@ func getTimeFromAnnotations(annotations map[string]string) string {
 
 // PullGadgetImage pulls the gadget image into the local oci store and returns its descriptor.
 func PullGadgetImage(ctx context.Context, image string, authOpts *AuthOptions) (*GadgetImageDesc, error) {
-	ociStore, err := getLocalOciStore()
+	ociStore, err := GetLocalOciStore()
 	if err != nil {
 		return nil, fmt.Errorf("getting oci store: %w", err)
 	}
@@ -174,7 +187,7 @@ func pullIfNotExist(ctx context.Context, imageStore oras.Target, authOpts *AuthO
 
 // PushGadgetImage pushes the gadget image and returns its descriptor.
 func PushGadgetImage(ctx context.Context, image string, authOpts *AuthOptions) (*GadgetImageDesc, error) {
-	ociStore, err := getLocalOciStore()
+	ociStore, err := GetLocalOciStore()
 	if err != nil {
 		return nil, fmt.Errorf("getting oci store: %w", err)
 	}
@@ -215,7 +228,7 @@ func TagGadgetImage(ctx context.Context, srcImage, dstImage string) (*GadgetImag
 		return nil, fmt.Errorf("normalizing dst image: %w", err)
 	}
 
-	ociStore, err := getLocalOciStore()
+	ociStore, err := GetLocalOciStore()
 	if err != nil {
 		return nil, fmt.Errorf("getting oci store: %w", err)
 	}
@@ -238,8 +251,38 @@ func TagGadgetImage(ctx context.Context, srcImage, dstImage string) (*GadgetImag
 	return imageDesc, nil
 }
 
+// sortIndex sorts the manifest list in the index file and writes it back. This
+// is done to be sure the index is deterministic and the generate tar file is
+// the same.
+func sortIndex(indexPath string) (*ocispec.Index, error) {
+	file, err := os.ReadFile(indexPath)
+	if err != nil {
+		return nil, fmt.Errorf("reading index.json: %w", err)
+	}
+
+	var index ocispec.Index
+	if err = json.Unmarshal(file, &index); err != nil {
+		return nil, fmt.Errorf("unmarshalling index.json: %w", err)
+	}
+
+	slices.SortFunc(index.Manifests, func(a, b ocispec.Descriptor) int {
+		return cmp.Compare(a.Digest.String(), b.Digest.String())
+	})
+
+	file, err = json.Marshal(index)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling index.json: %w", err)
+	}
+
+	if err = os.WriteFile(indexPath, file, 0o600); err != nil {
+		return nil, fmt.Errorf("writing index.json: %w", err)
+	}
+
+	return &index, nil
+}
+
 func ExportGadgetImages(ctx context.Context, dstFile string, images ...string) error {
-	ociStore, err := getLocalOciStore()
+	ociStore, err := GetLocalOciStore()
 	if err != nil {
 		return fmt.Errorf("getting oci store: %w", err)
 	}
@@ -267,7 +310,22 @@ func ExportGadgetImages(ctx context.Context, dstFile string, images ...string) e
 		}
 	}
 
-	if err := tarFolderToFile(tmpDir, dstFile); err != nil {
+	index, err := sortIndex(path.Join(tmpDir, "index.json"))
+	if err != nil {
+		return fmt.Errorf("reading index.json: %w", err)
+	}
+
+	// Set the time of the tar file to the creation time of the index. This
+	// allows to have a deterministic tarball.
+	var tarHeaderTime time.Time
+	if index.Annotations != nil && index.Annotations[ocispec.AnnotationCreated] != "" {
+		tarHeaderTime, err = time.Parse(time.RFC3339, index.Annotations[ocispec.AnnotationCreated])
+		if err != nil {
+			return fmt.Errorf("parsing created time: %w", err)
+		}
+	}
+
+	if err := tarFolderToFile(tmpDir, dstFile, tarHeaderTime); err != nil {
 		return fmt.Errorf("creating tar for gadget image: %w", err)
 	}
 
@@ -281,7 +339,7 @@ func ImportGadgetImages(ctx context.Context, srcFile string) ([]string, error) {
 		return nil, fmt.Errorf("loading src bundle: %w", err)
 	}
 
-	ociStore, err := getLocalOciStore()
+	ociStore, err := GetLocalOciStore()
 	if err != nil {
 		return nil, fmt.Errorf("getting oci store: %w", err)
 	}
@@ -304,7 +362,7 @@ func ImportGadgetImages(ctx context.Context, srcFile string) ([]string, error) {
 }
 
 // based on https://medium.com/@skdomino/taring-untaring-files-in-go-6b07cf56bc07
-func tarFolderToFile(src, filePath string) error {
+func tarFolderToFile(src, filePath string, headerTime time.Time) error {
 	file, err := os.Create(filePath)
 	if err != nil {
 		return fmt.Errorf("opening file: %w", err)
@@ -326,6 +384,10 @@ func tarFolderToFile(src, filePath string) error {
 		if err != nil {
 			return err
 		}
+
+		header.ModTime = headerTime
+		header.AccessTime = headerTime
+		header.ChangeTime = headerTime
 
 		// update the name to correctly reflect the desired destination when untaring
 		header.Name = strings.TrimPrefix(strings.Replace(file, src, "", -1), string(filepath.Separator))
@@ -399,7 +461,7 @@ func listGadgetImages(ctx context.Context, store *oci.Store) ([]*GadgetImageDesc
 
 // ListGadgetImages lists all the gadget images.
 func ListGadgetImages(ctx context.Context) ([]*GadgetImageDesc, error) {
-	ociStore, err := getLocalOciStore()
+	ociStore, err := GetLocalOciStore()
 	if err != nil {
 		return nil, fmt.Errorf("getting oci store: %w", err)
 	}
@@ -418,7 +480,7 @@ func ListGadgetImages(ctx context.Context) ([]*GadgetImageDesc, error) {
 
 // DeleteGadgetImage removes the given image.
 func DeleteGadgetImage(ctx context.Context, image string) error {
-	ociStore, err := getLocalOciStore()
+	ociStore, err := GetLocalOciStore()
 	if err != nil {
 		return fmt.Errorf("getting oci store: %w", err)
 	}
@@ -634,7 +696,7 @@ func getImageDigest(ctx context.Context, store *oci.Store, imageRef string) (str
 	return desc.Digest.String(), nil
 }
 
-func getSigningInformation(ctx context.Context, repo *remote.Repository, imageDigest string, authOpts *AuthOptions) ([]byte, []byte, error) {
+func getSigningInformation(ctx context.Context, repo *remote.Repository, imageDigest string) ([]byte, []byte, error) {
 	signatureTag, err := craftSignatureTag(imageDigest)
 	if err != nil {
 		return nil, nil, fmt.Errorf("crafting signature tag: %w", err)
@@ -687,7 +749,7 @@ func checkPayloadImage(payloadBytes []byte, imageDigest string) error {
 }
 
 func verifyImage(ctx context.Context, image string, imgOpts *ImageOptions) error {
-	imageStore, err := getLocalOciStore()
+	imageStore, err := GetLocalOciStore()
 	if err != nil {
 		return fmt.Errorf("getting local oci store: %w", err)
 	}
@@ -712,7 +774,7 @@ func verifyImage(ctx context.Context, image string, imgOpts *ImageOptions) error
 		return fmt.Errorf("creating repository: %w", err)
 	}
 
-	signatureBytes, payloadBytes, err := getSigningInformation(ctx, repo, imageDigest, &imgOpts.AuthOptions)
+	signatureBytes, payloadBytes, err := getSigningInformation(ctx, repo, imageDigest)
 	if err != nil {
 		return fmt.Errorf("getting signing information: %w", err)
 	}
@@ -809,6 +871,32 @@ func ensureImage(ctx context.Context, imageStore oras.Target, image string, imgO
 		}
 	}
 
+	if len(imgOpts.AllowedDigests) > 0 {
+		targetImage, err := normalizeImageName(image)
+		if err != nil {
+			return fmt.Errorf("normalizing image: %w", err)
+		}
+
+		desc, err := imageStore.Resolve(ctx, targetImage.String())
+		if err != nil {
+			return fmt.Errorf("resolving image %q on local registry: %w", targetImage.String(), err)
+		}
+
+		digestString := desc.Digest.String()
+		found := false
+		for _, digest := range imgOpts.AllowedDigests {
+			if digestString == digest {
+				found = true
+
+				break
+			}
+		}
+
+		if !found {
+			return fmt.Errorf("image digest not allowed: %q not in %q", digestString, strings.Join(imgOpts.AllowedDigests, ", "))
+		}
+	}
+
 	if !imgOpts.VerifyPublicKey {
 		log.Warnf("you set --verify-image=false, image will not be verified")
 
@@ -825,7 +913,7 @@ func ensureImage(ctx context.Context, imageStore oras.Target, image string, imgO
 
 // EnsureImage ensures the image is present in the local store
 func EnsureImage(ctx context.Context, image string, imgOpts *ImageOptions, pullPolicy string) error {
-	imageStore, err := getLocalOciStore()
+	imageStore, err := GetLocalOciStore()
 	if err != nil {
 		return fmt.Errorf("getting local oci store: %w", err)
 	}
@@ -864,12 +952,8 @@ func getManifestForHost(ctx context.Context, target oras.ReadOnlyTarget, image s
 	return manifest, nil
 }
 
-func GetManifestForHost(ctx context.Context, image string) (*ocispec.Manifest, error) {
-	imageStore, err := getLocalOciStore()
-	if err != nil {
-		return nil, fmt.Errorf("getting local oci store: %w", err)
-	}
-	return getManifestForHost(ctx, imageStore, image)
+func GetManifestForHost(ctx context.Context, target oras.ReadOnlyTarget, image string) (*ocispec.Manifest, error) {
+	return getManifestForHost(ctx, target, image)
 }
 
 // getIndex gets an index for the given image
@@ -887,13 +971,8 @@ func getIndex(ctx context.Context, target oras.ReadOnlyTarget, image string) (*o
 	return &index, nil
 }
 
-func GetContentFromDescriptor(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
-	imageStore, err := getLocalOciStore()
-	if err != nil {
-		return nil, fmt.Errorf("getting local oci store: %w", err)
-	}
-
-	reader, err := imageStore.Fetch(ctx, desc)
+func GetContentFromDescriptor(ctx context.Context, target oras.ReadOnlyTarget, desc ocispec.Descriptor) (io.ReadCloser, error) {
+	reader, err := target.Fetch(ctx, desc)
 	if err != nil {
 		return nil, fmt.Errorf("fetching descriptor: %w", err)
 	}

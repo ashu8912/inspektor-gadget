@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -227,7 +228,16 @@ func runBuild(cmd *cobra.Command, opts *cmdOpts) error {
 		MetadataPath:     conf.Metadata,
 		UpdateMetadata:   opts.updateMetadata,
 		ValidateMetadata: opts.validateMetadata,
-		CreatedDate:      time.Now().Format(time.RFC3339),
+	}
+
+	if sourceDateEpoch, ok := os.LookupEnv("SOURCE_DATE_EPOCH"); ok {
+		sde, err := strconv.ParseInt(sourceDateEpoch, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid SOURCE_DATE_EPOCH: %w", err)
+		}
+		buildOpts.CreatedDate = time.Unix(sde, 0).UTC().Format(time.RFC3339)
+	} else {
+		buildOpts.CreatedDate = time.Now().Format(time.RFC3339)
 	}
 
 	desc, err := oci.BuildGadgetImage(context.TODO(), buildOpts, opts.image)
@@ -277,15 +287,18 @@ func ensureBuilderImage(ctx context.Context, cli *client.Client, builderImage st
 	f := filters.NewArgs()
 	f.Add("reference", builderImage)
 
-	images, err := cli.ImageList(ctx, image.ListOptions{Filters: f})
-	if err != nil {
-		return fmt.Errorf("listing images: %w", err)
-	}
+	// For :latest we always want to have the newest image that is available upstream
+	if !strings.HasSuffix(builderImage, ":latest") {
+		images, err := cli.ImageList(ctx, image.ListOptions{Filters: f})
+		if err != nil {
+			return fmt.Errorf("listing images: %w", err)
+		}
 
-	for _, img := range images {
-		for _, tag := range img.RepoTags {
-			if tag == builderImage {
-				return nil
+		for _, img := range images {
+			for _, tag := range img.RepoTags {
+				if tag == builderImage {
+					return nil
+				}
 			}
 		}
 	}
@@ -320,14 +333,32 @@ func buildInContainer(opts *cmdOpts, conf *buildFile) error {
 		return err
 	}
 
+	// where the gadget source code is mounted in the container
+	gadgetSourcePath := "/work"
+	pathHost := cwd
+
+	inspektorGadetSrcPath := os.Getenv("IG_SOURCE_PATH")
+	if inspektorGadetSrcPath != "" {
+		pathHost = inspektorGadetSrcPath
+		// find the gadget relative path to the inspektor-gadget source
+		if !strings.HasPrefix(cwd, inspektorGadetSrcPath) {
+			return fmt.Errorf("the current directory %q is not under the inspektor-gadget source path %q", cwd, inspektorGadetSrcPath)
+		}
+		gadgetRelativePath := strings.TrimPrefix(cwd, inspektorGadetSrcPath)
+		gadgetSourcePath = filepath.Join("/work", gadgetRelativePath)
+
+		// use in-tree headers too
+		conf.CFlags += " -I /work/include/"
+	}
+
 	wasmFullPath := ""
 	if conf.Wasm != "" {
-		wasmFullPath = filepath.Join("/work", conf.Wasm)
+		wasmFullPath = filepath.Join(gadgetSourcePath, conf.Wasm)
 	}
 
 	cmd := []string{
 		"make", "-f", "/Makefile", "-j", fmt.Sprintf("%d", runtime.NumCPU()),
-		"EBPFSOURCE=" + filepath.Join("/work", conf.EBPFSource),
+		"EBPFSOURCE=" + filepath.Join(gadgetSourcePath, conf.EBPFSource),
 		"WASM=" + wasmFullPath,
 		"OUTPUTDIR=/out",
 		"CFLAGS=" + conf.CFlags,
@@ -338,7 +369,7 @@ func buildInContainer(opts *cmdOpts, conf *buildFile) error {
 		{
 			Type:     mount.TypeBind,
 			Target:   "/work",
-			Source:   cwd,
+			Source:   pathHost,
 			ReadOnly: true,
 		},
 		{
@@ -362,9 +393,10 @@ func buildInContainer(opts *cmdOpts, conf *buildFile) error {
 	resp, err := cli.ContainerCreate(
 		ctx,
 		&container.Config{
-			Image: opts.builderImage,
-			Cmd:   cmd,
-			User:  fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+			Image:      opts.builderImage,
+			Cmd:        cmd,
+			WorkingDir: gadgetSourcePath,
+			User:       fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		},
 		&container.HostConfig{
 			Mounts: mounts,

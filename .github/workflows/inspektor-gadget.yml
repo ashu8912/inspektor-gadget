@@ -8,6 +8,12 @@ env:
   AZURE_AKS_CLUSTER_PREFIX: ig-ci-aks-
   DEFAULT_DNSTESTER_IMAGE: ghcr.io/inspektor-gadget/dnstester:latest
   DEFAULT_EBPF_BUILDER_IMAGE: ghcr.io/inspektor-gadget/ebpf-builder:latest
+  # With the recent update of docker/build-push-action to v6, this action
+  # started creating docker build summary files (i.e. .dockerbuild).
+  # Sadly, these files create troubles when trying to download artifact in the
+  # release job as they seem to not be downloadable.
+  # So, for now, let's deactivate this feature.
+  DOCKER_BUILD_NO_SUMMARY: true
 concurrency:
   group: ${{ github.ref }}
   # We do not want to cancel job in progress on main to be sure to catch new
@@ -103,7 +109,7 @@ jobs:
       uses: golangci/golangci-lint-action@v6.0.1
       with:
         # This version number must be kept in sync with Makefile lint one.
-        version: v1.54.2
+        version: v1.59.0
         working-directory: /home/runner/work/inspektor-gadget/inspektor-gadget
         # Workaround to display the output:
         # https://github.com/golangci/golangci-lint-action/issues/119#issuecomment-981090648
@@ -241,7 +247,7 @@ jobs:
       with:
         category: ${{ matrix.client }}-${{ matrix.os }}-${{ matrix.arch }}
     - name: Add ${{ matrix.client }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz as artifact.
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.client }}-${{ matrix.os }}-${{ matrix.arch }}-tar-gz
         path: /home/runner/work/inspektor-gadget/inspektor-gadget/${{ matrix.client }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
@@ -333,7 +339,7 @@ jobs:
           ig LICENSE
         rm -rf ${{ matrix.platform }}
     - name: Add ig-linux-${{ matrix.platform }}.tar.gz as artifact.
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: ig-linux-${{ matrix.platform }}-tar-gz
         path: /home/runner/work/inspektor-gadget/inspektor-gadget/ig-linux-${{ matrix.platform }}.tar.gz
@@ -464,7 +470,7 @@ jobs:
     # mode=max results in builder image layer of ~7GB because of btfhub files in a layer, which is too
     # large (gloabal limit 10GB) to work with GH caches. (TODO: if we can work with mode=max in future?)
     - name: Build gadget ${{ matrix.os }} ${{ matrix.platform }} container image as artifacts
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         context: /home/runner/work/inspektor-gadget/inspektor-gadget/
         file: /home/runner/work/inspektor-gadget/inspektor-gadget/Dockerfiles/gadget.Dockerfile
@@ -476,13 +482,13 @@ jobs:
         build-args: |
           VERSION=${{ steps.set-repo-determine-image-tag.outputs.image-tag }}
     - name: Publish gadget ${{ matrix.os }} ${{ matrix.platform }} container image as artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: gadget-container-image-${{ matrix.os }}-${{ matrix.platform }}.tar
         path: /tmp/gadget-container-image-${{ matrix.os }}-${{ matrix.platform }}.tar
         retention-days: 1
     - name: Generate SBOM for gadget ${{ matrix.os }} ${{ matrix.platform }} image
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         context: /home/runner/work/inspektor-gadget/inspektor-gadget/
         file: /home/runner/work/inspektor-gadget/inspektor-gadget/Dockerfiles/gadget.Dockerfile
@@ -499,7 +505,7 @@ jobs:
     - name: Publish gadget ${{ matrix.os }} ${{ matrix.platform }} container image to registry
       id: publish-gadget-container-images
       if: github.event_name != 'pull_request'
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         context: /home/runner/work/inspektor-gadget/inspektor-gadget/
         file: /home/runner/work/inspektor-gadget/inspektor-gadget/Dockerfiles/gadget.Dockerfile
@@ -606,7 +612,7 @@ jobs:
         # - hash of all bpf objects
         key: btfgen-${{ matrix.platform }}-${{ steps.get-btfhub-head.outputs.head }}-${{ hashFiles('pkg/**/*.o') }}
     - name: Build ig ${{ matrix.os }} ${{ matrix.platform }} container image as artifacts
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         context: /home/runner/work/inspektor-gadget/inspektor-gadget/
         file: /home/runner/work/inspektor-gadget/inspektor-gadget/Dockerfiles/ig.Dockerfile
@@ -619,13 +625,13 @@ jobs:
           VERSION=${{ steps.set-repo-determine-image-tag.outputs.image-tag }}
           EBPF_BUILDER=${{ needs.build-helper-images.outputs.ebpf_builder_image }}
     - name: Publish ig ${{ matrix.os }} ${{ matrix.platform }} container image as artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: ig-container-image-${{ matrix.os }}-${{ matrix.platform }}.tar
         path: /tmp/ig-container-image-${{ matrix.os }}-${{ matrix.platform }}.tar
         retention-days: 1
     - name: Generate ig ${{ matrix.os }} ${{ matrix.platform }} container image SBOM
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         context: /home/runner/work/inspektor-gadget/inspektor-gadget/
         file: /home/runner/work/inspektor-gadget/inspektor-gadget/Dockerfiles/ig.Dockerfile
@@ -643,7 +649,7 @@ jobs:
     - name: Publish ig ${{ matrix.os }} ${{ matrix.platform }} container image to registry
       id: publish-ig-container-images
       if: github.event_name != 'pull_request'
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         context: /home/runner/work/inspektor-gadget/inspektor-gadget/
         file: /home/runner/work/inspektor-gadget/inspektor-gadget/Dockerfiles/ig.Dockerfile
@@ -698,12 +704,12 @@ jobs:
         platform: [ amd64 ]
     steps:
       - name: Download gadget ${{ matrix.os }} ${{ matrix.platform }} container image as artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: gadget-container-image-${{ matrix.os }}-${{ matrix.platform }}.tar
           path: ${{ github.workspace }}
       - name: Scan gadget ${{ matrix.os }} ${{ matrix.platform }} container image
-        uses: aquasecurity/trivy-action@b2933f565dbc598b29947660e66259e3c7bc8561 # v0.20.0
+        uses: aquasecurity/trivy-action@7c2007bcb556501da015201bcba5aa14069b74e2 # v0.23.0
         with:
           input: gadget-container-image-${{ matrix.os }}-${{ matrix.platform }}.tar
           format: 'table'
@@ -719,7 +725,6 @@ jobs:
     if: github.event_name != 'pull_request'
     needs:
       - build-gadget-container-images
-      - public-key-check
       - check-secrets
     runs-on: ubuntu-latest
     permissions:
@@ -769,24 +774,23 @@ jobs:
               ${{ steps.set-repo-determine-image-tag.outputs.container-repo }}@${{ needs.build-gadget-container-images.outputs.digest-arm64 }} \
               ${{ steps.set-repo-determine-image-tag.outputs.container-repo }}@${{ needs.build-gadget-container-images.outputs.sbom-digest-arm64 }}
 
-          image_digest=$(docker buildx imagetools inspect $IMAGE_TAG | grep 'Digest' | awk '{ print $2 }')
+          image_digest=$(docker buildx imagetools inspect --format '{{json .Manifest.Digest}}' $IMAGE_TAG | jq -r)
           echo "image-digest=${image_digest}" >> $GITHUB_OUTPUT
-      - name: Install Cosign
-        if: needs.check-secrets.outputs.cosign == 'true'
-        uses: sigstore/cosign-installer@main
       - name: Sign the manifest list
         if: needs.check-secrets.outputs.cosign == 'true'
-        env:
-          COSIGN_PASSWORD: '${{ secrets.COSIGN_PASSWORD }}'
-          COSIGN_PRIVATE_KEY: '${{ secrets.COSIGN_PRIVATE_KEY }}'
-        run: |
-          cosign sign --key env://COSIGN_PRIVATE_KEY --yes --recursive "${{ steps.set-repo-determine-image-tag.outputs.container-repo }}@${{ steps.publish-manifest-list.outputs.image-digest }}"
+        uses: ./.github/actions/sign-container-image
+        with:
+          password: '${{ secrets.COSIGN_PASSWORD }}'
+          private_key: '${{ secrets.COSIGN_PRIVATE_KEY }}'
+          image: "${{ steps.set-repo-determine-image-tag.outputs.container-repo }}@${{ steps.publish-manifest-list.outputs.image-digest }}"
 
   publish-ig-images-manifest:
     name: Publish ig img manifest
     # level: 2
     if: github.event_name != 'pull_request'
-    needs: build-ig-container-images
+    needs:
+      - build-ig-container-images
+      - check-secrets
     runs-on: ubuntu-latest
     permissions:
       # allow publishing container image
@@ -810,7 +814,9 @@ jobs:
           registry: ${{ env.REGISTRY }}
           container-image: ${{ github.repository_owner }}/ig
       - name: Publish the manifest list
+        id: publish-manifest-list
         run: |
+          IMAGE_TAG=${{ steps.set-repo-determine-image-tag.outputs.container-repo }}:${{ steps.set-repo-determine-image-tag.outputs.image-tag }}
           IMAGE_SOURCE="https://github.com/inspektor-gadget/inspektor-gadget"
           IMAGE_DOCUMENTATION="https://inspektor-gadget.io/docs"
           IMAGE_LICENSES="Apache-2.0"
@@ -818,7 +824,7 @@ jobs:
           IMAGE_DESCRIPTION="Inspektor Gadget is a collection of tools (or gadgets) to debug and inspect Kubernetes resources and applications. This image only includes the ig binary, a standalone tool to run the gadgets."
 
           docker buildx imagetools create \
-            -t ${{ steps.set-repo-determine-image-tag.outputs.container-repo }}:${{ steps.set-repo-determine-image-tag.outputs.image-tag }} \
+            -t $IMAGE_TAG \
             ${{ steps.set-repo-determine-image-tag.outputs.container-repo }}@${{ needs.build-ig-container-images.outputs.digest-amd64 }} \
             ${{ steps.set-repo-determine-image-tag.outputs.container-repo }}@${{ needs.build-ig-container-images.outputs.sbom-digest-amd64 }} \
             ${{ steps.set-repo-determine-image-tag.outputs.container-repo }}@${{ needs.build-ig-container-images.outputs.digest-arm64 }} \
@@ -829,10 +835,22 @@ jobs:
             --annotation index:org.opencontainers.image.source="$IMAGE_SOURCE" \
             --annotation index:org.opencontainers.image.title="$IMAGE_TITLE"
 
+          image_digest=$(docker buildx imagetools inspect --format '{{json .Manifest.Digest}}' $IMAGE_TAG | jq -r)
+          echo "image-digest=${image_digest}" >> $GITHUB_OUTPUT
+      - name: Sign the manifest list
+        if: needs.check-secrets.outputs.cosign == 'true'
+        uses: ./.github/actions/sign-container-image
+        with:
+          password: '${{ secrets.COSIGN_PASSWORD }}'
+          private_key: '${{ secrets.COSIGN_PRIVATE_KEY }}'
+          image: "${{ steps.set-repo-determine-image-tag.outputs.container-repo }}@${{ steps.publish-manifest-list.outputs.image-digest }}"
+
   build-helper-images:
-    # level: 0
+    # level: 2
     name: helper images
     runs-on: ubuntu-latest
+    needs:
+      - check-secrets
     outputs:
       dnstester_image: ${{ steps.image-tag.outputs.dnstester }}
       ebpf_builder_image: ${{ steps.image-tag.outputs.ebpf-builder }}
@@ -893,10 +911,13 @@ jobs:
     - name: Build ${{ matrix.image.name }} image
       id: build-image
       if: steps.check-build-helpers.outputs.build == 'true'
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         context: ${{ matrix.image.context }}
         file: ${{ matrix.image.dockerfile }}
+        # The repository should have the variable PUSH_HELPERS set to
+        # ENABLE_PUSH_HELPERS, see:
+        # https://docs.github.com/en/actions/learn-github-actions/variables#creating-configuration-variables-for-a-repository
         push: ${{ vars.PUSH_HELPERS == 'ENABLE_PUSH_HELPERS' }}
         tags: ${{ steps.set-repo-determine-image-tag.outputs.container-repo }}:${{ steps.set-repo-determine-image-tag.outputs.image-tag }}
         platforms: ${{ matrix.image.platform }}
@@ -904,7 +925,7 @@ jobs:
       id: image-tag
       run: |
         if [ -n "${{ steps.build-image.outputs.digest }}" ]; then
-          image="${{ steps.set-repo-determine-image-tag.outputs.container-repo }}:${{ steps.set-repo-determine-image-tag.outputs.image-tag }}"
+          image="${{ steps.set-repo-determine-image-tag.outputs.container-repo }}@${{ steps.build-image.outputs.digest }}"
         else
           if [ ${{ matrix.image.name }} == "dnstester" ]; then
             image=${{ env.DEFAULT_DNSTESTER_IMAGE }}
@@ -917,6 +938,13 @@ jobs:
         fi
 
         echo "${{ matrix.image.name }}=${image}" >> $GITHUB_OUTPUT
+    - name: Sign ${{ matrix.image.name }} image
+      if: steps.check-build-helpers.outputs.build == 'true' && needs.check-secrets.outputs.cosign == 'true' && vars.PUSH_HELPERS == 'ENABLE_PUSH_HELPERS'
+      uses: ./.github/actions/sign-container-image
+      with:
+        password: '${{ secrets.COSIGN_PASSWORD }}'
+        private_key: '${{ secrets.COSIGN_PRIVATE_KEY }}'
+        image: "${{ steps.set-repo-determine-image-tag.outputs.container-repo }}@${{ steps.build-image.outputs.digest }}"
 
   build-examples:
     name: example
@@ -949,7 +977,7 @@ jobs:
         registry: ${{ env.REGISTRY }}
         container-image: ${{ env.CONTAINER_REPO }}
     - name: Build example container
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         context: /home/runner/work/inspektor-gadget/inspektor-gadget
         file: /home/runner/work/inspektor-gadget/inspektor-gadget/examples/${{ matrix.example }}/Dockerfile
@@ -969,12 +997,14 @@ jobs:
         cache: true
     - name: Build builtin gadgets example binaries
       run: |
-        for dir in $(dirname $(find examples/builtin-gadgets -name README.md)); do
+        cd examples
+        for dir in $(dirname $(find builtin-gadgets -name README.md)); do
           go build ./$dir;
         done
     - name: Build gadgets example binaries
       run: |
-        for dir in $(dirname $(find examples/gadgets -name main.go)); do
+        cd examples
+        for dir in $(dirname $(find gadgets -name main.go)); do
           go build ./$dir;
         done
 
@@ -1096,7 +1126,7 @@ jobs:
         export IMAGE_TAG=${{ steps.set-repo-determine-image-tag.outputs.image-tag }}
         make -C charts package
     - name: Upload Helm charts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: gadget-charts-tgz
         path: charts/bin/*.tgz
@@ -1234,15 +1264,11 @@ jobs:
     # level: 1
     needs: check-secrets
     runs-on: ubuntu-latest
-    # When this job is run by a PR coming from a fork, it will not have access
-    # to secrets.
-    # Also, unless specified in the secrets configuration, dependabot cannot access
-    # to secrets.
-    # So, we skip this job when run by dependabot and from a PR coming from a
-    # fork.
-    # We still need to run this job on push, otherwise it will not be run when
-    # we merge something on main.
-    if: github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') && needs.check-secrets.outputs.cosign == 'true'
+    # The first check means that job will only run if the secrets are present. So it will be skipped
+    # for forks, PRs from forks and dependabot PRs (if no dependabot secret are configured).
+    # The second check ensures if we forgot configuring the secrets in main repo
+    # (inspektor-gadget/inspektor-gadget) so we can catch it early.
+    if: needs.check-secrets.outputs.cosign == 'true' || (github.event_name == 'push' && github.repository == 'inspektor-gadget/inspektor-gadget')
     steps:
       - uses: actions/checkout@v4
       - name: Install Cosign
@@ -1276,7 +1302,7 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
       - name: Get ig-linux-amd64.tar.gz from artifact.
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: ig-linux-amd64-tar-gz
           path: /home/runner/work/inspektor-gadget/
@@ -1312,7 +1338,6 @@ jobs:
       - build-ig
       - build-helper-images
       - check-secrets
-      - public-key-check
     runs-on: ubuntu-latest
     permissions:
       # allow publishing container image
@@ -1334,7 +1359,7 @@ jobs:
           registry: ${{ env.REGISTRY }}
           container-image: ${{ env.CONTAINER_REPO }}
       - name: Get ig-linux-amd64.tar.gz from artifact.
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: ig-linux-amd64-tar-gz
           path: /home/runner/work/inspektor-gadget/
@@ -1342,6 +1367,11 @@ jobs:
         run: |
           tar zxvf /home/runner/work/inspektor-gadget/ig-linux-amd64.tar.gz
           sudo mv ig /usr/bin/ig
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@main
+      - name: Verify eBPF builder image
+        run: |
+          cosign verify --key pkg/resources/inspektor-gadget.pub ${{ needs.build-helper-images.outputs.ebpf_builder_image }}
       - name: Build gadgets
         run: |
           export GADGET_REPOSITORY=${{ steps.set-repo-determine-image-tag.outputs.gadget-repository }}
@@ -1355,9 +1385,6 @@ jobs:
 
           # Avoid building the gadgets again
           make -C gadgets/ push -o build
-      - name: Install Cosign
-        if: needs.check-secrets.outputs.cosign == 'true'
-        uses: sigstore/cosign-installer@main
       - name: Sign the gadgets
         if: needs.check-secrets.outputs.cosign == 'true'
         env:
@@ -1373,6 +1400,7 @@ jobs:
       - build-ig
       - build-helper-images
       - build-and-push-gadgets
+      - check-secrets
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -1383,7 +1411,7 @@ jobs:
         registry: ${{ env.REGISTRY }}
         container-image: ${{ env.CONTAINER_REPO }}
     - name: Get ig-linux-amd64.tar.gz from artifact.
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
       with:
         name: ig-linux-amd64-tar-gz
         path: /home/runner/work/inspektor-gadget/
@@ -1402,7 +1430,72 @@ jobs:
           make \
           GADGET_REPOSITORY=${{ steps.set-repo-determine-image-tag.outputs.gadget-repository }} \
           GADGET_TAG=${{ steps.set-repo-determine-image-tag.outputs.gadget-tag }} \
-          -C gadgets/ test -o build
+          IG_FLAGS="--verify-image=${{ needs.check-secrets.outputs.cosign }}" \
+          -C gadgets/ test-ig-local -o build
+
+  test-gadgets-k8s:
+    name: Test gadgets K8s
+    #level 3
+    needs:
+      - build-ig
+      - build-gadget-container-images
+      - build-helper-images
+      - build-and-push-gadgets
+      - check-secrets
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [docker, containerd, cri-o]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set container repository and determine image tag
+      id: set-repo-determine-image-tag
+      uses: ./.github/actions/set-container-repo-and-determine-image-tag
+      with:
+        registry: ${{ env.REGISTRY }}
+        container-image: ${{ env.CONTAINER_REPO }}
+    - name: Setup go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        cache: true
+      id: go
+    - name: Setup minikube
+      uses: ./.github/actions/setup-minikube
+      with:
+        runtime: ${{ matrix.runtime }}
+        multi-node: true
+    - name: Get gadget-container-image-linux-amd64.tar from artifact.
+      uses: actions/download-artifact@v4
+      with:
+        name: gadget-container-image-linux-amd64.tar
+        path: /home/runner/work/inspektor-gadget/
+    - name: Prepare minikube by loading gadget-container-image-linux-amd64.tar
+      run: |
+        # 'docker load' ensures the image is named correctly e.g podman has issues loading untagged images from archive
+        docker load -i /home/runner/work/inspektor-gadget/gadget-container-image-linux-amd64.tar
+        minikube image load ${{ steps.set-repo-determine-image-tag.outputs.container-repo }}:${{ steps.set-repo-determine-image-tag.outputs.image-tag }}
+    - name: Get kubectl-gadget-linux-amd64.tar.gz from artifact.
+      uses: actions/download-artifact@v4
+      with:
+        name: kubectl-gadget-linux-amd64-tar-gz
+        path: /home/runner/work/inspektor-gadget/inspektor-gadget/
+    - name: Gadgets tests
+      run: |
+        tar zxvf /home/runner/work/inspektor-gadget/inspektor-gadget/kubectl-gadget-linux-amd64.tar.gz
+        ./kubectl-gadget deploy --image-pull-policy=Never --debug --experimental --image=${{ steps.set-repo-determine-image-tag.outputs.container-repo }}:${{ steps.set-repo-determine-image-tag.outputs.image-tag }}
+        make \
+        GADGET_REPOSITORY=${{ steps.set-repo-determine-image-tag.outputs.gadget-repository }} \
+        GADGET_TAG=${{ steps.set-repo-determine-image-tag.outputs.gadget-tag }} \
+        KUBECTL_GADGET=/home/runner/work/inspektor-gadget/inspektor-gadget/kubectl-gadget \
+        IG_FLAGS="--verify-image=${{ needs.check-secrets.outputs.cosign }}" \
+        -C gadgets/ test-k8s -o build
+    - name: Undeploy Inspektor Gadget
+      id: undeploy-ig
+      if: always()
+      shell: bash
+      run: ./kubectl-gadget undeploy
 
   test-integration-non-k8s-ig:
     name: Test ig w/o k8s
@@ -1426,7 +1519,7 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
       - name: Get ig-linux-amd64.tar.gz from artifact.
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: ig-linux-amd64-tar-gz
           path: /home/runner/work/inspektor-gadget/
@@ -1514,10 +1607,7 @@ jobs:
         # GitHub Action.
         az extension add --name aks-preview
 
-        # Let's keep thing in the US to avoid data crossing the Atlantic as
-        # GitHub data centers are in the US:
-        # https://github.blog/2017-10-12-evolution-of-our-data-centers/
-        az aks create -l eastus -g ${AZURE_AKS_RESOURCE_GROUP} -n ${{ env.CLUSTER_NAME }} -s $node_size --os-sku ${{ matrix.os-sku }} --no-ssh-key
+        az aks create -l eastus2 -g ${AZURE_AKS_RESOURCE_GROUP} -n ${{ env.CLUSTER_NAME }} -s $node_size --os-sku ${{ matrix.os-sku }} --no-ssh-key
     - uses: azure/aks-set-context@v4
       name: Set AKS cluster ${{ env.CLUSTER_NAME }} context
       with:
@@ -1790,6 +1880,7 @@ jobs:
       - build-gadget-container-images
       - build-helper-images
       - build-and-push-gadgets
+      - check-secrets
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -1808,7 +1899,7 @@ jobs:
         runtime: ${{ matrix.runtime }}
         multi-node: true
     - name: Get gadget-container-image-linux-amd64.tar from artifact.
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
       with:
         name: gadget-container-image-linux-amd64.tar
         path: /home/runner/work/inspektor-gadget/
@@ -1833,6 +1924,7 @@ jobs:
         dnstester_image: ${{ needs.build-helper-images.outputs.dnstester_image }}
         gadget_repository: ${{ steps.set-repo-determine-image-tag.outputs.gadget-repository }}
         gadget_tag: ${{ steps.set-repo-determine-image-tag.outputs.gadget-tag }}
+        gadget_verify_image: ${{ needs.check-secrets.outputs.cosign }}
         test_summary_suffix: ${{ matrix.runtime }}
     - if: ${{ matrix.runtime == 'docker' }}
       name: Check that README is up-to-date
@@ -1862,7 +1954,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Get all reports
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
       with:
         name: "test-reports"
     - name: Store test reports
@@ -1881,7 +1973,6 @@ jobs:
       - semgrep
       - test-integration-minikube
       - test-integration-aks
-      - test-integration-aro
       - test-components
       - build-ig-cwe
       - test-ig
@@ -1894,6 +1985,7 @@ jobs:
       - check-secrets
       - scan-gadget-container-images
       - publish-gadget-images-manifest
+      - public-key-check
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1922,7 +2014,7 @@ jobs:
         name: Release ${{ github.ref_name }}
         draft: true
     - name: Get all artifacts.
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
     - name: Setup go
       uses: actions/setup-go@v5
       with:

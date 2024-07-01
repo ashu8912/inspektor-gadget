@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 
 	"github.com/distribution/reference"
 	"github.com/opencontainers/image-spec/specs-go"
@@ -76,7 +77,7 @@ type BuildGadgetImageOpts struct {
 // the "name:tag" format is used to name and tag the created image. If it's empty the image is not
 // named.
 func BuildGadgetImage(ctx context.Context, opts *BuildGadgetImageOpts, image string) (*GadgetImageDesc, error) {
-	ociStore, err := getLocalOciStore()
+	ociStore, err := GetLocalOciStore()
 	if err != nil {
 		return nil, fmt.Errorf("getting oci store: %w", err)
 	}
@@ -291,7 +292,16 @@ func createImageIndex(ctx context.Context, target oras.Target, o *BuildGadgetIma
 	// Read the eBPF program files and push them to the memory store
 	layers := []ocispec.Descriptor{}
 
-	for arch, paths := range o.ObjectPaths {
+	archs := make([]string, 0, len(o.ObjectPaths))
+	for k := range o.ObjectPaths {
+		archs = append(archs, k)
+	}
+
+	// Sort the keys to ensure the order of the layers is deterministic
+	slices.Sort(archs)
+
+	for _, arch := range archs {
+		paths := o.ObjectPaths[arch]
 		manifestDesc, err := createManifestForTarget(ctx, target, o.MetadataPath, arch, paths, o.CreatedDate)
 		if err != nil {
 			return ocispec.Descriptor{}, fmt.Errorf("creating %s manifest: %w", arch, err)

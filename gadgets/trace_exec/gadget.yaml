@@ -10,9 +10,7 @@ tracers:
 structs:
   event:
     fields:
-    - name: timestamp
-      attributes:
-        template: timestamp
+    - name: timestamp_raw
     - name: pid
       attributes:
         template: pid
@@ -67,7 +65,6 @@ structs:
       attributes:
         width: 16
         alignment: left
-        hidden: true
         ellipsis: end
     - name: mntns_id
       description: Mount namespace inode id
@@ -75,6 +72,14 @@ structs:
         template: ns
     - name: upper_layer
       description: Whether the executable is in the upper layer of the overlay filesystem
+      attributes:
+        width: 5
+        alignment: left
+        ellipsis: end
+    - name: pupper_layer
+      description: Whether the executable's parent in the process hierarchy is in
+        the upper layer of the overlay filesystem. Only initialized when the execution
+        succeeded.
       attributes:
         width: 5
         alignment: left

@@ -76,6 +76,14 @@ func (d *dataArray) Get(index int) Data {
 	return (*dataElement)(d.DataArray[index])
 }
 
+func (d *dataArray) Swap(i, j int) {
+	l := len(d.DataArray)
+	if i >= l || i < 0 || j >= l || j < 0 {
+		return
+	}
+	d.DataArray[i], d.DataArray[j] = d.DataArray[j], d.DataArray[i]
+}
+
 func (d *dataArray) New() Data {
 	return d.ds.newDataElement()
 }
@@ -124,6 +132,11 @@ func (f *field) ReflectType() reflect.Type {
 	}
 }
 
+type subscription struct {
+	priority int
+	fn       PacketFunc
+}
+
 type dataSource struct {
 	name string
 
@@ -140,9 +153,7 @@ type dataSource struct {
 
 	requestedFields map[string]bool
 
-	subscriptionsData   []*subscriptionData
-	subscriptionsArray  []*subscriptionArray
-	subscriptionsPacket []*subscriptionPacket
+	subscriptions []*subscription
 
 	requested bool
 
@@ -150,7 +161,13 @@ type dataSource struct {
 	lock      sync.RWMutex
 }
 
-func newDataSource(t Type, name string) *dataSource {
+func newDataSource(t Type, name string) (*dataSource, error) {
+	switch t {
+	case TypeSingle, TypeArray:
+	default:
+		return nil, fmt.Errorf("invalid data source type: %v", t)
+	}
+
 	return &dataSource{
 		name:            name,
 		dType:           t,
@@ -159,15 +176,18 @@ func newDataSource(t Type, name string) *dataSource {
 		byteOrder:       binary.NativeEndian,
 		tags:            make([]string, 0),
 		annotations:     map[string]string{},
-	}
+	}, nil
 }
 
-func New(t Type, name string) DataSource {
+func New(t Type, name string) (DataSource, error) {
 	return newDataSource(t, name)
 }
 
 func NewFromAPI(in *api.DataSource) (DataSource, error) {
-	ds := newDataSource(Type(in.Type), in.Name)
+	ds, err := newDataSource(Type(in.Type), in.Name)
+	if err != nil {
+		return nil, fmt.Errorf("creating DataSource: %w", err)
+	}
 	for _, f := range in.Fields {
 		ds.fields = append(ds.fields, (*field)(f))
 		if !FieldFlagUnreferenced.In(f.Flags) {
@@ -351,6 +371,9 @@ func (ds *dataSource) AddStaticFields(size uint32, fields []StaticField) (FieldA
 				checkParents[nf] = struct{}{}
 			}
 		}
+		if s, ok := f.(HiddenField); ok && s.FieldHidden() {
+			FieldFlagHidden.AddTo(&nf.Flags)
+		}
 		newFields = append(newFields, nf)
 	}
 
@@ -454,13 +477,30 @@ func (ds *dataSource) Subscribe(fn DataFunc, priority int) error {
 	ds.lock.Lock()
 	defer ds.lock.Unlock()
 
-	ds.subscriptionsData = append(ds.subscriptionsData, &subscriptionData{
-		priority: priority,
-		fn:       fn,
-	})
-	sort.SliceStable(ds.subscriptionsData, func(i, j int) bool {
-		return ds.subscriptionsData[i].priority < ds.subscriptionsData[j].priority
-	})
+	switch ds.Type() {
+	case TypeSingle:
+		ds.addSubscription(&subscription{priority: priority, fn: func(source DataSource, p Packet) error {
+			return fn(ds, p.(*data))
+		}})
+	case TypeArray:
+		ds.addSubscription(&subscription{priority: priority, fn: func(source DataSource, p Packet) error {
+			i := 0
+			alen := len(p.(*dataArray).DataArray)
+			for i < alen {
+				err := fn(ds, (*dataElement)(p.(*dataArray).DataArray[i]))
+				if err != nil {
+					if errors.Is(err, ErrDiscard) {
+						p.(*dataArray).DataArray = slices.Delete(p.(*dataArray).DataArray, i, i+1)
+						alen--
+						continue
+					}
+					return err
+				}
+				i++
+			}
+			return nil
+		}})
+	}
 
 	return nil
 }
@@ -477,14 +517,9 @@ func (ds *dataSource) SubscribeArray(fn ArrayFunc, priority int) error {
 	ds.lock.Lock()
 	defer ds.lock.Unlock()
 
-	ds.subscriptionsArray = append(ds.subscriptionsArray, &subscriptionArray{
-		priority: priority,
-		fn:       fn,
-	})
-	sort.SliceStable(ds.subscriptionsArray, func(i, j int) bool {
-		return ds.subscriptionsArray[i].priority < ds.subscriptionsArray[j].priority
-	})
-
+	ds.addSubscription(&subscription{priority: priority, fn: func(source DataSource, p Packet) error {
+		return fn(ds, p.(*dataArray))
+	}})
 	return nil
 }
 
@@ -496,53 +531,32 @@ func (ds *dataSource) SubscribePacket(fn PacketFunc, priority int) error {
 	ds.lock.Lock()
 	defer ds.lock.Unlock()
 
-	ds.subscriptionsPacket = append(ds.subscriptionsPacket, &subscriptionPacket{
-		priority: priority,
-		fn:       fn,
-	})
-	sort.SliceStable(ds.subscriptionsPacket, func(i, j int) bool {
-		return ds.subscriptionsPacket[i].priority < ds.subscriptionsPacket[j].priority
-	})
-
+	ds.addSubscription(&subscription{priority: priority, fn: func(source DataSource, p Packet) error {
+		return fn(ds, p)
+	}})
 	return nil
+}
+
+func (ds *dataSource) addSubscription(s *subscription) {
+	ds.subscriptions = append(ds.subscriptions, s)
+	sort.SliceStable(ds.subscriptions, func(i, j int) bool {
+		return ds.subscriptions[i].priority < ds.subscriptions[j].priority
+	})
 }
 
 func (ds *dataSource) EmitAndRelease(p Packet) error {
 	defer ds.Release(p)
 
-	switch ds.dType {
-	case TypeSingle:
-		for _, sub := range ds.subscriptionsData {
-			err := sub.fn(ds, p.(*data))
-			if err != nil {
-				return err
-			}
+	var err error
+	for _, s := range ds.subscriptions {
+		err = s.fn(ds, p)
+		if errors.Is(err, ErrDiscard) {
+			return nil
 		}
-	case TypeArray:
-		for _, sub := range ds.subscriptionsData {
-			for _, d := range p.(*dataArray).GetDataArray() {
-				err := sub.fn(ds, (*dataElement)(d))
-				if err != nil {
-					return err
-				}
-			}
-		}
-		for _, sub := range ds.subscriptionsArray {
-			err := sub.fn(ds, p.(*dataArray))
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	// Finally, send packet to packet-subscribers no matter the datasource type
-	for _, sub := range ds.subscriptionsPacket {
-		err := sub.fn(ds, p)
 		if err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 

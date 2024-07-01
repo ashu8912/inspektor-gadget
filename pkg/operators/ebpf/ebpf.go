@@ -31,6 +31,7 @@ import (
 	"github.com/cilium/ebpf/link"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/spf13/viper"
+	"oras.land/oras-go/v2"
 
 	containercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/container-collection"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
@@ -55,6 +56,11 @@ const (
 	ParamIface       = "iface"
 	ParamTraceKernel = "trace-pipe"
 
+	// Keep in sync with `include/gadget/kernel_stack_map.h`
+	KernelStackMapName       = "ig_kstack"
+	KernelStackMapMaxEntries = 10000
+	PerfMaxStackDepth        = 127
+
 	kernelTypesVar = "kernelTypes"
 )
 
@@ -76,12 +82,13 @@ func (o *ebpfOperator) Description() string {
 
 func (o *ebpfOperator) InstantiateImageOperator(
 	gadgetCtx operators.GadgetContext,
+	target oras.ReadOnlyTarget,
 	desc ocispec.Descriptor,
 	paramValues api.ParamValues,
 ) (
 	operators.ImageOperatorInstance, error,
 ) {
-	r, err := oci.GetContentFromDescriptor(gadgetCtx.Context(), desc)
+	r, err := oci.GetContentFromDescriptor(gadgetCtx.Context(), target, desc)
 	if err != nil {
 		return nil, fmt.Errorf("getting ebpf binary: %w", err)
 	}
@@ -109,7 +116,7 @@ func (o *ebpfOperator) InstantiateImageOperator(
 		containers: make(map[string]*containercollection.Container),
 
 		enums:      make(map[string]*btf.Enum),
-		converters: make(map[datasource.DataSource][]func(ds datasource.DataSource, data datasource.Data) error),
+		formatters: make(map[datasource.DataSource][]func(ds datasource.DataSource, data datasource.Data) error),
 
 		vars: make(map[string]*ebpfVar),
 
@@ -166,7 +173,9 @@ type ebpfInstance struct {
 	containers map[string]*containercollection.Container
 
 	enums      map[string]*btf.Enum
-	converters map[datasource.DataSource][]func(ds datasource.DataSource, data datasource.Data) error
+	formatters map[datasource.DataSource][]func(ds datasource.DataSource, data datasource.Data) error
+
+	stackIdMap *ebpf.Map
 
 	gadgetCtx operators.GadgetContext
 }
@@ -257,6 +266,21 @@ func (i *ebpfInstance) analyze() error {
 		i.logger.Debugf("error extracting default values for params: %v", err)
 	}
 
+	// create map for kernel stack, before initializing converters
+	if _, ok := i.collectionSpec.Maps[KernelStackMapName]; ok {
+		stackIdMapSpec := ebpf.MapSpec{
+			Name:       KernelStackMapName,
+			Type:       ebpf.StackTrace,
+			KeySize:    4,
+			ValueSize:  8 * PerfMaxStackDepth,
+			MaxEntries: KernelStackMapMaxEntries,
+		}
+		i.stackIdMap, err = ebpf.NewMap(&stackIdMapSpec)
+		if err != nil {
+			return fmt.Errorf("creating stack id map: %w", err)
+		}
+	}
+
 	// Iterate over programs
 	for name, program := range i.collectionSpec.Programs {
 		i.logger.Debugf("program %q", name)
@@ -287,7 +311,7 @@ func (i *ebpfInstance) init(gadgetCtx operators.GadgetContext) error {
 		return fmt.Errorf("registering datasources: %w", err)
 	}
 
-	err = i.initConverters(gadgetCtx)
+	err = i.initFormatters(gadgetCtx)
 	if err != nil {
 		return fmt.Errorf("initializing formatters: %w", err)
 	}
@@ -354,11 +378,11 @@ func (i *ebpfInstance) ExtraParams(gadgetCtx operators.GadgetContext) api.Params
 }
 
 func (i *ebpfInstance) Prepare(gadgetCtx operators.GadgetContext) error {
-	for ds, converters := range i.converters {
-		for _, converter := range converters {
-			converter := converter
+	for ds, formatters := range i.formatters {
+		for _, formatter := range formatters {
+			formatter := formatter
 			ds.Subscribe(func(ds datasource.DataSource, data datasource.Data) error {
-				return converter(ds, data)
+				return formatter(ds, data)
 			}, 0)
 		}
 	}
@@ -485,6 +509,11 @@ func (i *ebpfInstance) Start(gadgetCtx operators.GadgetContext) error {
 
 	mapReplacements := make(map[string]*ebpf.Map)
 	constReplacements := make(map[string]any)
+
+	// create map for kernel stack
+	if i.stackIdMap != nil {
+		mapReplacements[KernelStackMapName] = i.stackIdMap
+	}
 
 	// Set gadget params
 	for name, p := range i.params {

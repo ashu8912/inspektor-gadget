@@ -31,12 +31,12 @@ struct event {
 
 	char task[TASK_COMM_LEN];
 	gadget_mntns_id mntns_id;
-	gadget_timestamp timestamp;
+	gadget_timestamp timestamp_raw;
 	__u32 pid;
 	__u32 uid;
 	__u32 gid;
 	gadget_netns_id netns;
-	enum event_type type;
+	enum event_type type_raw;
 };
 
 const volatile uid_t filter_uid = -1;
@@ -131,10 +131,12 @@ static __always_inline bool fill_tuple(struct tuple_key_t *tuple,
 	}
 
 	BPF_CORE_READ_INTO(&tuple->dst.port, sk, __sk_common.skc_dport);
+	tuple->dst.port = bpf_ntohs(tuple->dst.port);
 	if (tuple->dst.port == 0)
 		return false;
 
 	BPF_CORE_READ_INTO(&tuple->src.port, sockp, inet_sport);
+	tuple->src.port = bpf_ntohs(tuple->src.port);
 	if (tuple->src.port == 0)
 		return false;
 
@@ -146,8 +148,8 @@ static __always_inline void fill_event(struct tuple_key_t *tuple,
 				       __u64 uid_gid, __u16 family, __u8 type,
 				       __u64 mntns_id)
 {
-	event->timestamp = bpf_ktime_get_boot_ns();
-	event->type = type;
+	event->timestamp_raw = bpf_ktime_get_boot_ns();
+	event->type_raw = type;
 	event->pid = pid;
 	event->uid = (__u32)uid_gid;
 	event->gid = (__u32)(uid_gid >> 32);
@@ -378,7 +380,6 @@ int BPF_KRETPROBE(ig_tcp_accept, struct sock *sk)
 	sport = BPF_CORE_READ(sk, __sk_common.skc_num);
 
 	fill_tuple(&t, sk, family);
-	t.src.port = bpf_ntohs(sport);
 	/* do not send event if IP address is 0.0.0.0 or port is 0 */
 	if (__builtin_memcmp(t.src.l3.addr.v6, ip_v6_zero,
 			     sizeof(t.src.l3.addr.v6)) == 0 ||

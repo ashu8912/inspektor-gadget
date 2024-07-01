@@ -10,9 +10,7 @@ tracers:
 structs:
   event:
     fields:
-    - name: timestamp
-      attributes:
-        template: timestamp
+    - name: timestamp_raw
     - name: src
       attributes:
         minWidth: 24
@@ -39,7 +37,7 @@ structs:
       description: 'TODO: Fill field description'
       attributes:
         template: uid
-    - name: tcpflags
+    - name: tcpflags_raw
       description: 'TODO: Fill field description'
       attributes:
         width: 16
@@ -55,7 +53,7 @@ structs:
       description: Network namespace inode id
       attributes:
         template: ns
-    - name: type
+    - name: type_raw
       description: Type of the retransmission, either RETRANS or LOSS
       attributes:
         width: 7

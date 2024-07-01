@@ -26,6 +26,10 @@ import (
 )
 
 func TestTraceNetwork(t *testing.T) {
+	if containerRuntime == ContainerRuntimeCRIO {
+		t.Skipf("Skip running trace network test for %q runtime. See issue #2358", containerRuntime)
+	}
+
 	t.Parallel()
 	ns := GenerateTestNamespaceName("test-trace-network")
 
@@ -172,7 +176,7 @@ func TestTraceNetwork(t *testing.T) {
 				}
 			}
 
-			match.ExpectEntriesToMatch(t, output, normalize, expectedEntries...)
+			match.MatchEntries(t, match.JSONMultiObjectMode, output, normalize, expectedEntries...)
 		},
 	}
 
