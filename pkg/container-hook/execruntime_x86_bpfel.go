@@ -8,16 +8,36 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
 
 type execruntimeRecord struct {
+	_          structs.HostLayout
+	MntnsId    uint64
 	Pid        uint32
+	Euid       uint32
 	ArgsSize   uint32
 	CallerComm [16]uint8
-	Args       [15360]uint8
+	Args       [5120]uint8
+	_          [4]byte
 }
+
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	execruntimeMapExecArgs     = "exec_args"
+	execruntimeMapIgFaPickCtx  = "ig_fa_pick_ctx"
+	execruntimeMapIgFaRecords  = "ig_fa_records"
+	execruntimeProgIgExecveE   = "ig_execve_e"
+	execruntimeProgIgExecveX   = "ig_execve_x"
+	execruntimeProgIgFaPickE   = "ig_fa_pick_e"
+	execruntimeProgIgFaPickX   = "ig_fa_pick_x"
+	execruntimeProgIgSchedExec = "ig_sched_exec"
+	execruntimeVarTracerGroup  = "tracer_group"
+)
 
 // loadExecruntime returns the embedded CollectionSpec for execruntime.
 func loadExecruntime() (*ebpf.CollectionSpec, error) {
@@ -39,7 +59,7 @@ func loadExecruntime() (*ebpf.CollectionSpec, error) {
 //	*execruntimeMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadExecruntimeObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadExecruntimeObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadExecruntime()
 	if err != nil {
 		return err
@@ -54,16 +74,18 @@ func loadExecruntimeObjects(obj interface{}, opts *ebpf.CollectionOptions) error
 type execruntimeSpecs struct {
 	execruntimeProgramSpecs
 	execruntimeMapSpecs
+	execruntimeVariableSpecs
 }
 
-// execruntimeSpecs contains programs before they are loaded into the kernel.
+// execruntimeProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type execruntimeProgramSpecs struct {
-	IgExecveE *ebpf.ProgramSpec `ebpf:"ig_execve_e"`
-	IgExecveX *ebpf.ProgramSpec `ebpf:"ig_execve_x"`
-	IgFaPickE *ebpf.ProgramSpec `ebpf:"ig_fa_pick_e"`
-	IgFaPickX *ebpf.ProgramSpec `ebpf:"ig_fa_pick_x"`
+	IgExecveE   *ebpf.ProgramSpec `ebpf:"ig_execve_e"`
+	IgExecveX   *ebpf.ProgramSpec `ebpf:"ig_execve_x"`
+	IgFaPickE   *ebpf.ProgramSpec `ebpf:"ig_fa_pick_e"`
+	IgFaPickX   *ebpf.ProgramSpec `ebpf:"ig_fa_pick_x"`
+	IgSchedExec *ebpf.ProgramSpec `ebpf:"ig_sched_exec"`
 }
 
 // execruntimeMapSpecs contains maps before they are loaded into the kernel.
@@ -73,7 +95,13 @@ type execruntimeMapSpecs struct {
 	ExecArgs    *ebpf.MapSpec `ebpf:"exec_args"`
 	IgFaPickCtx *ebpf.MapSpec `ebpf:"ig_fa_pick_ctx"`
 	IgFaRecords *ebpf.MapSpec `ebpf:"ig_fa_records"`
-	PidByTgid   *ebpf.MapSpec `ebpf:"pid_by_tgid"`
+}
+
+// execruntimeVariableSpecs contains global variables before they are loaded into the kernel.
+//
+// It can be passed ebpf.CollectionSpec.Assign.
+type execruntimeVariableSpecs struct {
+	TracerGroup *ebpf.VariableSpec `ebpf:"tracer_group"`
 }
 
 // execruntimeObjects contains all objects after they have been loaded into the kernel.
@@ -82,6 +110,7 @@ type execruntimeMapSpecs struct {
 type execruntimeObjects struct {
 	execruntimePrograms
 	execruntimeMaps
+	execruntimeVariables
 }
 
 func (o *execruntimeObjects) Close() error {
@@ -98,7 +127,6 @@ type execruntimeMaps struct {
 	ExecArgs    *ebpf.Map `ebpf:"exec_args"`
 	IgFaPickCtx *ebpf.Map `ebpf:"ig_fa_pick_ctx"`
 	IgFaRecords *ebpf.Map `ebpf:"ig_fa_records"`
-	PidByTgid   *ebpf.Map `ebpf:"pid_by_tgid"`
 }
 
 func (m *execruntimeMaps) Close() error {
@@ -106,18 +134,25 @@ func (m *execruntimeMaps) Close() error {
 		m.ExecArgs,
 		m.IgFaPickCtx,
 		m.IgFaRecords,
-		m.PidByTgid,
 	)
+}
+
+// execruntimeVariables contains all global variables after they have been loaded into the kernel.
+//
+// It can be passed to loadExecruntimeObjects or ebpf.CollectionSpec.LoadAndAssign.
+type execruntimeVariables struct {
+	TracerGroup *ebpf.Variable `ebpf:"tracer_group"`
 }
 
 // execruntimePrograms contains all programs after they have been loaded into the kernel.
 //
 // It can be passed to loadExecruntimeObjects or ebpf.CollectionSpec.LoadAndAssign.
 type execruntimePrograms struct {
-	IgExecveE *ebpf.Program `ebpf:"ig_execve_e"`
-	IgExecveX *ebpf.Program `ebpf:"ig_execve_x"`
-	IgFaPickE *ebpf.Program `ebpf:"ig_fa_pick_e"`
-	IgFaPickX *ebpf.Program `ebpf:"ig_fa_pick_x"`
+	IgExecveE   *ebpf.Program `ebpf:"ig_execve_e"`
+	IgExecveX   *ebpf.Program `ebpf:"ig_execve_x"`
+	IgFaPickE   *ebpf.Program `ebpf:"ig_fa_pick_e"`
+	IgFaPickX   *ebpf.Program `ebpf:"ig_fa_pick_x"`
+	IgSchedExec *ebpf.Program `ebpf:"ig_sched_exec"`
 }
 
 func (p *execruntimePrograms) Close() error {
@@ -126,6 +161,7 @@ func (p *execruntimePrograms) Close() error {
 		p.IgExecveX,
 		p.IgFaPickE,
 		p.IgFaPickX,
+		p.IgSchedExec,
 	)
 }
 

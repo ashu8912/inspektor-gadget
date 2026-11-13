@@ -1,4 +1,4 @@
-// Copyright 2024 The Inspektor Gadget authors
+// Copyright 2024-2025 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,32 +19,45 @@ package ebpfoperator
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"reflect"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/link"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/spf13/viper"
+	"golang.org/x/sys/unix"
+	"oras.land/oras-go/v2"
 
+	"github.com/inspektor-gadget/inspektor-gadget/internal/version"
 	containercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/container-collection"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
 	apihelpers "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api-helpers"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
+	libpcap_compiler "github.com/inspektor-gadget/inspektor-gadget/pkg/libpcap-compiler"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/networktracer"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/oci"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
+	ebpftypes "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/ebpf/types"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/params"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/socketenricher"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/symbolizer"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/tchandler"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/uprobetracer"
+	ebpfutils "github.com/inspektor-gadget/inspektor-gadget/pkg/utils/ebpf"
 )
 
 const (
@@ -56,15 +69,24 @@ const (
 	ParamTraceKernel = "trace-pipe"
 
 	kernelTypesVar = "kernelTypes"
+
+	AnnotationMapFlushOnStop  = "ebpf.map.flush-on-stop"
+	AnnotationIterFetchOnStop = "ebpf.iter.fetch-on-stop"
+	AnnotationRestName        = "ebpf.rest.name"
+	AnnotationRestLen         = "ebpf.rest.len"
 )
 
-type param struct {
-	*api.Param
-	fromEbpf bool
+type gadgetObjects struct {
+	programIDs []ebpf.ProgramID
+	mapIDs     []ebpf.MapID
 }
 
 // ebpfOperator reads ebpf programs from OCI images and runs them
-type ebpfOperator struct{}
+type ebpfOperator struct {
+	mu         sync.Mutex
+	gadgetObjs map[operators.GadgetContext]gadgetObjects
+	btfCache   *btf.Cache
+}
 
 func (o *ebpfOperator) Name() string {
 	return "ebpf"
@@ -76,12 +98,13 @@ func (o *ebpfOperator) Description() string {
 
 func (o *ebpfOperator) InstantiateImageOperator(
 	gadgetCtx operators.GadgetContext,
+	target oras.ReadOnlyTarget,
 	desc ocispec.Descriptor,
 	paramValues api.ParamValues,
 ) (
 	operators.ImageOperatorInstance, error,
 ) {
-	r, err := oci.GetContentFromDescriptor(gadgetCtx.Context(), desc)
+	r, err := oci.GetContentFromDescriptor(gadgetCtx.Context(), target, desc)
 	if err != nil {
 		return nil, fmt.Errorf("getting ebpf binary: %w", err)
 	}
@@ -95,21 +118,26 @@ func (o *ebpfOperator) InstantiateImageOperator(
 	// TODO: do some pre-checks in here, maybe validate hashes, signatures, etc.
 
 	newInstance := &ebpfInstance{
-		gadgetCtx: gadgetCtx, // context usually should not be stored, but should we really carry it through all funcs?
+		bpfOperator: o,
+		gadgetCtx:   gadgetCtx, // context usually should not be stored, but should we really carry it through all funcs?
+		done:        make(chan struct{}),
 
 		logger:  gadgetCtx.Logger(),
 		program: program,
 
 		// Preallocate maps
-		tracers:      make(map[string]*Tracer),
-		structs:      make(map[string]*Struct),
-		snapshotters: make(map[string]*Snapshotter),
-		params:       make(map[string]*param),
+		tracers:        make(map[string]*Tracer),
+		structs:        make(map[string]*Struct),
+		iterators:      make(map[string]*Iterator),
+		params:         make(map[string]*param),
+		mapIters:       make(map[string]*mapIter),
+		iterTargetMaps: make(map[string]string),
+		skTargetMaps:   make(map[string]string),
 
 		containers: make(map[string]*containercollection.Container),
 
-		enums:      make(map[string]*btf.Enum),
-		converters: make(map[datasource.DataSource][]func(ds datasource.DataSource, data datasource.Data) error),
+		enums:      make([]*enum, 0),
+		formatters: make(map[datasource.DataSource][]func(ds datasource.DataSource, data datasource.Data) error),
 
 		vars: make(map[string]*ebpfVar),
 
@@ -132,6 +160,9 @@ func (o *ebpfOperator) InstantiateImageOperator(
 
 	err = newInstance.init(gadgetCtx)
 	if err != nil {
+		// be sure to undo all changes done by init(), as we'll return a nil
+		// instance and Close() isn't called by the caller of this function
+		newInstance.Close(gadgetCtx)
 		return nil, fmt.Errorf("initializing ebpf gadget: %w", err)
 	}
 
@@ -139,7 +170,8 @@ func (o *ebpfOperator) InstantiateImageOperator(
 }
 
 type ebpfInstance struct {
-	mu sync.Mutex
+	mu          sync.Mutex
+	bpfOperator *ebpfOperator
 
 	config *viper.Viper
 
@@ -148,9 +180,17 @@ type ebpfInstance struct {
 	collectionSpec *ebpf.CollectionSpec
 	collection     *ebpf.Collection
 
-	tracers      map[string]*Tracer
-	structs      map[string]*Struct
-	snapshotters map[string]*Snapshotter
+	tracers   map[string]*Tracer
+	structs   map[string]*Struct
+	iterators map[string]*Iterator
+	mapIters  map[string]*mapIter
+	// iterTargetMaps maps a SEC("iter/bpf_map_elem") BPF program name to the
+	// map (by name) it should iterate over. Populated from
+	// GADGET_ITER_TARGET_MAP() declarations in the BPF object.
+	iterTargetMaps map[string]string
+	// skTargetMaps maps sk_skb and sk_msg programs to their sockmap or
+	// sockhash, as declared with GADGET_SK_TARGET_MAP().
+	skTargetMaps map[string]string
 	params       map[string]*param
 	paramValues  map[string]string
 
@@ -161,14 +201,26 @@ type ebpfInstance struct {
 	// map from ebpf variable name to ebpfVar struct
 	vars map[string]*ebpfVar
 
-	links []link.Link
+	links   []link.Link
+	perfFds []int
+
+	// rawDetachers undo BPF_PROG_ATTACH attachments that don't return a Link
+	// (sk_skb stream_parser/verdict). Run on Stop().
+	rawDetachers []func() error
 
 	containers map[string]*containercollection.Container
 
-	enums      map[string]*btf.Enum
-	converters map[datasource.DataSource][]func(ds datasource.DataSource, data datasource.Data) error
+	enums      []*enum
+	formatters map[datasource.DataSource][]func(ds datasource.DataSource, data datasource.Data) error
+
+	kernelStackMap *ebpf.Map
+	userStackMap   *ebpf.Map
 
 	gadgetCtx operators.GadgetContext
+	done      chan struct{}
+
+	// used to be sure all tracers are done before returning from Stop()
+	wg sync.WaitGroup
 }
 
 func (i *ebpfInstance) loadSpec() error {
@@ -177,11 +229,16 @@ func (i *ebpfInstance) loadSpec() error {
 	if err != nil {
 		return fmt.Errorf("loading spec: %w", err)
 	}
+
+	if spec.Types == nil {
+		return fmt.Errorf("missing types in ebpf spec")
+	}
+
 	i.collectionSpec = spec
 	return nil
 }
 
-func (i *ebpfInstance) analyze() error {
+func (i *ebpfInstance) analyze(gadgetCtx operators.GadgetContext, paramValues api.ParamValues) error {
 	prefixLookups := []populateEntry{
 		{
 			prefixFunc:   hasPrefix(tracerInfoPrefix),
@@ -189,20 +246,45 @@ func (i *ebpfInstance) analyze() error {
 			populateFunc: i.populateTracer,
 		},
 		{
-			prefixFunc:   hasPrefix(snapshottersPrefix),
+			prefixFunc: hasPrefix(snapshottersPrefix),
+			validator:  i.validateGlobalConstVoidPtrVar,
+			populateFunc: func(b btf.Type, s string) error {
+				gadgetCtx.Logger().Warnf("%s prefix is deprecated; please use %s instead", snapshottersPrefix, iteratorsPrefix)
+				return i.populateIterators(b, s)
+			},
+		},
+		{
+			// Distinct stem from iteratorsPrefix on purpose; see comment
+			// in types.go.
+			prefixFunc:   hasPrefix(iterTargetMapPrefix),
 			validator:    i.validateGlobalConstVoidPtrVar,
-			populateFunc: i.populateSnapshotter,
+			populateFunc: i.populateIterTargetMap,
+		},
+		{
+			prefixFunc:   hasPrefix(skTargetMapPrefix),
+			validator:    i.validateGlobalConstVoidPtrVar,
+			populateFunc: i.populateSKTargetMap,
+		},
+		{
+			prefixFunc:   hasPrefix(iteratorsPrefix),
+			validator:    i.validateGlobalConstVoidPtrVar,
+			populateFunc: i.populateIterators,
 		},
 		{
 			prefixFunc:   hasPrefix(paramPrefix),
 			validator:    i.validateGlobalConstVoidPtrVar,
 			populateFunc: i.populateParam,
 		},
-		// {
-		// 	prefixFunc:   hasPrefix(tracerMapPrefix),
-		// 	validator:    i.validateGlobalConstVoidPtrVar,
-		// 	populateFunc: i.populateMap,
-		// },
+		{
+			prefixFunc:   hasPrefix(tracerMapPrefix),
+			validator:    i.validateGlobalConstVoidPtrVar,
+			populateFunc: i.fixTracerMap,
+		},
+		{
+			prefixFunc:   hasPrefix(mapIterPrefix),
+			validator:    i.validateGlobalConstVoidPtrVar,
+			populateFunc: i.populateMapIter,
+		},
 		{
 			prefixFunc: func(s string) (string, bool) {
 				// Exceptions for backwards-compatibility
@@ -211,6 +293,9 @@ func (i *ebpfInstance) analyze() error {
 				}
 				if s == socketenricher.SocketsMapName {
 					return socketenricher.SocketsMapName, true
+				}
+				if s == symbolizer.OtelGenericParamsMapName {
+					return symbolizer.OtelGenericParamsMapName, true
 				}
 				return "", false
 			},
@@ -230,21 +315,23 @@ func (i *ebpfInstance) analyze() error {
 	}
 
 	// Iterate over types and populate the gadget
-	it := i.collectionSpec.Types.Iterate()
-	for it.Next() {
+	for typ, err := range i.collectionSpec.Types.All() {
+		if err != nil {
+			return fmt.Errorf("iterating over types: %w", err)
+		}
 		for _, entry := range prefixLookups {
-			typeName, ok := entry.prefixFunc(it.Type.TypeName())
+			typeName, ok := entry.prefixFunc(typ.TypeName())
 			if !ok {
 				continue
 			}
 			if entry.validator != nil {
-				err := entry.validator(it.Type, strings.TrimPrefix(it.Type.TypeName(), typeName))
+				err := entry.validator(typ, strings.TrimPrefix(typ.TypeName(), typeName))
 				if err != nil {
-					i.logger.Debugf("type %q error: %v", it.Type.TypeName(), err)
+					i.logger.Debugf("type %q error: %v", typ.TypeName(), err)
 					continue
 				}
 			}
-			err := entry.populateFunc(it.Type, typeName)
+			err := entry.populateFunc(typ, typeName)
 			if err != nil {
 				return fmt.Errorf("handling type by prefix %q: %w", typeName, err)
 			}
@@ -277,7 +364,20 @@ func (i *ebpfInstance) init(gadgetCtx operators.GadgetContext) error {
 	if err != nil {
 		return fmt.Errorf("initializing: %w", err)
 	}
-	err = i.analyze()
+
+	// add extra info to gadgetcontext if requested
+	if gadgetCtx.ExtraInfo() {
+		err = i.addExtraInfo(gadgetCtx)
+		if err != nil {
+			return fmt.Errorf("adding extra info: %w", err)
+		}
+	}
+
+	// Release the raw ELF/BPF object bytes; loadSpec() and addExtraInfo() are
+	// the only callers and both have completed.
+	i.program = nil
+
+	err = i.analyze(gadgetCtx, i.paramValues)
 	if err != nil {
 		return fmt.Errorf("analyzing: %w", err)
 	}
@@ -287,9 +387,122 @@ func (i *ebpfInstance) init(gadgetCtx operators.GadgetContext) error {
 		return fmt.Errorf("registering datasources: %w", err)
 	}
 
-	err = i.initConverters(gadgetCtx)
+	err = i.initFormatters(gadgetCtx)
 	if err != nil {
 		return fmt.Errorf("initializing formatters: %w", err)
+	}
+
+	if err := i.evaluateMapParams(i.paramValues); err != nil {
+		return fmt.Errorf("evaluating map params: %w", err)
+	}
+
+	// Create network tracers, one for each socket filter program
+	// The same applies to uprobe / uretprobe as well.
+	for _, p := range i.collectionSpec.Programs {
+		switch p.Type {
+		case ebpf.Kprobe:
+			if strings.HasPrefix(p.SectionName, "uprobe/") ||
+				strings.HasPrefix(p.SectionName, "uretprobe/") ||
+				strings.HasPrefix(p.SectionName, "usdt/") {
+				uprobeTracer, err := uprobetracer.NewTracer[api.GadgetData](gadgetCtx.Logger())
+				if err != nil {
+					return fmt.Errorf("creating uprobe tracer: %w", err)
+				}
+				i.uprobeTracers[p.Name] = uprobeTracer
+			}
+		case ebpf.SocketFilter:
+			if strings.HasPrefix(p.SectionName, "socket") {
+				networkTracer, err := networktracer.NewTracer[api.GadgetData]()
+				if err != nil {
+					return fmt.Errorf("creating network tracer: %w", err)
+				}
+				i.networkTracers[p.Name] = networkTracer
+			}
+		case ebpf.SchedCLS:
+			parts := strings.Split(p.SectionName, "/")
+			if len(parts) != 3 {
+				return fmt.Errorf("invalid section name %q", p.SectionName)
+			}
+
+			for idx := 0; idx < len(p.Instructions); idx++ {
+				inst := p.Instructions[idx]
+				name, ok := strings.CutPrefix(inst.Symbol(), packetFilterPrefix)
+				if !ok {
+					continue
+				}
+				filter := i.paramValues[packetFilterParam+"-"+name]
+
+				// If the name is empty, we'll use `pf` as the parameter name directly
+				if name == "" {
+					filter = i.paramValues[packetFilterParam]
+				}
+				if filter == "" {
+					i.logger.Debugf("skipping pcap filter %q at %d: no filter set", filter, idx)
+					continue
+				}
+				injectIdx := idx
+				i.logger.Debugf("injecting pcap filter %q at %d", filter, idx)
+				insns := p.Instructions
+				filterInsns, err := libpcap_compiler.CompileEbpf(filter, inst.Symbol())
+				if err != nil {
+					return fmt.Errorf("adding filter: %w", err)
+				}
+				filterInsns[0] = filterInsns[0].WithMetadata(insns[injectIdx].Metadata)
+				insns[injectIdx] = insns[injectIdx].WithMetadata(asm.Metadata{})
+				p.Instructions = append(insns[:injectIdx], append(filterInsns, insns[injectIdx:]...)...)
+
+				idx = injectIdx
+			}
+
+			switch parts[0] {
+			default:
+				return fmt.Errorf("invalid section name %q (nclass)", p.SectionName)
+			case "classifier":
+				var direction tchandler.AttachmentDirection
+
+				switch parts[1] {
+				case "ingress":
+					direction = tchandler.AttachmentDirectionIngress
+				case "egress":
+					direction = tchandler.AttachmentDirectionEgress
+				default:
+					return fmt.Errorf("unsupported hook type %q", parts[1])
+				}
+
+				handler, err := tchandler.NewHandler(direction)
+				if err != nil {
+					return fmt.Errorf("creating tc network tracer: %w", err)
+				}
+
+				i.tcHandlers[p.Name] = handler
+			}
+		}
+	}
+
+	if len(i.tcHandlers) > 0 {
+		// For now, override enrichment
+		gadgetCtx.SetVar("NeedContainerEvents", true)
+		i.params["iface"] = &param{
+			Param: &api.Param{
+				Key:         ParamIface,
+				Description: "Network interface to attach to",
+			},
+		}
+	}
+
+	i.params[ParamTraceKernel] = &param{
+		Param: &api.Param{
+			Key:          ParamTraceKernel,
+			Title:        "Print Kernel Tracing Messages",
+			Description:  "Prints kernel messages from the trace pipe (e.g. coming from bpf_trace_printk)",
+			DefaultValue: "false",
+			TypeHint:     api.TypeBool,
+			Tags:         []string{api.TagAdvanced, "group:eBPF"},
+		},
+	}
+
+	for name, m := range i.collectionSpec.Maps {
+		gadgetCtx.SetVar(operators.MapSpecPrefix+name, m)
 	}
 
 	return nil
@@ -322,20 +535,96 @@ func (i *ebpfInstance) addDataSource(
 func (i *ebpfInstance) register(gadgetCtx operators.GadgetContext) error {
 	// register datasources
 	for name, m := range i.tracers {
-		ds, accessor, err := i.addDataSource(gadgetCtx, datasource.TypeSingle, name, i.structs[m.StructName].Size, i.structs[m.StructName].Fields)
+		ds, accessor, err := i.addDataSource(gadgetCtx, datasource.TypeSingle, name, i.structs[m.structName].Size, i.structs[m.structName].Fields)
 		if err != nil {
 			return fmt.Errorf("adding datasource: %w", err)
 		}
 		m.accessor = accessor
+		// handle trailing data if configured
+		if restName, ok := ds.Annotations()[AnnotationRestName]; ok {
+			m.restAccessor, err = ds.AddField(restName, api.Kind_Bytes)
+			if err != nil {
+				return fmt.Errorf("adding rest accessor: %w", err)
+			}
+			if restLenName, ok := ds.Annotations()[AnnotationRestLen]; ok {
+				m.restLenAccessor = ds.GetField(restLenName)
+				if m.restLenAccessor == nil {
+					return fmt.Errorf("rest length accessor field %q not found", restLenName)
+				}
+			}
+		}
 		m.ds = ds
 	}
-	for name, m := range i.snapshotters {
-		ds, accessor, err := i.addDataSource(gadgetCtx, datasource.TypeArray, name, i.structs[m.StructName].Size, i.structs[m.StructName].Fields)
+	for name, m := range i.iterators {
+		ds, accessor, err := i.addDataSource(gadgetCtx, datasource.TypeArray, name, i.structs[m.structName].Size, i.structs[m.structName].Fields)
 		if err != nil {
 			return fmt.Errorf("adding datasource: %w", err)
 		}
 
 		m.accessor = accessor
+		m.ds = ds
+
+		annotations := ds.Annotations()
+
+		// Configure fetch-count and fetch-interval annotations (if not present) to make the
+		// combiner operator handle the data correctly
+		if annotations[api.FetchIntervalAnnotation] != "" {
+			m.interval, err = time.ParseDuration(annotations[api.FetchIntervalAnnotation])
+			if err != nil {
+				return fmt.Errorf("parsing %s: %w", api.FetchIntervalAnnotation, err)
+			}
+		} else {
+			m.ds.AddAnnotation(api.FetchIntervalAnnotation, "0")
+			m.interval = time.Duration(0)
+		}
+		if annotations[api.FetchCountAnnotation] != "" {
+			m.count, err = strconv.Atoi(annotations[api.FetchCountAnnotation])
+			if err != nil {
+				return fmt.Errorf("parsing %s: %w", api.FetchCountAnnotation, err)
+			}
+		} else {
+			m.ds.AddAnnotation(api.FetchCountAnnotation, "1")
+			m.count = 1
+		}
+
+		m.fetchOnStop = annotations[AnnotationIterFetchOnStop] == "true"
+	}
+	for name, m := range i.mapIters {
+		fields := make([]*Field, 0)
+		ds, err := gadgetCtx.RegisterDataSource(datasource.TypeArray, name)
+		if err != nil {
+			return fmt.Errorf("adding mapiter datasource: %w", err)
+		}
+		staticFields := make([]datasource.StaticField, 0, len(fields))
+		for _, field := range i.structs[m.keyStructName].Fields {
+			// check whether role tag needs to be added
+			if !slices.Contains(field.Tags, "role:key") {
+				field.Tags = append(field.Tags, "role:key")
+			}
+			staticFields = append(staticFields, field)
+		}
+		accessor, err := ds.AddStaticFields(i.structs[m.keyStructName].Size, staticFields)
+		if err != nil {
+			return fmt.Errorf("adding fields for datasource: %w", err)
+		}
+		m.keyAccessor = accessor
+
+		staticFields = make([]datasource.StaticField, 0, len(fields))
+		for _, field := range i.structs[m.valStructName].Fields {
+			staticFields = append(staticFields, field)
+		}
+		accessor, err = ds.AddStaticFields(i.structs[m.valStructName].Size, staticFields)
+		if err != nil {
+			return fmt.Errorf("adding fields for datasource: %w", err)
+		}
+		m.valAccessor = accessor
+
+		annotations := ds.Annotations()
+		if flushOnStop := annotations[AnnotationMapFlushOnStop]; flushOnStop == "true" {
+			i.logger.Debugf("flushing on stop enabled")
+			m.flushOnStop = true
+		}
+
 		m.ds = ds
 	}
 	return nil
@@ -350,92 +639,38 @@ func (i *ebpfInstance) ExtraParams(gadgetCtx operators.GadgetContext) api.Params
 	for _, p := range i.params {
 		res = append(res, p.Param)
 	}
+
+	// MapIter params
+	res = append(res, i.mapParams()...)
+
+	// Iterate over programs
+	filters := make(map[string]struct{})
+	for programName, program := range i.collectionSpec.Programs {
+		// check for packet filters
+		for _, inst := range program.Instructions {
+			name, ok := strings.CutPrefix(inst.Symbol(), packetFilterPrefix)
+			if !ok {
+				continue
+			}
+			if _, ok := filters[name]; ok {
+				continue
+			}
+			paramName := packetFilterParam + "-" + name
+			// if no name was given, use `pf` directly
+			if name == "" {
+				paramName = packetFilterParam
+			}
+
+			i.logger.Debugf("> program %q uses packet filter named %q", programName, name)
+			res = append(res, &api.Param{
+				Key:         paramName,
+				Description: fmt.Sprintf("packet filter %s", name),
+				TypeHint:    api.TypeString,
+			})
+			filters[name] = struct{}{}
+		}
+	}
 	return res
-}
-
-func (i *ebpfInstance) Prepare(gadgetCtx operators.GadgetContext) error {
-	for ds, converters := range i.converters {
-		for _, converter := range converters {
-			converter := converter
-			ds.Subscribe(func(ds datasource.DataSource, data datasource.Data) error {
-				return converter(ds, data)
-			}, 0)
-		}
-	}
-
-	// Create network tracers, one for each socket filter program
-	// The same applies to uprobe / uretprobe as well.
-	for _, p := range i.collectionSpec.Programs {
-		switch p.Type {
-		case ebpf.Kprobe:
-			if strings.HasPrefix(p.SectionName, "uprobe/") ||
-				strings.HasPrefix(p.SectionName, "uretprobe/") ||
-				strings.HasPrefix(p.SectionName, "usdt/") {
-				uprobeTracer, err := uprobetracer.NewTracer[api.GadgetData](gadgetCtx.Logger())
-				if err != nil {
-					i.Close()
-					return fmt.Errorf("creating uprobe tracer: %w", err)
-				}
-				i.uprobeTracers[p.Name] = uprobeTracer
-			}
-		case ebpf.SocketFilter:
-			if strings.HasPrefix(p.SectionName, "socket") {
-				networkTracer, err := networktracer.NewTracer[api.GadgetData]()
-				if err != nil {
-					i.Close()
-					return fmt.Errorf("creating network tracer: %w", err)
-				}
-				i.networkTracers[p.Name] = networkTracer
-			}
-		case ebpf.SchedCLS:
-			parts := strings.Split(p.SectionName, "/")
-			if len(parts) != 3 {
-				return fmt.Errorf("invalid section name %q", p.SectionName)
-			}
-			if parts[0] != "classifier" {
-				return fmt.Errorf("invalid section name %q", p.SectionName)
-			}
-
-			var direction tchandler.AttachmentDirection
-
-			switch parts[1] {
-			case "ingress":
-				direction = tchandler.AttachmentDirectionIngress
-			case "egress":
-				direction = tchandler.AttachmentDirectionEgress
-			default:
-				return fmt.Errorf("unsupported hook type %q", parts[1])
-			}
-
-			handler, err := tchandler.NewHandler(direction)
-			if err != nil {
-				i.Close()
-				return fmt.Errorf("creating tc network tracer: %w", err)
-			}
-
-			i.tcHandlers[p.Name] = handler
-		}
-	}
-
-	if len(i.tcHandlers) > 0 {
-		// For now, override enrichment
-		gadgetCtx.SetVar("NeedContainerEvents", true)
-		i.params["iface"] = &param{
-			Param: &api.Param{
-				Key:         ParamIface,
-				Description: "Network interface to attach to",
-			},
-		}
-	}
-
-	i.params[ParamTraceKernel] = &param{
-		Param: &api.Param{
-			Key:          ParamTraceKernel,
-			DefaultValue: "false",
-			TypeHint:     api.TypeBool,
-		},
-	}
-	return nil
 }
 
 func (i *ebpfInstance) tracePipe(gadgetCtx operators.GadgetContext) error {
@@ -444,7 +679,7 @@ func (i *ebpfInstance) tracePipe(gadgetCtx operators.GadgetContext) error {
 		return fmt.Errorf("opening trace_pipe: %w", err)
 	}
 	go func() {
-		<-gadgetCtx.Context().Done()
+		<-i.done
 		tracePipe.Close()
 	}()
 	go func() {
@@ -453,10 +688,35 @@ func (i *ebpfInstance) tracePipe(gadgetCtx operators.GadgetContext) error {
 		defer tracePipe.Close()
 		scanner := bufio.NewScanner(tracePipe)
 		for scanner.Scan() {
-			log.Debug(scanner.Text())
+			log.Info(scanner.Text())
 		}
 	}()
 	return nil
+}
+
+func (i *ebpfInstance) PreStart(gadgetCtx operators.GadgetContext) error {
+	params := apihelpers.ToParamDescs(i.ExtraParams(gadgetCtx)).ToParams()
+	for _, p := range *params {
+		if _, ok := i.paramValues[p.Key]; !ok {
+			i.paramValues[p.Key] = p.DefaultValue
+		}
+	}
+
+	for ds, formatters := range i.formatters {
+		for _, formatter := range formatters {
+			ds.Subscribe(func(ds datasource.DataSource, data datasource.Data) error {
+				return formatter(ds, data)
+			}, 0)
+		}
+	}
+	return nil
+}
+
+// otelTailCallTarget is the OTel eBPF Profiler entry program that gadgets tail
+// call into (oteltracer.CollectTrampolineRef). It is stored in the gadget
+// context under symbolizer.OtelEbpfProgramKprobe or OtelEbpfProgramPerf.
+type otelTailCallTarget interface {
+	InsertInto(progArray *ebpf.Map, key uint32) error
 }
 
 func (i *ebpfInstance) Start(gadgetCtx operators.GadgetContext) error {
@@ -484,15 +744,80 @@ func (i *ebpfInstance) Start(gadgetCtx operators.GadgetContext) error {
 	}
 
 	mapReplacements := make(map[string]*ebpf.Map)
-	constReplacements := make(map[string]any)
 
 	// Set gadget params
 	for name, p := range i.params {
 		if !p.fromEbpf {
 			continue
 		}
-		constReplacements[name] = paramMap[name].AsAny()
-		i.logger.Debugf("setting param value %q = %v", name, paramMap[name].AsAny())
+
+		paramVal := paramMap[name].AsAny()
+
+		switch p.TypeHint {
+		case api.TypeIP:
+			i.logger.Debugf("handling IP param: %q", name)
+			ipAddr := ebpftypes.L3Endpoint{}
+			ipParam := paramVal.(net.IP)
+			if ip := ipParam.To4(); ip != nil {
+				ipAddr.Version = 4
+				copy(ipAddr.V6[:4], ip)
+			} else if ip := ipParam.To16(); ip != nil {
+				copy(ipAddr.V6[:], ip)
+				ipAddr.Version = 6
+			} else {
+				return fmt.Errorf("invalid IP address: %v", ipParam)
+			}
+			paramVal = ipAddr
+		case api.TypeString:
+			i.logger.Debugf("handling string param: %q", name)
+			bytes := make([]byte, p.strLen)
+			strBytes := []byte(paramMap[name].AsString())
+			// check if the param defined in the ebpf code is big enough to
+			// store the string
+			if len(strBytes) > p.strLen {
+				return fmt.Errorf("string param %q too long: %d > %d", name, len(strBytes), p.strLen)
+			}
+			copy(bytes[:], strBytes)
+			paramVal = bytes
+		}
+
+		i.logger.Debugf("setting param value %q = %v", name, paramVal)
+
+		if err := ebpfutils.SpecSetVar(i.collectionSpec, name, paramVal); err != nil {
+			return err
+		}
+	}
+
+	opts := ebpf.CollectionOptions{
+		MapReplacements: mapReplacements,
+		Cache:           i.bpfOperator.btfCache,
+		Maps: ebpf.MapOptions{
+			PinPath: "/sys/fs/bpf",
+		},
+	}
+
+	if seBtfSpecI, ok := gadgetCtx.GetVar("socketEnricherbtf"); ok {
+		gadgetCtx.Logger().Debugf("using socket enricher BTF spec from context")
+		// Load the programs with the spec from the socket enricher and the
+		// kernel or btfgen specs
+		seBTFSpec, ok := seBtfSpecI.(*btf.Spec)
+		if !ok {
+			return fmt.Errorf("invalid socket enricher BTF spec: expected *btf.Spec, got %T", seBtfSpecI)
+		}
+
+		opts.Programs.ExtraRelocationTargets = []*btf.Spec{seBTFSpec}
+
+		bpfStructI, ok := gadgetCtx.GetVar("socketEnricherStruct")
+		if !ok {
+			return fmt.Errorf("missing socket enricher struct size in context")
+		}
+		btfStruct, ok := bpfStructI.(*btf.Struct)
+		if !ok {
+			return fmt.Errorf("invalid socket enricher struct: expected *btf.Struct, got %T", bpfStructI)
+		}
+		mapSpec := i.collectionSpec.Maps[socketenricher.SocketsMapName]
+
+		mapSpec.ValueSize = btfStruct.Size
 	}
 
 	for _, v := range i.vars {
@@ -506,26 +831,53 @@ func (i *ebpfInstance) Start(gadgetCtx operators.GadgetContext) error {
 			if t == nil {
 				continue
 			}
-			i.logger.Debugf("replacing map %q", v.name)
-			mapReplacements[v.name] = t
+			if err := i.collectionSpec.Maps[v.name].Compatible(t); err == nil {
+				mapReplacements[v.name] = t
+			} else {
+				i.logger.Warnf("Replacement map %q incompatible: %s",
+					v.name, err)
+				i.logger.Warnf("Is %s compatible with ig %s?", i.gadgetCtx.ImageName(), version.Version().String())
+			}
 		default:
 			if !reflect.TypeOf(res).AssignableTo(v.refType) {
 				i.logger.Debugf("variable %q can not be set to type %T (expected %s)", v.name, res, v.refType.Name())
 				continue
 			}
 			i.logger.Debugf("setting var %q to %v", v.name, t)
-			constReplacements[v.name] = res
+
+			if err := ebpfutils.SpecSetVar(i.collectionSpec, v.name, res); err != nil {
+				return err
+			}
 		}
 	}
 
-	if err := i.collectionSpec.RewriteConstants(constReplacements); err != nil {
-		return fmt.Errorf("rewriting constants: %w", err)
+	// Maps with a parameter _max_entries can have their size set at runtime.
+	// Example:
+	//     const volatile int mymap_max_entries = 1024;
+	//     GADGET_PARAM(mymap_max_entries);
+	//
+	//     struct {
+	//            __uint(type, BPF_MAP_TYPE_HASH);
+	//            __uint(key_size, sizeof(u32));
+	//            __uint(value_size, sizeof(u32));
+	//            __uint(max_entries, 0);
+	//     } mymap SEC(".maps");
+	for _, m := range i.collectionSpec.Maps {
+		maxEntriesStr := m.Name + "_max_entries"
+		v, ok := i.collectionSpec.Variables[maxEntriesStr]
+		if !ok {
+			continue
+		}
+		var maxEntries uint32
+		err := v.Get(&maxEntries)
+		if err != nil {
+			i.logger.Warnf("Getting map %q max_entries: %s", m.Name, err)
+			continue
+		}
+		m.MaxEntries = maxEntries
 	}
 
 	i.logger.Debugf("creating ebpf collection")
-	opts := ebpf.CollectionOptions{
-		MapReplacements: mapReplacements,
-	}
 
 	// check if the btfgen operator has stored the kernel types in the context
 	if btfSpecI, ok := gadgetCtx.GetVar(kernelTypesVar); ok {
@@ -538,44 +890,148 @@ func (i *ebpfInstance) Start(gadgetCtx operators.GadgetContext) error {
 	}
 	collection, err := ebpf.NewCollectionWithOptions(i.collectionSpec, opts)
 	if err != nil {
+		var verifierErr *ebpf.VerifierError
+		if errors.As(err, &verifierErr) {
+			gadgetCtx.Logger().Debugf("running gadget: verifier error: %+v\n", verifierErr)
+		}
+
 		return fmt.Errorf("creating eBPF collection: %w", err)
 	}
 	i.collection = collection
 
-	for _, tracer := range i.tracers {
-		i.logger.Debugf("starting tracer %q", tracer.MapName)
-		go func(tracer *Tracer) {
-			err := i.runTracer(gadgetCtx, tracer)
-			if err != nil {
-				i.logger.Errorf("starting tracer: %w", err)
+	// Load the OTel entry programs into their type-matching prog-array maps.
+	// OTel symbolization uses BPF tail calls, which require the tail-called
+	// program and the caller to share the same BPF_PROG_TYPE. We therefore
+	// keep two separate prog arrays: otel_tc_kprobe (for kprobe/kretprobe/
+	// uprobe/uretprobe gadget programs) and otel_tc_perf (for perf_event
+	// gadget programs). Each is populated only with its matching-type entry
+	// program.
+	otelTailCalls := []struct {
+		mapName string
+		progVar string
+		want    ebpf.ProgramType
+	}{
+		{symbolizer.OtelTailCallForKprobeMapName, symbolizer.OtelEbpfProgramKprobe, ebpf.Kprobe},
+		{symbolizer.OtelTailCallForPerfMapName, symbolizer.OtelEbpfProgramPerf, ebpf.PerfEvent},
+	}
+	for _, tc := range otelTailCalls {
+		otelEbpfProgramI, ok := gadgetCtx.GetVar(tc.progVar)
+		if !ok {
+			continue
+		}
+		otelEbpfProgram, ok := otelEbpfProgramI.(otelTailCallTarget)
+		if !ok {
+			return fmt.Errorf("invalid otel ebpf program %q: expected InsertInto(*ebpf.Map, uint32), got %T", tc.progVar, otelEbpfProgramI)
+		}
+		progMap, ok := collection.Maps[tc.mapName]
+		if !ok {
+			// The gadget does not use this program type's OTel path.
+			continue
+		}
+
+		// A BPF_MAP_TYPE_PROG_ARRAY is locked to the program type of the
+		// first program that references it (kernel
+		// bpf_prog_array_compatible). Only load the entry program if a
+		// gadget program of the matching type actually references this
+		// map; otherwise the update would fail (or the tail call could
+		// never run). Warn about mismatched-type referrers, which cannot
+		// be symbolized with the OTel eBPF Profiler.
+		matched := false
+		for name, prog := range i.collectionSpec.Programs {
+			refs := prog.Instructions.ReferenceOffsets()
+			if _, ok := refs[tc.mapName]; !ok {
+				continue
 			}
-		}(tracer)
+			if prog.Type == tc.want {
+				matched = true
+			} else {
+				i.logger.Warnf("program %q (type %s) references OTel tail call map %q (expects %s); OTel eBPF Profiler symbolization only supports matching program types",
+					name, prog.Type, tc.mapName, tc.want)
+			}
+		}
+		if !matched {
+			continue
+		}
+
+		if err := otelEbpfProgram.InsertInto(progMap, 0); err != nil {
+			return fmt.Errorf("updating %s map: %w", tc.mapName, err)
+		}
+	}
+
+	// collect program IDs and map IDs for this gadget
+	gadgetObjs := gadgetObjects{}
+
+	for _, p := range i.collection.Programs {
+		info, err := p.Info()
+		if err != nil {
+			i.logger.Warnf("stats for this gadget won't be available: getting program info: %v", err)
+			continue
+		}
+
+		id, _ := info.ID()
+		gadgetObjs.programIDs = append(gadgetObjs.programIDs, id)
+	}
+
+	for _, m := range i.collection.Maps {
+		info, err := m.Info()
+		if err != nil {
+			i.logger.Warnf("stats for this gadget won't be available: getting map info: %v", err)
+			continue
+		}
+
+		id, _ := info.ID()
+		gadgetObjs.mapIDs = append(gadgetObjs.mapIDs, id)
+	}
+	i.bpfOperator.mu.Lock()
+	if i.bpfOperator.gadgetObjs == nil {
+		i.bpfOperator.gadgetObjs = make(map[operators.GadgetContext]gadgetObjects)
+	}
+	i.bpfOperator.gadgetObjs[gadgetCtx] = gadgetObjs
+	i.bpfOperator.mu.Unlock()
+
+	for name, m := range i.collection.Maps {
+		gadgetCtx.SetVar(operators.MapPrefix+name, m)
+
+		if name == ebpftypes.KernelStackMapName {
+			i.kernelStackMap = m
+		}
+		if name == ebpftypes.UserStackMapName {
+			i.userStackMap = m
+		}
+	}
+
+	for _, tracer := range i.tracers {
+		i.logger.Debugf("starting tracer %q", tracer.mapName)
+		err := i.runTracer(gadgetCtx, tracer)
+		if err != nil {
+			return fmt.Errorf("running tracer %q: %w", tracer.mapName, err)
+		}
 	}
 
 	// Attach programs
 	for progName, p := range i.collectionSpec.Programs {
 		l, err := i.attachProgram(gadgetCtx, p, i.collection.Programs[progName])
 		if err != nil {
-			i.Close()
 			return fmt.Errorf("attaching eBPF program %q: %w", progName, err)
 		}
 
-		if l != nil {
-			i.links = append(i.links, l)
+		if l == nil {
+			continue
 		}
+
+		i.links = append(i.links, l)
 
 		// We need to store iterators' links because we need them to run the programs
 		if p.Type == ebpf.Tracing && strings.HasPrefix(p.SectionName, iterPrefix) {
 			lIter, ok := l.(*link.Iter)
 			if !ok {
-				i.Close()
 				return fmt.Errorf("link is not an iterator")
 			}
 
 			found := false
-			for _, snapshotter := range i.snapshotters {
-				if _, ok := snapshotter.iterators[progName]; ok {
-					snapshotter.links[progName] = &linkSnapshotter{
+			for _, iter := range i.iterators {
+				if _, ok := iter.iterators[progName]; ok {
+					iter.links[progName] = &linkIterator{
 						link: lIter,
 						typ:  p.AttachTo,
 					}
@@ -584,34 +1040,80 @@ func (i *ebpfInstance) Start(gadgetCtx operators.GadgetContext) error {
 				}
 			}
 			if !found {
-				i.logger.Warnf("None snapshotter will run iterator %q", progName)
+				i.logger.Warnf("No iterator will run iterator program %q", progName)
 			}
 		}
 	}
 
-	err = i.runSnapshotters()
+	err = i.runIterators()
 	if err != nil {
-		i.Close()
-		return fmt.Errorf("running snapshotters: %w", err)
+		return fmt.Errorf("running iterators: %w", err)
 	}
 
+	err = i.runMapIterators()
+	if err != nil {
+		return fmt.Errorf("running map iterators: %w", err)
+	}
+
+	// Release the CollectionSpec after all programs are attached and iterators
+	// are running; it is not referenced at runtime and holds BTF
+	// type/line info that the GC cannot otherwise reclaim.
+	i.collectionSpec = nil
+
 	return nil
+}
+
+func (i *ebpfInstance) PreStop(gadgetCtx operators.GadgetContext) error {
+	close(i.done)
+	return nil
+}
+
+func (i *ebpfInstance) detachRawPrograms() {
+	for _, detach := range i.rawDetachers {
+		if err := detach(); err != nil {
+			i.logger.Errorf("detaching sk program: %v", err)
+		}
+	}
+	i.rawDetachers = nil
 }
 
 func (i *ebpfInstance) Stop(gadgetCtx operators.GadgetContext) error {
-	i.Close()
-	return nil
-}
-
-func (i *ebpfInstance) Close() {
-	if i.collection != nil {
-		i.collection.Close()
-		i.collection = nil
+	for _, t := range i.tracers {
+		t.close()
 	}
+	i.tracers = nil
+
+	i.detachRawPrograms()
+
 	for _, l := range i.links {
 		gadgets.CloseLink(l)
 	}
 	i.links = nil
+
+	for _, fd := range i.perfFds {
+		// Disable perf event.
+		err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_DISABLE, 0)
+		if err != nil {
+			i.logger.Errorf("disabling perf fd: %v", err)
+		}
+
+		err = unix.Close(fd)
+		if err != nil {
+			i.logger.Errorf("closing perf fd: %v", err)
+		}
+	}
+
+	i.wg.Wait()
+	return nil
+}
+
+func (i *ebpfInstance) Close(gadgetCtx operators.GadgetContext) error {
+	i.detachRawPrograms()
+
+	if i.collection != nil {
+		i.collection.Close()
+		i.collection = nil
+	}
 
 	for _, networkTracer := range i.networkTracers {
 		networkTracer.Close()
@@ -622,6 +1124,12 @@ func (i *ebpfInstance) Close() {
 	for _, uprobeTracer := range i.uprobeTracers {
 		uprobeTracer.Close()
 	}
+
+	i.bpfOperator.mu.Lock()
+	delete(i.bpfOperator.gadgetObjs, gadgetCtx)
+	i.bpfOperator.mu.Unlock()
+
+	return nil
 }
 
 // Using Attacher interface for network tracers for now
@@ -632,7 +1140,7 @@ func (i *ebpfInstance) AttachContainer(container *containercollection.Container)
 	i.mu.Unlock()
 
 	for _, networkTracer := range i.networkTracers {
-		if err := networkTracer.Attach(container.Pid); err != nil {
+		if err := networkTracer.AttachContainer(container); err != nil {
 			return err
 		}
 	}
@@ -660,7 +1168,7 @@ func (i *ebpfInstance) DetachContainer(container *containercollection.Container)
 	i.mu.Unlock()
 
 	for _, networkTracer := range i.networkTracers {
-		if err := networkTracer.Detach(container.Pid); err != nil {
+		if err := networkTracer.DetachContainer(container); err != nil {
 			return err
 		}
 	}
@@ -682,6 +1190,11 @@ func (i *ebpfInstance) DetachContainer(container *containercollection.Container)
 	return nil
 }
 
+var ebpfOp = &ebpfOperator{
+	btfCache: btf.NewCache(),
+}
+
 func init() {
-	operators.RegisterOperatorForMediaType(eBPFObjectMediaType, &ebpfOperator{})
+	operators.RegisterOperatorForMediaType(eBPFObjectMediaType, ebpfOp)
+	operators.RegisterDataOperator(ebpfOp)
 }

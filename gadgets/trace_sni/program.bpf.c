@@ -5,6 +5,7 @@
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/in.h>
 #include <linux/tcp.h>
 
@@ -12,13 +13,13 @@
 #include <bpf/bpf_endian.h>
 
 #define GADGET_NO_BUF_RESERVE
-#define MAX_EVENT_SIZE 512
+#define GADGET_MAX_EVENT_SIZE 512
+#define GADGET_TYPE_NETWORKING
 #include <gadget/macros.h>
 #include <gadget/buffer.h>
 #include <gadget/types.h>
-
-#define GADGET_TYPE_NETWORKING
 #include <gadget/sockets-map.h>
+#include <gadget/filter.h>
 
 #define TLS_CONTENT_TYPE_HANDSHAKE 0x16
 #define TLS_HANDSHAKE_TYPE_CLIENT_HELLO 0x1
@@ -53,19 +54,11 @@
 // The offset of the session ID length field from the start of the TLS payload.
 #define TLS_SESSION_ID_LENGTH_OFF 43
 
-#define TASK_COMM_LEN 16
-
 struct event_t {
-	gadget_timestamp timestamp;
+	gadget_timestamp timestamp_raw;
+	gadget_netns_id netns_id;
+	struct gadget_process proc;
 
-	gadget_mntns_id mntns_id;
-	gadget_netns_id netns;
-
-	__u32 pid;
-	__u32 tid;
-	__u32 uid;
-	__u32 gid;
-	char task[TASK_COMM_LEN];
 	char name[TLS_MAX_SERVER_NAME_LEN];
 };
 
@@ -177,24 +170,34 @@ int ig_trace_sni(struct __sk_buff *skb)
 	struct ethhdr ethh;
 	if (bpf_skb_load_bytes(skb, 0, &ethh, sizeof ethh))
 		return 0;
-	if (bpf_ntohs(ethh.h_proto) != ETH_P_IP)
-		return 0;
 
-	int ip_off = ETH_HLEN;
-	// Read the IP header.
-	struct iphdr iph;
-	if (bpf_skb_load_bytes(skb, ip_off, &iph, sizeof iph))
-		return 0;
+	int tcp_off = 0;
+	__u16 h_proto = bpf_ntohs(ethh.h_proto);
 
-	// Skip packets with IP protocol other than TCP.
-	if (iph.protocol != IPPROTO_TCP)
-		return 0;
+	if (h_proto == ETH_P_IP) {
+		int ip_off = ETH_HLEN;
+		struct iphdr iph;
+		if (bpf_skb_load_bytes(skb, ip_off, &iph, sizeof iph))
+			return 0;
+		if (iph.protocol != IPPROTO_TCP)
+			return 0;
 
-	// An IPv4 header doesn't have a fixed size. The IHL field of a packet
-	// represents the size of the IP header in 32-bit words, so we need to
-	// multiply this value by 4 to get the header size in bytes.
-	__u8 ip_header_len = iph.ihl * 4;
-	int tcp_off = ip_off + ip_header_len;
+		// An IPv4 header doesn't have a fixed size. The IHL field of a packet
+		// represents the size of the IP header in 32-bit words, so we need to
+		// multiply this value by 4 to get the header size in bytes.
+		__u8 ip_header_len = iph.ihl * 4;
+		tcp_off = ip_off + ip_header_len;
+	} else if (h_proto == ETH_P_IPV6) {
+		int ip_off = ETH_HLEN;
+		struct ipv6hdr ip6h;
+		if (bpf_skb_load_bytes(skb, ip_off, &ip6h, sizeof ip6h))
+			return 0;
+		if (ip6h.nexthdr != IPPROTO_TCP)
+			return 0;
+		tcp_off = ip_off + sizeof(struct ipv6hdr);
+	} else {
+		return 0;
+	}
 
 	// Read the TCP header.
 	struct tcphdr tcph;
@@ -207,6 +210,7 @@ int ig_trace_sni(struct __sk_buff *skb)
 	// The data offset field in the header is specified in 32-bit words. We
 	// have to multiply this value by 4 to get the TCP header length in bytes.
 	__u8 tcp_header_len = tcph.doff * 4;
+
 	// TLS data starts at this offset.
 	int payload_off = tcp_off + tcp_header_len;
 
@@ -216,29 +220,24 @@ int ig_trace_sni(struct __sk_buff *skb)
 	if (read == 0)
 		return 0;
 
+	struct gadget_socket_value *skb_val = gadget_socket_lookup(skb);
+	if (gadget_should_discard_data_by_skb(skb_val))
+		return 0;
+
 	struct event_t event = {
 		0,
 	};
 
-	event.netns = skb->cb[0]; // cb[0] initialized by dispatcher.bpf.c
+	event.netns_id = skb->cb[0]; // cb[0] initialized by dispatcher.bpf.c
 	for (int i = 0; i < TLS_MAX_SERVER_NAME_LEN; i++) {
 		if (sni[i] == '\0')
 			break;
 		event.name[i] = sni[i];
 	}
-	event.timestamp = bpf_ktime_get_boot_ns();
+	event.timestamp_raw = bpf_ktime_get_boot_ns();
 
 	// Enrich event with process metadata
-	struct sockets_value *skb_val = gadget_socket_lookup(skb);
-	if (skb_val != NULL) {
-		event.mntns_id = skb_val->mntns;
-		event.pid = skb_val->pid_tgid >> 32;
-		event.tid = (__u32)skb_val->pid_tgid;
-		__builtin_memcpy(&event.task, skb_val->task,
-				 sizeof(event.task));
-		event.uid = (__u32)skb_val->uid_gid;
-		event.gid = (__u32)(skb_val->uid_gid >> 32);
-	}
+	gadget_process_populate_from_socket(skb_val, &event.proc);
 
 	gadget_output_buf(skb, &events, &event, sizeof(event));
 

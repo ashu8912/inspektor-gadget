@@ -1,4 +1,4 @@
-// Copyright 2024 The Inspektor Gadget authors
+// Copyright 2024-2026 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package uidgidresolver
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,6 +31,9 @@ import (
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/cachedmap"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
 )
+
+// ErrNoUserGroupFiles is returned when /etc/passwd or /etc/group files are not found
+var ErrNoUserGroupFiles = errors.New("user/group files not found")
 
 // UserGroupCache is a cache of user names, uids, group names and gids
 type UserGroupCache interface {
@@ -64,6 +68,19 @@ var (
 	})
 )
 
+// FilesAvailable checks if /etc/passwd and /etc/group files exist
+func FilesAvailable() error {
+	if _, err := os.Stat(fullPasswdPath); os.IsNotExist(err) {
+		return fmt.Errorf("%w: %s does not exist", ErrNoUserGroupFiles, fullPasswdPath)
+	}
+
+	if _, err := os.Stat(fullGroupPath); os.IsNotExist(err) {
+		return fmt.Errorf("%w: %s does not exist", ErrNoUserGroupFiles, fullGroupPath)
+	}
+
+	return nil
+}
+
 func (cache *userGroupCache) Start() error {
 	cache.useCountMutex.Lock()
 	defer cache.useCountMutex.Unlock()
@@ -94,7 +111,7 @@ func (cache *userGroupCache) Start() error {
 		cache.groupCache.Clear()
 		passwdFile, err := os.OpenFile(fullPasswdPath, os.O_RDONLY, 0)
 		if err != nil {
-			return fmt.Errorf("UserGroupCache: open %q: %w", fullPasswdPath, err)
+			return fmt.Errorf("UserGroupCache: open /etc/passwd in host file system: %w", err)
 		}
 		defer passwdFile.Close()
 		updateEntries(passwdFile, cache.userCache)
@@ -173,13 +190,14 @@ func (cache *userGroupCache) handleEvent(event fsnotify.Event) {
 
 	targetFilePath := ""
 	var resourceCache cachedmap.CachedMap[uint32, string]
-	if event.Name == fullPasswdPath {
+	switch event.Name {
+	case fullPasswdPath:
 		targetFilePath = fullPasswdPath
 		resourceCache = cache.userCache
-	} else if event.Name == fullGroupPath {
+	case fullGroupPath:
 		targetFilePath = fullGroupPath
 		resourceCache = cache.groupCache
-	} else {
+	default:
 		return
 	}
 

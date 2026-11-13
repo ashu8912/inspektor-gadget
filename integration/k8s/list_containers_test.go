@@ -15,8 +15,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
+
+	ocispec "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/stretchr/testify/require"
 
 	. "github.com/inspektor-gadget/inspektor-gadget/integration"
 	containercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/container-collection"
@@ -55,7 +59,7 @@ func newListContainerTestStep(
 					BasicRuntimeMetadata: types.BasicRuntimeMetadata{
 						RuntimeName:        types.String2RuntimeName(runtime),
 						ContainerName:      runtimeContainerName,
-						ContainerImageName: "docker.io/library/busybox:latest",
+						ContainerImageName: "ghcr.io/inspektor-gadget/ci/busybox:latest",
 					},
 				},
 			}
@@ -66,8 +70,6 @@ func newListContainerTestStep(
 			}
 
 			normalize := func(c *containercollection.Container) {
-				c.Pid = 0
-				c.OciConfig = nil
 				c.Bundle = ""
 				c.Mntns = 0
 				c.Netns = 0
@@ -79,12 +81,23 @@ func newListContainerTestStep(
 				c.SandboxId = ""
 				c.K8s.PodLabels = addPodLabels(pod)
 				c.Runtime.ContainerID = ""
+				c.Runtime.ContainerPID = 0
 				c.Runtime.ContainerImageDigest = ""
+				c.Runtime.ContainerStartedAt = 0
+				c.Runtime.ContainerImageID = ""
 
 				// Docker can provide different values for ContainerImageName. See `getContainerImageNamefromImage`
 				if isDockerRuntime {
 					c.Runtime.ContainerImageName = ""
 				}
+
+				// only validate the OCI config is not empty before normalizing it
+				var spec *ocispec.Spec
+				err := json.Unmarshal([]byte(c.OciConfig), &spec)
+				require.NoError(t, err, "unmarshalling OCI config")
+				require.NotNil(t, spec, "OCI config is nil")
+				require.NotEmpty(t, spec.Version, "OCI config version is empty")
+				c.OciConfig = ""
 			}
 
 			verifyOutput(t, output, normalize, expectedContainer)
@@ -112,7 +125,7 @@ func TestListContainers(t *testing.T) {
 
 	commands := []TestStep{
 		CreateTestNamespaceCommand(ns),
-		PodCommand(cn, "busybox", ns, `["sleep", "inf"]`, ""),
+		PodCommand(cn, "ghcr.io/inspektor-gadget/ci/busybox:latest", ns, `["sleep", "inf"]`, ""),
 		WaitUntilPodReadyCommand(ns, pod),
 	}
 	RunTestSteps(commands, t, WithCbBeforeCleanup(PrintLogsFn(ns)))
@@ -134,7 +147,7 @@ func TestListContainers(t *testing.T) {
 			fmt.Sprintf("ig list-containers -o json --runtimes=%s", containerRuntime),
 			cn, pod, podUID, ns, containerRuntime, runtimeContainerName,
 			func(t *testing.T, o string, f func(*containercollection.Container), c *containercollection.Container) {
-				ExpectEntriesInArrayToMatch(t, o, f, c)
+				match.MatchEntries(t, match.JSONSingleArrayMode, o, f, c)
 			},
 		)
 		RunTestSteps([]TestStep{listContainerTestStep}, t, WithCbBeforeCleanup(PrintLogsFn(ns)))
@@ -146,10 +159,149 @@ func TestListContainers(t *testing.T) {
 		listContainerTestStep := newListContainerTestStep(
 			fmt.Sprintf("ig list-containers -o json --runtimes=%s --containername=%s", containerRuntime, runtimeContainerName),
 			cn, pod, podUID, ns, containerRuntime, runtimeContainerName,
-			func(t *testing.T, o string, f func(*containercollection.Container), c *containercollection.Container) {
-				ExpectAllInArrayToMatch(t, o, f, c)
+			func(t *testing.T, output string, f func(*containercollection.Container), c *containercollection.Container) {
+				match.MatchAllEntries(t, match.JSONSingleArrayMode, output, f, c)
 			},
 		)
+		RunTestSteps([]TestStep{listContainerTestStep}, t, WithCbBeforeCleanup(PrintLogsFn(ns)))
+	})
+
+	t.Run("FilteredListK8sContainerName", func(t *testing.T) {
+		t.Parallel()
+		listContainerTestStep := newListContainerTestStep(
+			fmt.Sprintf("ig list-containers -o json --runtimes=%s --k8s-containername=%s", containerRuntime, cn),
+			cn, pod, podUID, ns, containerRuntime, runtimeContainerName,
+			func(t *testing.T, output string, f func(*containercollection.Container), c *containercollection.Container) {
+				match.MatchAllEntries(t, match.JSONSingleArrayMode, output, f, c)
+			},
+		)
+		RunTestSteps([]TestStep{listContainerTestStep}, t, WithCbBeforeCleanup(PrintLogsFn(ns)))
+	})
+
+	t.Run("FilteredListWithPodName", func(t *testing.T) {
+		t.Parallel()
+
+		listContainerTestStep := newListContainerTestStep(
+			fmt.Sprintf("ig list-containers -o json --runtimes=%s --containername=%s --k8s-podname=%s", containerRuntime, runtimeContainerName, cn),
+			cn, pod, podUID, ns, containerRuntime, runtimeContainerName,
+			func(t *testing.T, output string, f func(*containercollection.Container), c *containercollection.Container) {
+				match.MatchAllEntries(t, match.JSONSingleArrayMode, output, f, c)
+			},
+		)
+		RunTestSteps([]TestStep{listContainerTestStep}, t, WithCbBeforeCleanup(PrintLogsFn(ns)))
+	})
+
+	t.Run("FilteredListWithNamespace", func(t *testing.T) {
+		t.Parallel()
+
+		listContainerTestStep := newListContainerTestStep(
+			fmt.Sprintf("ig list-containers -o json --runtimes=%s --containername=%s --k8s-namespace=%s", containerRuntime, runtimeContainerName, ns),
+			cn, pod, podUID, ns, containerRuntime, runtimeContainerName,
+			func(t *testing.T, output string, f func(*containercollection.Container), c *containercollection.Container) {
+				match.MatchAllEntries(t, match.JSONSingleArrayMode, output, f, c)
+			},
+		)
+		RunTestSteps([]TestStep{listContainerTestStep}, t, WithCbBeforeCleanup(PrintLogsFn(ns)))
+	})
+
+	t.Run("FilteredListByDigest", func(t *testing.T) {
+		t.Parallel()
+
+		var digest string
+
+		// 1. Get the digest first
+		cmd := &Command{
+			Name: "GetDigest",
+			Cmd:  fmt.Sprintf("ig list-containers -o json --runtimes=%s --containername=%s", containerRuntime, runtimeContainerName),
+			ValidateOutput: func(t *testing.T, output string) {
+				var containers []*containercollection.Container
+				err := json.Unmarshal([]byte(output), &containers)
+				require.NoError(t, err, "unmarshalling list-containers output")
+
+				// Find the correct container
+				found := false
+				for _, c := range containers {
+					if c.Runtime.ContainerName == runtimeContainerName {
+						digest = c.Runtime.ContainerImageDigest
+						found = true
+						break
+					}
+				}
+				require.True(t, found, "container not found")
+				require.NotEmpty(t, digest, "container image digest is empty")
+			},
+		}
+		RunTestSteps([]TestStep{cmd}, t, WithCbBeforeCleanup(PrintLogsFn(ns)))
+
+		// 2. Filter by digest
+		listContainerTestStep := newListContainerTestStep(
+			fmt.Sprintf("ig list-containers -o json --runtimes=%s --runtime-containerimage-digest=%s", containerRuntime, digest),
+			cn, pod, podUID, ns, containerRuntime, runtimeContainerName,
+			func(t *testing.T, output string, f func(*containercollection.Container), c *containercollection.Container) {
+				match.MatchEntries(t, match.JSONSingleArrayMode, output, f, c)
+			},
+		)
+		RunTestSteps([]TestStep{listContainerTestStep}, t, WithCbBeforeCleanup(PrintLogsFn(ns)))
+	})
+
+	t.Run("NegativeFilteredList", func(t *testing.T) {
+		t.Parallel()
+
+		listContainerTestStep := &Command{
+			Name: "RunListContainers",
+			Cmd:  fmt.Sprintf("ig list-containers -o json --runtimes=%s --containername=non-existing", containerRuntime),
+			ValidateOutput: func(t *testing.T, output string) {
+				var containers []containercollection.Container
+				err := json.Unmarshal([]byte(output), &containers)
+				require.NoError(t, err, "unmarshalling list-containers output")
+				require.Len(t, containers, 0, "expected no containers")
+			},
+		}
+		RunTestSteps([]TestStep{listContainerTestStep}, t, WithCbBeforeCleanup(PrintLogsFn(ns)))
+	})
+
+	t.Run("NegativeFilteredListK8sContainerName", func(t *testing.T) {
+		t.Parallel()
+		listContainerTestStep := &Command{
+			Name: "RunListContainers",
+			Cmd:  fmt.Sprintf("ig list-containers -o json --runtimes=%s --k8s-containername=non-existing", containerRuntime),
+			ValidateOutput: func(t *testing.T, output string) {
+				var containers []containercollection.Container
+				err := json.Unmarshal([]byte(output), &containers)
+				require.NoError(t, err, "unmarshalling list-containers output")
+				require.Len(t, containers, 0, "expected no containers")
+			},
+		}
+		RunTestSteps([]TestStep{listContainerTestStep}, t, WithCbBeforeCleanup(PrintLogsFn(ns)))
+	})
+
+	t.Run("NegativeFilteredListWithPodName", func(t *testing.T) {
+		t.Parallel()
+		listContainerTestStep := &Command{
+			Name: "RunListContainers",
+			Cmd:  fmt.Sprintf("ig list-containers -o json --runtimes=%s --containername=%s --k8s-podname=non-existing", containerRuntime, runtimeContainerName),
+			ValidateOutput: func(t *testing.T, output string) {
+				var containers []containercollection.Container
+				err := json.Unmarshal([]byte(output), &containers)
+				require.NoError(t, err, "unmarshalling list-containers output")
+				require.Len(t, containers, 0, "expected no containers")
+			},
+		}
+		RunTestSteps([]TestStep{listContainerTestStep}, t, WithCbBeforeCleanup(PrintLogsFn(ns)))
+	})
+
+	t.Run("NegativeFilteredListWithNamespace", func(t *testing.T) {
+		t.Parallel()
+		listContainerTestStep := &Command{
+			Name: "RunListContainers",
+			Cmd:  fmt.Sprintf("ig list-containers -o json --runtimes=%s --containername=%s --k8s-namespace=non-existing", containerRuntime, runtimeContainerName),
+			ValidateOutput: func(t *testing.T, output string) {
+				var containers []containercollection.Container
+				err := json.Unmarshal([]byte(output), &containers)
+				require.NoError(t, err, "unmarshalling list-containers output")
+				require.Len(t, containers, 0, "expected no containers")
+			},
+		}
 		RunTestSteps([]TestStep{listContainerTestStep}, t, WithCbBeforeCleanup(PrintLogsFn(ns)))
 	})
 }
@@ -186,7 +338,7 @@ func TestWatchCreatedContainers(t *testing.T) {
 						BasicRuntimeMetadata: types.BasicRuntimeMetadata{
 							RuntimeName:        types.String2RuntimeName(containerRuntime),
 							ContainerName:      cn,
-							ContainerImageName: "docker.io/library/busybox:latest",
+							ContainerImageName: "ghcr.io/inspektor-gadget/ci/busybox:latest",
 						},
 					},
 				},
@@ -198,8 +350,7 @@ func TestWatchCreatedContainers(t *testing.T) {
 			}
 
 			normalize := func(e *containercollection.PubSubEvent) {
-				e.Container.Pid = 0
-				e.Container.OciConfig = nil
+				e.Container.OciConfig = ""
 				e.Container.Bundle = ""
 				e.Container.Mntns = 0
 				e.Container.Netns = 0
@@ -213,7 +364,10 @@ func TestWatchCreatedContainers(t *testing.T) {
 				e.Container.K8s.PodLabels = addPodLabels(pod)
 				e.Container.K8s.PodUID = ""
 				e.Container.Runtime.ContainerID = ""
+				e.Container.Runtime.ContainerPID = 0
 				e.Container.Runtime.ContainerImageDigest = ""
+				e.Container.Runtime.ContainerStartedAt = 0
+				e.Container.Runtime.ContainerImageID = ""
 
 				// Docker and CRI-O use a custom container name composed, among
 				// other things, by the pod UID. We don't know the pod UID in
@@ -234,8 +388,8 @@ func TestWatchCreatedContainers(t *testing.T) {
 
 			// Watching containers is a command that needs to be started before
 			// the container is created, so we can't filter by container name
-			// neither use ExpectAllInArrayToMatch here.
-			match.ExpectEntriesToMatch(t, output, normalize, expectedEvent)
+			// neither use MatchAllEntries here.
+			match.MatchEntries(t, match.JSONMultiObjectMode, output, normalize, expectedEvent)
 		},
 	}
 
@@ -243,7 +397,7 @@ func TestWatchCreatedContainers(t *testing.T) {
 		CreateTestNamespaceCommand(ns),
 		watchContainersCmd,
 		SleepForSecondsCommand(2), // wait to ensure ig has started
-		PodCommand(pod, "busybox", ns, `["sleep", "inf"]`, ""),
+		PodCommand(pod, "ghcr.io/inspektor-gadget/ci/busybox:latest", ns, `["sleep", "inf"]`, ""),
 		WaitUntilPodReadyCommand(ns, pod),
 		DeleteTestNamespaceCommand(ns),
 	}
@@ -281,7 +435,7 @@ func TestWatchDeletedContainers(t *testing.T) {
 						BasicRuntimeMetadata: types.BasicRuntimeMetadata{
 							RuntimeName:        types.String2RuntimeName(containerRuntime),
 							ContainerName:      cn,
-							ContainerImageName: "docker.io/library/busybox:latest",
+							ContainerImageName: "ghcr.io/inspektor-gadget/ci/busybox:latest",
 						},
 					},
 				},
@@ -293,8 +447,7 @@ func TestWatchDeletedContainers(t *testing.T) {
 			}
 
 			normalize := func(e *containercollection.PubSubEvent) {
-				e.Container.Pid = 0
-				e.Container.OciConfig = nil
+				e.Container.OciConfig = ""
 				e.Container.Bundle = ""
 				e.Container.Mntns = 0
 				e.Container.Netns = 0
@@ -308,7 +461,10 @@ func TestWatchDeletedContainers(t *testing.T) {
 				e.Container.K8s.PodLabels = addPodLabels(pod)
 				e.Container.K8s.PodUID = ""
 				e.Container.Runtime.ContainerID = ""
+				e.Container.Runtime.ContainerPID = 0
 				e.Container.Runtime.ContainerImageDigest = ""
+				e.Container.Runtime.ContainerStartedAt = 0
+				e.Container.Runtime.ContainerImageID = ""
 
 				// Docker and CRI-O use a custom container name composed, among
 				// other things, by the pod UID. We don't know the pod UID in
@@ -329,14 +485,14 @@ func TestWatchDeletedContainers(t *testing.T) {
 
 			// Watching containers is a command that needs to be started before
 			// the container is created, so we can't filter by container name
-			// neither use ExpectAllInArrayToMatch here.
-			match.ExpectEntriesToMatch(t, output, normalize, expectedEvent)
+			// neither use MatchAllEntries here.
+			match.MatchEntries(t, match.JSONMultiObjectMode, output, normalize, expectedEvent)
 		},
 	}
 
 	commands := []TestStep{
 		CreateTestNamespaceCommand(ns),
-		PodCommand(pod, "busybox", ns, `["sleep", "inf"]`, ""),
+		PodCommand(pod, "ghcr.io/inspektor-gadget/ci/busybox:latest", ns, `["sleep", "inf"]`, ""),
 		WaitUntilPodReadyCommand(ns, pod),
 		watchContainersCmd,
 		&Command{
@@ -379,7 +535,7 @@ func TestPodWithSecurityContext(t *testing.T) {
 						BasicRuntimeMetadata: types.BasicRuntimeMetadata{
 							RuntimeName:        types.String2RuntimeName(containerRuntime),
 							ContainerName:      cn,
-							ContainerImageName: "docker.io/library/busybox:latest",
+							ContainerImageName: "ghcr.io/inspektor-gadget/ci/busybox:latest",
 						},
 					},
 				},
@@ -391,8 +547,7 @@ func TestPodWithSecurityContext(t *testing.T) {
 			}
 
 			normalize := func(e *containercollection.PubSubEvent) {
-				e.Container.Pid = 0
-				e.Container.OciConfig = nil
+				e.Container.OciConfig = ""
 				e.Container.Bundle = ""
 				e.Container.Mntns = 0
 				e.Container.Netns = 0
@@ -404,7 +559,10 @@ func TestPodWithSecurityContext(t *testing.T) {
 
 				e.Container.SandboxId = ""
 				e.Container.Runtime.ContainerID = ""
+				e.Container.Runtime.ContainerPID = 0
 				e.Container.Runtime.ContainerImageDigest = ""
+				e.Container.Runtime.ContainerStartedAt = 0
+				e.Container.Runtime.ContainerImageID = ""
 				e.Container.K8s.PodLabels = addPodLabels(po)
 				e.Container.K8s.PodUID = ""
 
@@ -427,8 +585,8 @@ func TestPodWithSecurityContext(t *testing.T) {
 
 			// Watching containers is a command that needs to be started before
 			// the container is created, so we can't filter by container name
-			// neither use ExpectAllInArrayToMatch here.
-			match.ExpectEntriesToMatch(t, output, normalize, expectedEvent)
+			// neither use MatchAllEntries here.
+			match.MatchEntries(t, match.JSONMultiObjectMode, output, normalize, expectedEvent)
 		},
 	}
 
@@ -449,7 +607,7 @@ spec:
   terminationGracePeriodSeconds: 0
   containers:
   - name: %s
-    image: busybox
+    image: ghcr.io/inspektor-gadget/ci/busybox:latest
     command: ["sleep", "inf"]
 `, po, ns, po, cn)
 

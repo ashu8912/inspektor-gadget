@@ -23,7 +23,6 @@ import (
 	"testing"
 
 	. "github.com/inspektor-gadget/inspektor-gadget/integration"
-	eventtypes "github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 )
 
 const (
@@ -51,38 +50,10 @@ var (
 
 var (
 	integrationTest = flag.Bool("integration", false, "run integration tests")
-	dnsTesterImage  = flag.String("dnstester-image", "ghcr.io/inspektor-gadget/dnstester:latest", "dnstester container image")
+	dnsTesterImage  = flag.String("dnstester-image", "ghcr.io/inspektor-gadget/dnstester:main", "dnstester container image")
 	testComponent   = flag.String("test-component", "", "run tests for specific component")
 	k8sArch         = flag.String("k8s-arch", "amd64", "allows to skip tests that are not supported on a given CPU architecture")
 )
-
-func normalizeCommonData(e *eventtypes.CommonData, ns string) {
-	cn := "test-pod"
-
-	e.Runtime.ContainerID = ""
-	e.Runtime.ContainerImageDigest = ""
-
-	switch DefaultTestComponent {
-	case IgTestComponent:
-		// Docker and CRI-O use a custom container name composed, among
-		// other things, by the pod UID. We don't know the pod UID in
-		// advance, so we can't match the exact expected container name.
-		prefixContainerName := fmt.Sprintf("k8s_%s_%s_%s_", cn, cn, ns)
-		if (isDockerRuntime || isCrioRuntime) &&
-			strings.HasPrefix(e.Runtime.ContainerName, prefixContainerName) {
-			e.Runtime.ContainerName = cn
-		}
-		// Docker can provide different values for ContainerImageName. See `getContainerImageNamefromImage`
-		if isDockerRuntime {
-			e.Runtime.ContainerImageName = ""
-		}
-	case InspektorGadgetTestComponent:
-		e.K8s.Node = ""
-		// TODO: Verify container runtime and container name
-		e.Runtime.RuntimeName = ""
-		e.Runtime.ContainerName = ""
-	}
-}
 
 func initialize() error {
 	var err error

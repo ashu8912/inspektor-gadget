@@ -1,4 +1,4 @@
-// Copyright 2019-2023 The Inspektor Gadget authors
+// Copyright 2019-2025 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +15,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	_ "embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"reflect"
-	"slices"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -30,10 +32,11 @@ import (
 	"github.com/distribution/reference"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -59,14 +62,17 @@ import (
 
 	commonutils "github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
 	"github.com/inspektor-gadget/inspektor-gadget/cmd/kubectl-gadget/utils"
-	"github.com/inspektor-gadget/inspektor-gadget/internal/version"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/config/gadgettracermanagerconfig"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/k8sutil"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/resources"
 	grpcruntime "github.com/inspektor-gadget/inspektor-gadget/pkg/runtime/grpc"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/experimental"
 )
 
-const gadgetPullSecret = "gadget-pull-secret"
+const (
+	gadgetPullSecret = "gadget-pull-secret"
+	configYamlKey    = "config.yaml"
+)
 
 var deployCmd = &cobra.Command{
 	Use:          "deploy",
@@ -79,31 +85,36 @@ var deployCmd = &cobra.Command{
 var gadgetimage = "undefined"
 
 var (
-	image               string
-	imagePullPolicy     string
-	hookMode            string
-	livenessProbe       bool
-	deployTimeout       time.Duration
-	fallbackPodInformer bool
-	legacyHostPID       bool
-	printOnly           bool
-	quiet               bool
-	debug               bool
-	seccompProfile      string
-	wait                bool
-	runtimesConfig      commonutils.RuntimesSocketPathConfig
-	nodeSelector        string
-	experimentalVar     bool
-	skipSELinuxOpts     bool
-	eventBufferLength   uint64
-	daemonLogLevel      string
-	appArmorprofile     string
-	verifyImage         bool
-	publicKey           string
-	strLevels           []string
+	image                 string
+	imagePullPolicy       string
+	livenessProbe         bool
+	deployTimeout         time.Duration
+	printOnly             bool
+	quiet                 bool
+	debug                 bool
+	seccompProfile        string
+	wait                  bool
+	runtimesConfig        commonutils.RuntimesSocketPathConfig
+	nodeSelector          string
+	experimentalVar       bool
+	skipSELinuxOpts       bool
+	eventBufferLength     uint64
+	daemonLogLevel        string
+	appArmorprofile       string
+	verifyImage           bool
+	publicKey             string
+	strLevels             []string
+	verifyGadgets         bool
+	gadgetsPublicKeys     string
+	allowedGadgets        []string
+	insecureRegistries    []string
+	disallowGadgetsPull   bool
+	otelMetricsListen     bool
+	otelMetricsListenAddr string
+	daemonConfig          string
+	setDaemonConfig       []string
+	dropCapSysAdmin       bool
 )
-
-var supportedHooks = []string{"auto", "crio", "podinformer", "nri", "fanotify", "fanotify+ebpf"}
 
 var clusterImagePolicyKind = schema.GroupVersionKind{
 	Group:   "policy.sigstore.dev",
@@ -142,26 +153,11 @@ func init() {
 		"image-pull-policy", "",
 		"Always",
 		"pull policy for the container image")
-	deployCmd.PersistentFlags().StringVarP(
-		&hookMode,
-		"hook-mode", "",
-		"auto",
-		fmt.Sprintf("how to get containers start/stop notifications (%s)", strings.Join(supportedHooks, ", ")))
 	deployCmd.PersistentFlags().BoolVarP(
 		&livenessProbe,
 		"liveness-probe", "",
 		true,
 		"enable liveness probes")
-	deployCmd.PersistentFlags().BoolVarP(
-		&fallbackPodInformer,
-		"fallback-podinformer", "",
-		true,
-		"use pod informer as a fallback for the main hook")
-	deployCmd.PersistentFlags().BoolVarP(
-		&legacyHostPID,
-		"legacy-host-pid", "",
-		false,
-		"use hostPID=true for the gadget pod (legacy)")
 	deployCmd.PersistentFlags().BoolVarP(
 		&printOnly,
 		"print-only", "",
@@ -213,9 +209,11 @@ func init() {
 		"events-buffer-length", "",
 		16384,
 		"The events buffer length. A low value could impact horizontal scaling.")
+	deployCmd.PersistentFlags().MarkDeprecated("events-buffer-length", "This flag is deprecated and will be removed in v0.43.0+ release. Use --daemon-config instead")
 	deployCmd.PersistentFlags().StringVarP(
 		&daemonLogLevel,
 		"daemon-log-level", "", "info", fmt.Sprintf("Set the ig-k8s log level, valid values are: %v", strings.Join(strLevels, ", ")))
+	deployCmd.PersistentFlags().MarkDeprecated("daemon-log-level", "This flag is deprecated and will be removed in v0.43.0+ release. Use --daemon-config instead")
 	deployCmd.PersistentFlags().StringVarP(
 		&appArmorprofile,
 		"apparmor-profile", "", "unconfined", "AppArmor profile to use")
@@ -227,6 +225,50 @@ func init() {
 	deployCmd.PersistentFlags().StringVarP(
 		&publicKey,
 		"public-key", "", resources.InspektorGadgetPublicKey, "Public key used to verify the container image")
+	deployCmd.PersistentFlags().BoolVar(
+		&verifyGadgets,
+		"verify-gadgets", true, "Verify gadgets using the provided public keys")
+	deployCmd.PersistentFlags().MarkDeprecated("verify-gadgets", "This flag is deprecated and will be removed in v0.43.0+ release. Use --daemon-config instead")
+	// WARNING For now, use StringVar() instead of StringSliceVar() as only the
+	// first line of the file will be taken when used with
+	// --gadgets-public-keys="$(cat inspektor-gadget.pub),$(cat your-key.pub)"
+	deployCmd.PersistentFlags().StringVar(
+		&gadgetsPublicKeys,
+		"gadgets-public-keys", resources.InspektorGadgetPublicKey, "Public keys used to verify the gadgets")
+	deployCmd.PersistentFlags().MarkDeprecated("gadgets-public-keys", "This flag is deprecated and will be removed in v0.43.0+ release. Use --daemon-config instead")
+	deployCmd.PersistentFlags().StringSliceVar(
+		&allowedGadgets,
+		"allowed-gadgets", []string{}, "List of allowed gadgets, if gadget is not part of it, execution will be denied. By default, all gadgets are allowed.")
+	deployCmd.PersistentFlags().MarkDeprecated("allowed-gadgets", "This flag is deprecated and will be removed in v0.43.0+ release. Use --daemon-config instead")
+	deployCmd.PersistentFlags().StringSliceVar(
+		&insecureRegistries,
+		"insecure-registries",
+		[]string{},
+		"List of registries to access over plain HTTP",
+	)
+	deployCmd.PersistentFlags().MarkDeprecated("insecure-registries", "This flag is deprecated and will be removed in v0.43.0+ release. Use --daemon-config instead")
+	deployCmd.PersistentFlags().BoolVar(
+		&disallowGadgetsPull,
+		"disallow-gadgets-pulling", false, "Disallow pulling gadgets from registries")
+	deployCmd.PersistentFlags().MarkDeprecated("disallow-gadgets-pulling", "This flag is deprecated and will be removed in v0.43.0+ release. Use --daemon-config instead")
+	deployCmd.PersistentFlags().BoolVar(
+		&otelMetricsListen,
+		"otel-metrics-listen", false, "Enable OpenTelemetry metrics listener (Prometheus compatible) endpoint")
+	deployCmd.PersistentFlags().MarkDeprecated("otel-metrics-listen", "This flag is deprecated and will be removed in v0.43.0+ release. Use --daemon-config instead")
+	deployCmd.PersistentFlags().StringVar(
+		&otelMetricsListenAddr,
+		"otel-metrics-listen-address", "0.0.0.0:2224", "Address and port to create the OpenTelemetry metrics listener (Prometheus compatible) on")
+	deployCmd.PersistentFlags().MarkDeprecated("otel-metrics-listen-address", "This flag is deprecated and will be removed in v0.43.0+ release. Use --daemon-config instead")
+	deployCmd.PersistentFlags().StringSliceVar(
+		&setDaemonConfig,
+		"set-daemon-config", []string{}, "Set a key-value pair in the daemon configuration. The format is key=value. This flag can be used multiple times to set multiple values. Only recommended for primitive values (string, int, bool). For complex values, use --daemon-config flag with a YAML file.")
+	deployCmd.PersistentFlags().StringVar(
+		&daemonConfig,
+		"daemon-config", "", "Path to a config file to override the daemon configuration values. The file must be in YAML format")
+	deployCmd.PersistentFlags().BoolVar(
+		&dropCapSysAdmin,
+		"drop-cap-sys-admin", false,
+		"Drop CAP_SYS_ADMIN and use CAP_BPF and CAP_PERFMON instead. This disables fanotify-based container detection and use a non-fanotify hook-mode (podinformer/nri/crio)")
 	rootCmd.AddCommand(deployCmd)
 }
 
@@ -237,12 +279,45 @@ func info(format string, args ...any) {
 	fmt.Printf(format, args...)
 }
 
+func replaceCapSysAdminWithCapBpfAndCapPerfmon(c *v1.Container) error {
+	if c.SecurityContext == nil || c.SecurityContext.Capabilities == nil {
+		return fmt.Errorf("gadget container has no capabilities to modify")
+	}
+	caps := c.SecurityContext.Capabilities
+
+	// Worst case: one entry removed (SYS_ADMIN), two added (BPF, PERFMON).
+	filtered := make([]v1.Capability, 0, len(caps.Add)+1)
+	found := false
+	for _, capability := range caps.Add {
+		switch capability {
+		case "SYS_ADMIN":
+			found = true
+			continue
+		case "BPF", "PERFMON":
+			// Appended below, skip them here to avoid duplicates.
+			continue
+		}
+		filtered = append(filtered, capability)
+	}
+	if !found {
+		return errors.New("--drop-cap-sys-admin used but CAP_SYS_ADMIN was not present in deployment")
+	}
+
+	filtered = append(filtered, "BPF", "PERFMON")
+	caps.Add = filtered
+
+	log.Warn("CAP_SYS_ADMIN dropped: new-container detection via fanotify is disabled")
+	return nil
+}
+
 // parseK8sYaml parses a k8s YAML deployment file content and returns the
 // corresponding objects.
 // It was adapted from:
 // https://github.com/kubernetes/client-go/issues/193#issuecomment-363318588
 func parseK8sYaml(content string) ([]runtime.Object, error) {
-	sepYamlfiles := strings.Split(content, "---")
+	// We need to use a regex due to public key which contains "-----".
+	pattern := regexp.MustCompile(`(?m)^---$`)
+	sepYamlfiles := pattern.Split(content, -1)
 	retVal := make([]runtime.Object, 0, len(sepYamlfiles))
 
 	sch := runtime.NewScheme()
@@ -252,8 +327,6 @@ func parseK8sYaml(content string) ([]runtime.Object, error) {
 		seccompprofileapi.AddToScheme(sch)
 	}
 
-	// For CustomResourceDefinition kind.
-	apiextv1.AddToScheme(sch)
 	// For ClusterImagePolicy kind, this avoid including all sigstore dependencies.
 	sch.AddKnownTypeWithName(clusterImagePolicyKind, &unstructured.Unstructured{})
 	// For all the other kinds (e.g. Namespace).
@@ -386,6 +459,33 @@ func selectorAsNodeSelector(s string) (*v1.NodeSelector, error) {
 	return nodeSelector, nil
 }
 
+// This function handles translating an AppArmor profile as given for
+// annotations to the new structure offered by k8s >= 1.30:
+// https://pkg.go.dev/k8s.io/api/core/v1#AppArmorProfileType
+func createAppArmorProfile(profile string) (*v1.AppArmorProfile, error) {
+	ret := &v1.AppArmorProfile{}
+
+	parts := strings.Split(profile, "/")
+	switch parts[0] {
+	case "unconfined":
+		ret.Type = v1.AppArmorProfileTypeUnconfined
+	case "runtime":
+		ret.Type = v1.AppArmorProfileTypeRuntimeDefault
+	case "localhost":
+		ret.Type = v1.AppArmorProfileTypeLocalhost
+
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("AppArmor profile malformed: localhost/profile expected, got %q", profile)
+		}
+
+		ret.LocalhostProfile = &parts[1]
+	default:
+		return nil, fmt.Errorf("AppArmor profile badly named: expected unconfined, runtime or localhost, got %q", parts[0])
+	}
+
+	return ret, nil
+}
+
 // createAffinity returns the affinity to be used for the DaemonSet.
 func createAffinity(client *kubernetes.Clientset) (*v1.Affinity, error) {
 	nodes, err := client.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: nodeSelector})
@@ -411,6 +511,135 @@ func createAffinity(client *kubernetes.Clientset) (*v1.Affinity, error) {
 	return affinity, nil
 }
 
+// applyConfigToConfigMap overrides the ConfigMap using the following order of precedence (highest to lowest):
+// 1. Flags (--gadgets-public-keys, --disallow-gadgets-pulling, etc.) [Deprecated]
+// 2. --set-daemon-config flag
+// 3. ConfigFile passed through `daemon-config`
+// 4. Flags default values [Deprecated]
+// 5. ConfigMap default values
+func applyConfigToConfigMap(cm *v1.ConfigMap, configPath string, flags *pflag.FlagSet) error {
+	if cm == nil {
+		return fmt.Errorf("ConfigMap is nil")
+	}
+	cfgData, ok := cm.Data[configYamlKey]
+	if !ok {
+		return fmt.Errorf("%q not found in ConfigMap %q", configYamlKey, cm.Name)
+	}
+
+	v := viper.New()
+	v.SetConfigType("yaml")
+
+	// Set the default values from the ConfigMap
+	err := v.ReadConfig(strings.NewReader(cfgData))
+	if err != nil {
+		return fmt.Errorf("reading config file %q: %w", configPath, err)
+	}
+
+	// Set default value from flags
+	flags.VisitAll(func(flag *pflag.Flag) {
+		ck, ok := flagToConfigKey(flag.Name)
+		if !ok {
+			return
+		}
+		val := flagToConfigValue(ck, flag.Value)
+		v.SetDefault(ck, val)
+	})
+
+	// Set the values from a config file
+	if configPath != "" {
+		f, err := os.Open(configPath)
+		if err != nil {
+			return fmt.Errorf("opening daemon config file %q: %w", configPath, err)
+		}
+		defer f.Close()
+		err = v.MergeConfig(f)
+		if err != nil {
+			return fmt.Errorf("merging config file %q: %w", configPath, err)
+		}
+	}
+
+	// Set values from --set-daemon-config flag
+	for _, set := range setDaemonConfig {
+		parts := strings.SplitN(set, "=", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid format for --set-daemon-config: %q, expected key=value", set)
+		}
+		key := parts[0]
+		value := parts[1]
+
+		// best effort: type is inferred from the flag value or values read from the ConfigMap
+		if v.IsSet(key) {
+			existingValue := v.Get(key)
+			switch reflect.TypeOf(existingValue).Kind() {
+			case reflect.Int:
+				intValue, err := strconv.Atoi(value)
+				if err != nil {
+					return fmt.Errorf("invalid integer value for %q: %q", key, value)
+				}
+				v.Set(key, intValue)
+			case reflect.Bool:
+				boolValue, err := strconv.ParseBool(value)
+				if err != nil {
+					return fmt.Errorf("invalid boolean value for %q: %q", key, value)
+				}
+				v.Set(key, boolValue)
+			case reflect.String:
+				v.Set(key, value)
+			default:
+				return fmt.Errorf("setting %q with --set-daemon-config is only supported for primitive values (string, int, bool), got %T. For complex values, use --daemon-config flag with a YAML file", key, existingValue)
+			}
+			continue
+		}
+		v.Set(key, value)
+	}
+
+	// Set values from flags if changed
+	flags.VisitAll(func(flag *pflag.Flag) {
+		fn, ok := flagToConfigKey(flag.Name)
+		if !ok || !flag.Changed {
+			return
+		}
+		val := flagToConfigValue(fn, flag.Value)
+		v.Set(fn, val)
+	})
+
+	var buf bytes.Buffer
+	err = v.WriteConfigTo(&buf)
+	if err != nil {
+		return fmt.Errorf("writing config to buffer: %w", err)
+	}
+	cm.Data[configYamlKey] = buf.String()
+
+	return nil
+}
+
+// flagToConfigKey converts a flag name to the corresponding config key
+// since some flags have different names in the config file.
+func flagToConfigKey(flagName string) (string, bool) {
+	key := flagName
+	switch flagName {
+	case "gadgets-public-keys":
+		key = gadgettracermanagerconfig.PublicKeys
+	case "disallow-gadgets-pulling":
+		key = gadgettracermanagerconfig.DisallowPulling
+	case "verify-gadgets":
+		key = gadgettracermanagerconfig.VerifyImage
+	}
+	if !gadgettracermanagerconfig.IsValidKey(key) {
+		return "", false
+	}
+
+	return gadgettracermanagerconfig.FullKeyPath(key), true
+}
+
+// flagToConfigValue converts a flag value to the corresponding config value.
+func flagToConfigValue(flagName string, value pflag.Value) any {
+	if flagName == gadgettracermanagerconfig.PublicKeys {
+		return strings.Split(value.String(), ",")
+	}
+	return value
+}
+
 func runDeploy(cmd *cobra.Command, args []string) error {
 	gadgetNamespace := runtimeGlobalParams.Get(grpcruntime.ParamGadgetNamespace).AsString()
 	if !printOnly {
@@ -425,18 +654,6 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	found := false
-	for _, supportedHook := range supportedHooks {
-		if hookMode == supportedHook {
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		return fmt.Errorf("invalid argument %q for --hook-mode=[%s]", hookMode, strings.Join(supportedHooks, ","))
-	}
-
 	if quiet && debug {
 		return fmt.Errorf("it's not possible to use --quiet and --debug together")
 	}
@@ -445,13 +662,6 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-
-	traceObjects, err := parseK8sYaml(resources.TracesCustomResource)
-	if err != nil {
-		return err
-	}
-
-	objects = append(objects, traceObjects...)
 
 	if seccompProfile != "" {
 		content, err := os.ReadFile(seccompProfile)
@@ -550,29 +760,20 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 
 		daemonSet, handlingDaemonSet := object.(*appsv1.DaemonSet)
 		if handlingDaemonSet {
-			daemonSet.Spec.Template.Annotations["inspektor-gadget.kinvolk.io/option-hook-mode"] = hookMode
-			daemonSet.Spec.Template.Annotations["container.apparmor.security.beta.kubernetes.io/gadget"] = appArmorprofile
-			daemonSet.Namespace = gadgetNamespace
-
-			// Inspektor Gadget used to require hostPID=true. This is no longer
-			// required, so keep hostPID=false unless the user explicitly
-			// requests it for compatibility with older clusters.
-			daemonSet.Spec.Template.Spec.HostPID = legacyHostPID
-
-			if !printOnly {
-				// The "kubernetes.io/os" node label was introduced in v1.14.0
-				// (https://github.com/kubernetes/kubernetes/blob/master/CHANGELOG/CHANGELOG-1.14.md.)
-				// Remove this if the cluster is older than that to allow Inspektor Gadget to work there.
-				serverInfo, err := discoveryClient.ServerVersion()
+			// modify the otel-metrics-listen-address if specified
+			if otelMetricsListen {
+				// modify the prometheus.io/port annotation
+				_, otelListenPort, err := net.SplitHostPort(otelMetricsListenAddr)
 				if err != nil {
-					return fmt.Errorf("getting server version: %w", err)
+					return fmt.Errorf("parsing port: %w", err)
 				}
-
-				serverVersion := k8sversion.MustParseSemantic(serverInfo.String())
-				if serverVersion.LessThan(k8sversion.MustParseSemantic("v1.14.0")) {
-					delete(daemonSet.Spec.Template.Spec.NodeSelector, "kubernetes.io/os")
+				if daemonSet.Spec.Template.Annotations == nil {
+					daemonSet.Spec.Template.Annotations = make(map[string]string)
 				}
+				daemonSet.Spec.Template.Annotations["prometheus.io/port"] = otelListenPort
 			}
+
+			daemonSet.Namespace = gadgetNamespace
 
 			if seccompProfile != "" {
 				path := "operator/gadget/profile.json"
@@ -584,9 +785,52 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 				}
 			}
 
+			if !printOnly {
+				serverInfo, err := discoveryClient.ServerVersion()
+				if err != nil {
+					return fmt.Errorf("getting server version: %w", err)
+				}
+
+				serverVersion := k8sversion.MustParseSemantic(serverInfo.String())
+
+				// The "kubernetes.io/os" node label was introduced in v1.14.0
+				// (https://github.com/kubernetes/kubernetes/blob/master/CHANGELOG/CHANGELOG-1.14.md.)
+				// Remove this if the cluster is older than that to allow Inspektor Gadget to work there.
+				if serverVersion.LessThan(k8sversion.MustParseSemantic("v1.14.0")) {
+					delete(daemonSet.Spec.Template.Spec.NodeSelector, "kubernetes.io/os")
+				}
+
+				// Before 1.30, AppArmor profile was set as annotation, but since 1.30
+				// it has specific types:
+				// https://kubernetes.io/docs/tutorials/security/apparmor/#securing-a-pod
+				if serverVersion.AtLeast(k8sversion.MustParseSemantic("v1.30.0")) {
+					delete(daemonSet.Spec.Template.Annotations, "container.apparmor.security.beta.kubernetes.io/gadget")
+
+					profile, err := createAppArmorProfile(appArmorprofile)
+					if err != nil {
+						return fmt.Errorf("creating AppArmor profile: %w", err)
+					}
+
+					if daemonSet.Spec.Template.Spec.SecurityContext == nil {
+						daemonSet.Spec.Template.Spec.SecurityContext = &v1.PodSecurityContext{}
+					}
+
+					daemonSet.Spec.Template.Spec.SecurityContext.AppArmorProfile = profile
+				} else {
+					daemonSet.Spec.Template.Annotations["container.apparmor.security.beta.kubernetes.io/gadget"] = appArmorprofile
+				}
+			}
+
 			gadgetContainer := &daemonSet.Spec.Template.Spec.Containers[0]
 
 			gadgetContainer.Image = image
+
+			if dropCapSysAdmin {
+				err := replaceCapSysAdminWithCapBpfAndCapPerfmon(gadgetContainer)
+				if err != nil {
+					return err
+				}
+			}
 
 			policy, err := stringToPullPolicy(imagePullPolicy)
 			if err != nil {
@@ -602,12 +846,6 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 				switch gadgetContainer.Env[i].Name {
 				case "GADGET_IMAGE":
 					gadgetContainer.Env[i].Value = image
-				case "INSPEKTOR_GADGET_VERSION":
-					gadgetContainer.Env[i].Value = version.Version().String()
-				case "INSPEKTOR_GADGET_OPTION_HOOK_MODE":
-					gadgetContainer.Env[i].Value = hookMode
-				case "INSPEKTOR_GADGET_OPTION_FALLBACK_POD_INFORMER":
-					gadgetContainer.Env[i].Value = strconv.FormatBool(fallbackPodInformer)
 				case utils.GadgetEnvironmentContainerdSocketpath:
 					gadgetContainer.Env[i].Value = runtimesConfig.Containerd
 				case utils.GadgetEnvironmentCRIOSocketpath:
@@ -619,13 +857,6 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 				case experimental.EnvName:
 					value := experimental.Enabled() || experimentalVar
 					gadgetContainer.Env[i].Value = strconv.FormatBool(value)
-				case "EVENTS_BUFFER_LENGTH":
-					gadgetContainer.Env[i].Value = strconv.FormatUint(eventBufferLength, 10)
-				case "GADGET_TRACER_MANAGER_LOG_LEVEL":
-					if !slices.Contains(strLevels, daemonLogLevel) {
-						return fmt.Errorf("invalid log level %q, valid levels are: %v", daemonLogLevel, strings.Join(strLevels, ", "))
-					}
-					gadgetContainer.Env[i].Value = daemonLogLevel
 				}
 			}
 
@@ -638,7 +869,7 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 			}
 
 			// skip SELinux options if the user explicitly requests it
-			if legacyHostPID || skipSELinuxOpts {
+			if skipSELinuxOpts {
 				gadgetContainer.SecurityContext.SELinuxOptions = nil
 			}
 
@@ -695,6 +926,14 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 		}
 		if rBinding, isRole := object.(*rbacv1.RoleBinding); isRole {
 			rBinding.Namespace = gadgetNamespace
+		}
+
+		if cm, isCm := object.(*v1.ConfigMap); isCm {
+			cm.Namespace = gadgetNamespace
+			err = applyConfigToConfigMap(cm, daemonConfig, cmd.PersistentFlags())
+			if err != nil {
+				return fmt.Errorf("merging config with %q: %w", daemonConfig, err)
+			}
 		}
 
 		if printOnly {
@@ -781,7 +1020,6 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 			return false, nil
 		}
 	})
-
 	if err != nil {
 		if utilwait.Interrupted(err) && debug {
 			fmt.Println("DUMP PODS:")
@@ -790,12 +1028,6 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 			fmt.Println(getEvents(k8sClient, gadgetNamespace))
 		}
 		return err
-	}
-
-	info("Retrieving Gadget Catalog...\n")
-	err = grpcRuntime.UpdateDeployInfo()
-	if err != nil {
-		fmt.Printf("> failed: %v\n", err)
 	}
 
 	info("Inspektor Gadget successfully deployed\n")

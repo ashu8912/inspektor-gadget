@@ -1,6 +1,8 @@
 CLANG ?= clang
 LLVM_STRIP ?= llvm-strip
-EBPF_BUILDER ?= ghcr.io/inspektor-gadget/ebpf-builder
+GADGET_BUILDER ?= ghcr.io/inspektor-gadget/gadget-builder
+
+include ../rootless.mk
 
 .PHOHY: all
 all: testdata_docker
@@ -18,7 +20,6 @@ TESTDATA = \
 	populate_metadata_snapshotter_struct.o \
 	validate_metadata1.o \
 	validate_metadata_topper.o \
-	validate_metadata_sched_cls.o \
 	populate_metadata_1_topper_1_struct_from_scratch.o \
 	populate_metadata_topper_non_existing_map.o \
 	populate_metadata_topper_bad_topper_info.o \
@@ -40,9 +41,9 @@ testdata_host: $(TESTDATA)
 
 .PHONY: testdata_docker
 testdata_docker:
-	docker run --rm --name testdata-builder --user $(shell id -u):$(shell id -g) \
-		-v $(shell pwd):/work $(EBPF_BUILDER) \
-		bash -c "cd /work && make testdata_host"
+	docker run --rm --name testdata-builder $(DOCKER_USER_FLAG) \
+		-v $(shell pwd)/..:/work $(GADGET_BUILDER) \
+		bash -c "cd /work && make -C testdata testdata_host"
 
 .PHONY: clean
 clean:

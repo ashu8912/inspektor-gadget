@@ -15,7 +15,9 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	. "github.com/inspektor-gadget/inspektor-gadget/integration"
@@ -43,8 +45,7 @@ func TestFilterByContainerName(t *testing.T) {
 			}
 
 			normalize := func(c *containercollection.Container) {
-				c.Pid = 0
-				c.OciConfig = nil
+				c.OciConfig = ""
 				c.Bundle = ""
 				c.Mntns = 0
 				c.Netns = 0
@@ -56,12 +57,15 @@ func TestFilterByContainerName(t *testing.T) {
 				c.K8s.PodLabels = nil
 				c.K8s.PodUID = ""
 				c.Runtime.ContainerID = ""
+				c.Runtime.ContainerPID = 0
+				c.Runtime.ContainerStartedAt = 0
 				// TODO: Handle once we support getting ContainerImageName from Docker
 				c.Runtime.ContainerImageName = ""
 				c.Runtime.ContainerImageDigest = ""
+				c.Runtime.ContainerImageID = ""
 			}
 
-			ExpectAllInArrayToMatch(t, output, normalize, expectedContainer)
+			match.MatchAllEntries(t, match.JSONSingleArrayMode, output, normalize, expectedContainer)
 		},
 	}
 
@@ -109,8 +113,7 @@ func TestWatchContainers(t *testing.T) {
 			}
 
 			normalize := func(e *containercollection.PubSubEvent) {
-				e.Container.Pid = 0
-				e.Container.OciConfig = nil
+				e.Container.OciConfig = ""
 				e.Container.Bundle = ""
 				e.Container.Mntns = 0
 				e.Container.Netns = 0
@@ -123,12 +126,15 @@ func TestWatchContainers(t *testing.T) {
 				e.Container.K8s.PodLabels = nil
 				e.Container.K8s.PodUID = ""
 				e.Container.Runtime.ContainerID = ""
+				e.Container.Runtime.ContainerPID = 0
+				e.Container.Runtime.ContainerStartedAt = 0
 				// TODO: Handle once we support getting ContainerImageName from Docker
 				e.Container.Runtime.ContainerImageName = ""
 				e.Container.Runtime.ContainerImageDigest = ""
+				e.Container.Runtime.ContainerImageID = ""
 			}
 
-			match.ExpectEntriesToMatch(t, output, normalize, expectedEvents...)
+			match.MatchEntries(t, match.JSONMultiObjectMode, output, normalize, expectedEvents...)
 		},
 	}
 
@@ -139,4 +145,98 @@ func TestWatchContainers(t *testing.T) {
 	}
 
 	RunTestSteps(testSteps, t)
+}
+
+func TestFilterByContainerImageDigest(t *testing.T) {
+	t.Parallel()
+
+	cn := "test-filter-digest"
+
+	// Start container
+	c := containerFactory.NewContainer(cn, "sleep inf", containers.WithStartAndStop())
+	c.Start(t)
+	defer c.Stop(t)
+
+	// Wait a bit for container to be ready
+	SleepForSecondsCommand(2).Run(t)
+
+	var digest string
+
+	// Get digest
+	getDigestCmd := &Command{
+		Name: "GetDigest",
+		Cmd:  fmt.Sprintf("./ig list-containers -o json --runtimes=%s --containername=%s", *runtime, cn),
+		ValidateOutput: func(t *testing.T, output string) {
+			var containers []*containercollection.Container
+			err := json.Unmarshal([]byte(output), &containers)
+			if err != nil {
+				t.Fatalf("failed to unmarshal json: %v", err)
+			}
+			if len(containers) == 0 {
+				t.Fatalf("no containers found")
+			}
+			digest = containers[0].Runtime.ContainerImageDigest
+			if digest == "" {
+				t.Fatalf("container image digest is empty")
+			}
+			t.Logf("Got digest: %s", digest)
+		},
+	}
+	getDigestCmd.Run(t)
+
+	// Helper to run filter test
+	runFilterTest := func(name, filterValue string, shouldMatch bool) {
+		cmd := &Command{
+			Name: name,
+			Cmd:  fmt.Sprintf("./ig list-containers -o json --runtimes=%s --runtime-containerimage-digest=%s", *runtime, filterValue),
+			ValidateOutput: func(t *testing.T, output string) {
+				var containers []*containercollection.Container
+				err := json.Unmarshal([]byte(output), &containers)
+				if err != nil {
+					t.Fatalf("failed to unmarshal json: %v", err)
+				}
+
+				found := false
+				for _, c := range containers {
+					if c.Runtime.ContainerName == cn {
+						found = true
+						break
+					}
+				}
+
+				if shouldMatch {
+					if !found {
+						t.Fatalf("container %s not found in output matching filter %s", cn, filterValue)
+					}
+				} else {
+					if found {
+						t.Fatalf("container %s SHOULD NOT be found in output matching filter %s", cn, filterValue)
+					}
+				}
+			},
+		}
+		cmd.Run(t)
+	}
+
+	// 1. Full digest
+	runFilterTest("FilterByFullDigest", digest, true)
+
+	// 2. Truncated digest (12 chars)
+	// Remove prefix if present for truncation logic (although the filter handles it, we want to pass 12 chars of the hash)
+	hash := digest
+	if idx := strings.Index(hash, ":"); idx != -1 {
+		hash = hash[idx+1:]
+	}
+	if len(hash) > 12 {
+		truncated := hash[:12]
+		runFilterTest("FilterByTruncatedDigest", truncated, true)
+	}
+
+	// 3. Digest without prefix (if present)
+	if strings.Contains(digest, ":") {
+		runFilterTest("FilterByDigestNoPrefix", hash, true)
+	}
+
+	// 4. Wrong digest
+	runFilterTest("FilterByWrongDigest", "sha256:0000000000000000000000000000000000000000000000000000000000000000", false)
 }

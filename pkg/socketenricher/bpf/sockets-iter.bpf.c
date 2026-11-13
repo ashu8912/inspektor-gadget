@@ -9,6 +9,7 @@
 
 #include <bpf/bpf_helpers.h>
 
+#include <gadget/filesystem.h>
 #include <gadget/sockets-map.h>
 #include "socket-enricher-helpers.h"
 
@@ -17,18 +18,25 @@
 
 const volatile __u64 socket_file_ops_addr = 0;
 
+static const struct gadget_socket_value empty_sockets_value = {};
+// The iterator is called one time, we don't need BPF per-cpu array map.
+static struct gadget_socket_value socket_value = {};
+
 static __always_inline void insert_socket_from_iter(struct sock *sock,
 						    struct task_struct *task)
 {
-	struct sockets_key socket_key = {
+	struct gadget_socket_key socket_key = {
 		0,
 	};
 	prepare_socket_key(&socket_key, sock);
 
-	struct sockets_value socket_value = {
-		0,
-	};
+	bpf_probe_read_kernel(&socket_value, sizeof(socket_value),
+			      &empty_sockets_value);
+
 	// use given task
+	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
+	struct fs_struct *fs = BPF_CORE_READ(task, fs);
+	struct file *exe_file = BPF_CORE_READ(task, mm, exe_file);
 	socket_value.pid_tgid = ((u64)task->tgid) << 32 | task->pid;
 	// The VFS code might temporary substitute task->cred by other creds during overlayfs
 	// copyup. In this case, we want the real creds of the process, not the creds temporarily
@@ -39,14 +47,34 @@ static __always_inline void insert_socket_from_iter(struct sock *sock,
 	__builtin_memcpy(&socket_value.task, task->comm,
 			 sizeof(socket_value.task));
 	socket_value.mntns = (u64)task->nsproxy->mnt_ns->ns.inum;
+
+	if (parent != NULL) {
+		bpf_probe_read_kernel(&socket_value.ptask,
+				      sizeof(socket_value.ptask), parent->comm);
+		socket_value.ppid = (__u32)BPF_CORE_READ(parent, tgid);
+		socket_value.ptid = (__u32)BPF_CORE_READ(parent, pid);
+	}
+
 	socket_value.sock = (__u64)sock;
 	socket_value.ipv6only =
 		BPF_CORE_READ_BITFIELD_PROBED(sock, __sk_common.skc_ipv6only);
 
+	if (bpf_core_field_exists(socket_value.cwd)) {
+		int cwd_size = bpf_core_field_size(socket_value.cwd);
+		char *cwd = get_path_str(&fs->pwd);
+		bpf_probe_read_kernel_str(socket_value.cwd, cwd_size, cwd);
+	}
+	if (bpf_core_field_exists(socket_value.exepath)) {
+		int exepath_size = bpf_core_field_size(socket_value.exepath);
+		char *exepath = get_path_str(&exe_file->f_path);
+		bpf_probe_read_kernel_str(socket_value.exepath, exepath_size,
+					  exepath);
+	}
+
 	// If the endpoint was not present, add it and we're done.
-	struct sockets_value *old_socket_value =
-		(struct sockets_value *)bpf_map_lookup_elem(&gadget_sockets,
-							    &socket_key);
+	struct gadget_socket_value *old_socket_value =
+		(struct gadget_socket_value *)bpf_map_lookup_elem(
+			&gadget_sockets, &socket_key);
 	if (!old_socket_value) {
 		// Use BPF_NOEXIST: if an entry was inserted just after the check, this
 		// is because the bpf iterator for initial sockets runs in
@@ -80,8 +108,16 @@ static __always_inline void insert_socket_from_iter(struct sock *sock,
 SEC("iter/task_file")
 int ig_sockets_it(struct bpf_iter__task_file *ctx)
 {
+	struct seq_file *seq = ctx->meta->seq;
+	__u32 seq_num = ctx->meta->seq_num;
 	struct file *file = ctx->file;
 	struct task_struct *task = ctx->task;
+
+	// Don't spend more than 1 million iterations without printing something to
+	// avoid EAGAIN errors. Output is ignored by userspace.
+	// https://github.com/torvalds/linux/commit/e679654a704e5bd676ea6446fa7b764cbabf168a
+	if (seq_num % 100000 == 0)
+		BPF_SEQ_PRINTF(seq, ".");
 
 	if (!file || !task)
 		return 0;
@@ -114,9 +150,15 @@ int ig_sk_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 	struct seq_file *seq = ctx->meta->seq;
 	__u32 seq_num = ctx->meta->seq_num;
 	struct bpf_map *map = ctx->map;
-	struct sockets_key *socket_key = ctx->key;
-	struct sockets_key tmp_key;
-	struct sockets_value *socket_value = ctx->value;
+	struct gadget_socket_key *socket_key = ctx->key;
+	struct gadget_socket_key tmp_key;
+	struct gadget_socket_value *socket_value = ctx->value;
+
+	// Don't spend more than 1 million iterations without printing something to
+	// avoid EAGAIN errors. Output is ignored by userspace.
+	// https://github.com/torvalds/linux/commit/e679654a704e5bd676ea6446fa7b764cbabf168a
+	if (seq_num % 100000 == 0)
+		BPF_SEQ_PRINTF(seq, ".");
 
 	if (!socket_key || !socket_value)
 		return 0;
@@ -130,7 +172,7 @@ int ig_sk_cleanup(struct bpf_iter__bpf_map_elem *ctx)
 	    deletion_timestamp + socket_expiration_ns < now) {
 		// The socket is expired, remove it from the map.
 		__builtin_memcpy(&tmp_key, socket_key,
-				 sizeof(struct sockets_key));
+				 sizeof(struct gadget_socket_key));
 		bpf_map_delete_elem(&gadget_sockets, &tmp_key);
 		return 0;
 	}

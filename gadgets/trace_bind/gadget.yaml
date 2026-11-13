@@ -1,0 +1,33 @@
+name: trace bind
+description: Trace socket bindings
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/trace_bind
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/trace_bind
+datasources:
+  bind:
+    fields:
+      addr:
+        annotations:
+          description: Address the socket is bound to
+          columns.width: 32
+      error_raw:
+        annotations:
+          columns.hidden: true
+      opts_raw:
+        annotations:
+          columns.hidden: true
+      opts:
+        annotations:
+          description: Socket options
+          columns.hidden: true
+      bound_dev_if:
+        annotations:
+          description: Index of the network interface the socket is bound to
+          columns.width: 10
+params:
+  ebpf:
+    ignore_errors:
+      key: ignore-errors
+      alias: i
+      defaultValue: "true"
+      description: Show only events where the bind succeeded

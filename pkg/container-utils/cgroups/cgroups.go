@@ -25,17 +25,34 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/nsenter"
 )
 
 func CgroupPathV2AddMountpoint(path string) (string, error) {
-	pathWithMountpoint := filepath.Join("/sys/fs/cgroup/unified", path)
-	if _, err := os.Stat(pathWithMountpoint); os.IsNotExist(err) {
-		pathWithMountpoint = filepath.Join("/sys/fs/cgroup", path)
-		if _, err := os.Stat(pathWithMountpoint); os.IsNotExist(err) {
-			return "", fmt.Errorf("accessing cgroup %q: %w", path, err)
-		}
+	mountpoint, err := GetCgroupV2Mountpoint()
+	if err != nil {
+		return "", err
+	}
+	pathWithMountpoint := filepath.Join(mountpoint, path)
+	if _, err := os.Stat(pathWithMountpoint); err != nil {
+		return "", fmt.Errorf("accessing cgroup %q: %w", path, err)
 	}
 	return pathWithMountpoint, nil
+}
+
+// GetCgroupV2Mountpoint returns the host's cgroup-v2 mount point.
+func GetCgroupV2Mountpoint() (string, error) {
+	candidates := []string{
+		"/sys/fs/cgroup",
+		"/sys/fs/cgroup/unified",
+	}
+	for _, path := range candidates {
+		var stat unix.Statfs_t
+		if err := unix.Statfs(path, &stat); err == nil && stat.Type == unix.CGROUP2_SUPER_MAGIC {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("no cgroup v2 mount found (looked in %v)", candidates)
 }
 
 // GetCgroupID returns the cgroup2 ID of a path.
@@ -56,7 +73,17 @@ func GetCgroupID(pathWithMountpoint string) (uint64, error) {
 func GetCgroupPaths(pid int) (string, string, error) {
 	cgroupPathV1 := ""
 	cgroupPathV2 := ""
-	if cgroupFile, err := os.Open(filepath.Join(host.HostProcFs, fmt.Sprint(pid), "cgroup")); err == nil {
+
+	hostCgroupNs, err := host.IsHostCgroupNs()
+	if err != nil {
+		return "", "", err
+	}
+
+	readFn := func() error {
+		cgroupFile, err := os.Open(filepath.Join(host.HostProcFs, fmt.Sprint(pid), "cgroup"))
+		if err != nil {
+			return fmt.Errorf("parsing cgroup: %w", err)
+		}
 		defer cgroupFile.Close()
 		reader := bufio.NewReader(cgroupFile)
 		for {
@@ -75,8 +102,16 @@ func GetCgroupPaths(pid int) (string, string, error) {
 				continue
 			}
 		}
+		return nil
+	}
+
+	if hostCgroupNs {
+		err = readFn()
 	} else {
-		return "", "", fmt.Errorf("parsing cgroup: %w", err)
+		err = nsenter.CgroupnsEnter(1, readFn)
+	}
+	if err != nil {
+		return "", "", err
 	}
 
 	if cgroupPathV1 == "/" {

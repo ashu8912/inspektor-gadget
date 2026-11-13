@@ -6,10 +6,10 @@
 # image is valid, even scratch. Alpine is used by default as a tradeoff
 # between size and tools available in the image.
 
-ARG BUILDER_IMAGE=golang:1.22-bullseye
-ARG BASE_IMAGE=alpine:3.18
+ARG BUILDER_IMAGE=golang:1.26.10-trixie@sha256:909771fef53e3dcb0950255f0c9a8b4728c3b841e61509c7b29b098de7ee02d4
+ARG BASE_IMAGE=gcr.io/distroless/static-debian11:latest@sha256:1dbe426d60caed5d19597532a2d74c8056cd7b1674042b88f7328690b5ead8ed
 
-FROM --platform=${BUILDPLATFORM} ${BUILDER_IMAGE} as builder
+FROM --platform=${BUILDPLATFORM} ${BUILDER_IMAGE} AS builder
 
 ARG TARGETARCH
 ARG TARGETOS
@@ -30,7 +30,10 @@ ENV IMAGE_TAG=${IMAGE_TAG}
 
 # This COPY is limited by .dockerignore
 COPY ./ /gadget
-RUN cd /gadget && GOHOSTOS=$TARGETOS GOHOSTARCH=$TARGETARCH make kubectl-gadget
+RUN \
+    --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg \
+    cd /gadget && GOHOSTOS=$TARGETOS GOHOSTARCH=$TARGETARCH make kubectl-gadget
 
 FROM ${BASE_IMAGE}
 

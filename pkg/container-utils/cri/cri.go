@@ -53,6 +53,7 @@ type CRIClient struct {
 }
 
 func NewCRIClient(name types.RuntimeName, socketPath string, timeout time.Duration) (*CRIClient, error) {
+	//nolint:staticcheck
 	conn, err := grpc.Dial(
 		socketPath,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -362,6 +363,16 @@ func parseExtraInfo(extraInfo map[string]string,
 	return nil
 }
 
+// ParseExtraInfoTest exports parseExtraInfo for the tests only (cri_test.go)
+// This allows the tests to be in a separate package (package cri_test) so we
+// can remove memory expensive dependencies from ig
+// (github.com/google/go-cmp/cmp)
+func ParseExtraInfoTest(extraInfo map[string]string,
+	containerDetailsData *runtimeclient.ContainerDetailsData,
+) error {
+	return parseExtraInfo(extraInfo, containerDetailsData)
+}
+
 // Convert the state from container status to state of runtime client.
 func containerStatusStateToRuntimeClientState(containerStatusState runtime.ContainerState) (runtimeClientState string) {
 	switch containerStatusState {
@@ -393,11 +404,13 @@ type CRIContainer interface {
 
 func digestFromRef(imageRef string) string {
 	splitted := strings.Split(imageRef, "@")
-	if len(splitted) == 1 {
-		return imageRef
-	} else {
+	if len(splitted) > 1 {
 		return splitted[1]
 	}
+	if idx := strings.Index(imageRef, "sha256:"); idx != -1 {
+		return imageRef[idx:]
+	}
+	return ""
 }
 
 func getFilteredPodLabels(podSandbox *runtime.PodSandbox) map[string]string {
@@ -417,14 +430,13 @@ func buildContainerData(runtimeName types.RuntimeName, container CRIContainer, p
 
 	containerData := &runtimeclient.ContainerData{
 		Runtime: runtimeclient.RuntimeContainerData{
-			BasicRuntimeMetadata: types.BasicRuntimeMetadata{
-				ContainerID:          container.GetId(),
-				ContainerName:        strings.TrimPrefix(containerMetadata.GetName(), "/"),
-				RuntimeName:          runtimeName,
-				ContainerImageName:   image.GetImage(),
-				ContainerImageDigest: digestFromRef(imageRef),
-			},
-			State: containerStatusStateToRuntimeClientState(container.GetState()),
+			ContainerID:          container.GetId(),
+			ContainerName:        strings.TrimPrefix(containerMetadata.GetName(), "/"),
+			RuntimeName:          runtimeName,
+			ContainerImageName:   image.GetImage(),
+			ContainerImageID:     imageRef,
+			ContainerImageDigest: digestFromRef(imageRef),
+			State:                containerStatusStateToRuntimeClientState(container.GetState()),
 		},
 	}
 
@@ -432,12 +444,12 @@ func buildContainerData(runtimeName types.RuntimeName, container CRIContainer, p
 	runtimeclient.EnrichWithK8sMetadata(containerData, container.GetLabels())
 
 	// Initial labels are stored in the pod sandbox
-	containerData.K8s.BasicK8sMetadata.PodLabels = getFilteredPodLabels(podSandbox)
+	containerData.K8s.PodLabels = getFilteredPodLabels(podSandbox)
 
-	// CRI-O does not use the same container name of Kubernetes as containerd.
+	// Docker and CRI-O use composed container names with pod metadata (unlike containerd).
 	// Instead, it uses a composed name as Docker does, but such name is not
 	// available in the container metadata.
-	if runtimeName == types.RuntimeNameCrio {
+	if runtimeName == types.RuntimeNameCrio || runtimeName == types.RuntimeNameDocker {
 		containerData.Runtime.ContainerName = fmt.Sprintf("k8s_%s_%s_%s_%s_%d",
 			containerData.K8s.ContainerName,
 			containerData.K8s.PodName,

@@ -17,30 +17,19 @@
 package gadgets
 
 import (
-	"fmt"
-	"syscall"
+	"bytes"
 )
 
-func ProtoString(proto int) string {
-	// proto definitions:
-	// https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
-	protoStr := fmt.Sprintf("UNKNOWN#%d", proto)
-	switch proto {
-	case syscall.IPPROTO_TCP:
-		protoStr = "TCP"
-	case syscall.IPPROTO_UDP:
-		protoStr = "UDP"
-	}
-	return protoStr
-}
-
 func FromCString(in []byte) string {
-	for i := 0; i < len(in); i++ {
-		if in[i] == 0 {
-			return string(in[:i])
-		}
+	idx := bytes.IndexByte(in, 0)
+	switch {
+	case idx == -1:
+		return string(in)
+	case idx < len(in):
+		return string(in[:idx])
+	default:
+		return string(in)
 	}
-	return string(in)
 }
 
 func FromCStringN(in []byte, length int) string {
@@ -49,10 +38,14 @@ func FromCStringN(in []byte, length int) string {
 		l = length
 	}
 
-	for i := 0; i < l; i++ {
-		if in[i] == 0 {
-			return string(in[:i])
-		}
+	buf := in[:l]
+	idx := bytes.IndexByte(buf, 0)
+	switch {
+	case idx == -1:
+		return string(in)
+	case idx < l:
+		return string(in[:idx])
+	default:
+		return string(in)
 	}
-	return string(in[:l])
 }

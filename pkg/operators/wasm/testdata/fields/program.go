@@ -1,0 +1,115 @@
+// Copyright 2024 The Inspektor Gadget authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"fmt"
+
+	api "github.com/inspektor-gadget/inspektor-gadget/wasmapi/go"
+)
+
+//go:wasmexport gadgetInit
+func gadgetInit() int32 {
+	ds, err := api.GetDataSource("myds")
+	if err != nil {
+		api.Warnf("failed to get datasource: %v", err)
+		return 1
+	}
+
+	type field struct {
+		name string
+		typ  api.FieldKind
+		acc  api.Field
+		val  any
+		tag  string
+	}
+
+	fields := []*field{
+		{"field_bool", api.Kind_Bool, 0, bool(true), "tag_bool"},
+		{"field_int8", api.Kind_Int8, 0, int8(-123), "tag_int8"},
+		{"field_int16", api.Kind_Int16, 0, int16(-25647), "tag_int16"},
+		{"field_int32", api.Kind_Int32, 0, int32(-535245564), "tag_int32"},
+		{"field_int64", api.Kind_Int64, 0, int64(-1234567890), "tag_int64"},
+		{"field_uint8", api.Kind_Uint8, 0, uint8(56), "tag_uint8"},
+		{"field_uint16", api.Kind_Uint16, 0, uint16(12345), "tag_uint16"},
+		{"field_uint32", api.Kind_Uint32, 0, uint32(1234567890), "tag_uint32"},
+		{"field_uint64", api.Kind_Uint64, 0, uint64(1234567890123456), "tag_uint64"},
+		{"field_float32", api.Kind_Float32, 0, float32(3.14159), "tag_float32"},
+		{"field_float64", api.Kind_Float64, 0, float64(3.14159265359), "tag_float64"},
+		{"field_string", api.Kind_String, 0, string("Hello, World!"), "tag_string"},
+		{"field_bytes", api.Kind_Bytes, 0, []byte{0x01, 0x02, 0x03, 0x04, 0x05}, "tag_bytes"},
+	}
+
+	for _, f := range fields {
+		acc, err := ds.AddField(f.name, f.typ)
+		if err != nil {
+			api.Warnf("failed to add field: %v", err)
+			return 1
+		}
+		err = acc.AddTag(f.tag)
+		if err != nil {
+			api.Warnf("failed to add tag: %v", err)
+			return 1
+		}
+		f.acc = acc
+	}
+
+	hostF, err := ds.GetField("host_field")
+	if err != nil {
+		api.Warnf("failed to get host field: %v", err)
+		return 1
+	}
+
+	fields = append(fields, &field{"host_field", api.Kind_String, hostF, "LOCALHOST", "host_tag"})
+
+	ds.Subscribe(func(source api.DataSource, data api.Data) {
+		for _, f := range fields {
+			switch f.typ {
+			case api.Kind_Int8:
+				err = f.acc.SetInt8(data, f.val.(int8))
+			case api.Kind_Int16:
+				err = f.acc.SetInt16(data, f.val.(int16))
+			case api.Kind_Int32:
+				err = f.acc.SetInt32(data, f.val.(int32))
+			case api.Kind_Int64:
+				err = f.acc.SetInt64(data, f.val.(int64))
+			case api.Kind_Uint8:
+				err = f.acc.SetUint8(data, f.val.(uint8))
+			case api.Kind_Uint16:
+				err = f.acc.SetUint16(data, f.val.(uint16))
+			case api.Kind_Uint32:
+				err = f.acc.SetUint32(data, f.val.(uint32))
+			case api.Kind_Uint64:
+				err = f.acc.SetUint64(data, f.val.(uint64))
+			case api.Kind_Float32:
+				err = f.acc.SetFloat32(data, f.val.(float32))
+			case api.Kind_Float64:
+				err = f.acc.SetFloat64(data, f.val.(float64))
+			case api.Kind_String:
+				err = f.acc.SetString(data, f.val.(string))
+			case api.Kind_Bytes:
+				err = f.acc.SetBytes(data, f.val.([]byte))
+			}
+
+			if err != nil {
+				panic(fmt.Sprintf("failed to set field: %v", err))
+			}
+		}
+	}, 0)
+
+	return 0
+}
+
+func main() {}

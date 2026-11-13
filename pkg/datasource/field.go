@@ -94,6 +94,27 @@ type ParentedField interface {
 
 type FieldOption func(*field)
 
+func WithSameParentAs(otherField FieldAccessor) FieldOption {
+	return func(f *field) {
+		if otherField == nil {
+			return
+		}
+		if FieldFlagHasParent.In(otherField.(*fieldAccessor).Flags()) {
+			f.Parent = otherField.(*fieldAccessor).f.Parent
+			FieldFlagHasParent.AddTo(&f.Flags)
+		}
+	}
+}
+
+func WithSameOrderAs(otherField FieldAccessor) FieldOption {
+	return func(f *field) {
+		if otherField == nil {
+			return
+		}
+		f.Order = otherField.(*fieldAccessor).f.Order
+	}
+}
+
 func WithTags(tags ...string) FieldOption {
 	return func(f *field) {
 		f.Tags = append(f.Tags, tags...)

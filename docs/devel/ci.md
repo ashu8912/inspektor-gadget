@@ -1,6 +1,6 @@
 ---
 title: Continuous Integration
-weight: 210
+sidebar_position: 210
 description: >
   Inspektor Gadget continuous integration workflow
 ---
@@ -37,7 +37,7 @@ Note that, you need to [set repository packages as public](https://docs.github.c
 Optionally, we can add the secrets described in this section so that the
 integration tests will also run on a pre-created [Azure Red Hat OpenShift
 (ARO)](https://docs.microsoft.com/en-us/azure/openshift/intro-openshift)
-cluster. Consider that the Inspektor Gadget workflow will still success even if
+cluster. Consider that the Inspektor Gadget workflow will still succeed even if
 no ARO cluster is provided through these secrets.
 
 ### Create a cluster
@@ -53,6 +53,7 @@ $ export CLUSTER=<myCluster>
 $ export VNET=<myVNET>
 $ export MASTSUB=<myMASTSUB>
 $ export WORKSUB=<myWORKSUB>
+$ export SP_NAME=<myServicePrincipalName>
 
 # Set subscription so that we don't need to specify it at every command
 $ az account set --subscription $SUBSCRIPTION
@@ -64,16 +65,27 @@ $ az provider register -n Microsoft.Storage --wait
 $ az provider register -n Microsoft.Authorization --wait
 
 # Create resource group
-$ az group create --name $RESOURCEGROUP --location $LOCATION
+$ az group create --name $RESOURCEGROUP --location $LOCATION --tags DO-NOT-DELETE='Inspektor Gadget CI, contact hello@inspektor-gadget.io'
 
 # Create virtual network and two empty subnets for the master and the worker nodes.
 $ az network vnet create --resource-group $RESOURCEGROUP --name $VNET --address-prefixes 10.0.0.0/22
-$ az network vnet subnet create --resource-group $RESOURCEGROUP --vnet-name $VNET --name $MASTSUB --address-prefixes 10.0.0.0/23 --service-endpoints Microsoft.ContainerRegistry
-$ az network vnet subnet create --resource-group $RESOURCEGROUP --vnet-name $VNET --name $WORKSUB --address-prefixes 10.0.2.0/23 --service-endpoints Microsoft.ContainerRegistry
-$ az network vnet subnet update --name $MASTSUB --resource-group $RESOURCEGROUP --vnet-name $VNET --disable-private-link-service-network-policies true
+$ az network vnet subnet create --resource-group $RESOURCEGROUP --vnet-name $VNET \
+  --name $MASTSUB --address-prefixes 10.0.0.0/23 --service-endpoints Microsoft.ContainerRegistry
+$ az network vnet subnet create --resource-group $RESOURCEGROUP --vnet-name $VNET \
+  --name $WORKSUB --address-prefixes 10.0.2.0/23 --service-endpoints Microsoft.ContainerRegistry
+$ az network vnet subnet update --name $MASTSUB --resource-group $RESOURCEGROUP --vnet-name $VNET \
+  --disable-private-link-service-network-policies true
+
+# Create the service principal for the cluster
+$ SP_CREDENTIALS=$(az ad sp create-for-rbac -n $SP_NAME --role contributor --scopes "/subscriptions/${SUBSCRIPTION}/resourceGroups/${RESOURCEGROUP}")
+
+$ SP_APPID=$(echo $SP_CREDENTIALS | jq '.appId')
+$ SP_PASSWORD=$(echo $SP_CREDENTIALS | jq '.password')
 
 # Create the cluster (Minimum 3 worker nodes must be used)
-$ az aro create --resource-group $RESOURCEGROUP --name $CLUSTER --vnet $VNET --master-subnet $MASTSUB --worker-count 3 --worker-subnet $WORKSUB
+$ az aro create --resource-group $RESOURCEGROUP --name $CLUSTER --vnet $VNET \
+  --master-subnet $MASTSUB --worker-count 3 --worker-subnet $WORKSUB \
+  --client-id $SP_APPID --client-secret $SP_PASSWORD
 ```
 
 Considerations:
@@ -104,7 +116,7 @@ documentation](https://docs.microsoft.com/en-us/azure/openshift/tutorial-create-
 
 ### Connect to a cluster
 
-Fist of all, to be able to connect to our cluster, we need the following
+First of all, to be able to connect to our cluster, we need the following
 information:
 
 ```bash
@@ -123,7 +135,7 @@ $ az aro list-credentials --subscription $SUBSCRIPTION -g $RESOURCEGROUP -n $CLU
 #### From GitHub actions
 
 The `test-integration` job is already configured to authenticate and set the
-kubeconf context to the ARO cluster configured in the GitHub repository. So all
+kubeconfig context to the ARO cluster configured in the GitHub repository. So all
 we need to do is to add the following actions secrets:
 
 - `OPENSHIFT_SERVER`: The API server URL: `https://api.server.example.io:1234`.
@@ -163,7 +175,28 @@ will also run on
 
 As Inspektor Gadget support both `amd64` and `arm64`, two clusters will be
 created when the CI is triggered.
-To be able to create them in the CI, you need to follow [these instructions](https://learn.microsoft.com/en-us/azure/developer/github/connect-from-azure?tabs=azure-cli%2Clinux):
+There are some requirements before creating the needed components in Azure:
+1. You should have created an [environment](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments) in GitHub for your repository.
+2. Your account should have the "[Application Developer](https://learn.microsoft.com/en-us/entra/identity/role-based-access-control/permissions-reference#application-developer)" as Microsoft Entra role, you can check this with the following:
+
+```bash
+# First, get your user object ID.
+$ your_oid=$(az ad signed-in-user show --query id -o tsv)
+# Then, get the "Application Developer" role ID.
+$ app_dev_role_id=$(az rest --method GET --url "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions?\$filter=displayName%20eq%20'Application%20Developer'&\$select=id,displayName" --query 'value[0].id' -o tsv)
+# If the response is different than this, you need to contact your administrator
+# to ask for this role.
+$ az rest --method GET --url "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?\$filter=principalId%20eq%20'${your_oid}'%20and%20roleDefinitionId%20eq%20'${app_dev_role_id}'&\$select=id,principalId,roleDefinitionId" --query 'value' -o json
+[
+  {
+    "id": "...",
+    "principalId": "...", # Should contain $your_oid.
+    "roleDefinitionId": "..." # Should contain $app_dev_role_id.
+  }
+]
+```
+
+You can now follow [these instructions](https://learn.microsoft.com/en-us/azure/developer/github/connect-from-azure?tabs=azure-cli%2Clinux) to enable your CI to create these clusters:
 
 ```bash
 $ subscription_id=<mySubscriptionID>
@@ -175,6 +208,7 @@ $ federated_name=<myFederatedCredentialName>
 $ organization=<myGitHubOrganization>
 $ repository=<myGitHubRepository>
 $ environment=<myCIJobEnvironment>
+$ service_management_reference=<myServiceManagementReference>
 
 # Set subscription so that we don't need to specify it at every command.
 $ az account set --subscription $subscription_id
@@ -185,13 +219,13 @@ $ az account set --subscription $subscription_id
 $ az group create --name $resourcegroup --location $location
 
 # Register an application for your CI.
-$ az ad app create --display-name $app_name
+$ az ad app create --display-name $app_name --service-management-reference $service_management_reference
 {
 # It should reply with a big JSON object.
 }
 
 # Let's get the ID of the created application
-$ app_id=$(az ad app list --display-name $app_name --query [0].id | tr -d '"')
+$ app_id=$(az ad app list --filter "displayName eq '$app_name'" --query '[0].id' -o tsv)
 
 # Let's create a service principal for the corresponding application.
 $ az ad sp create --id $app_id
@@ -200,7 +234,7 @@ $ az ad sp create --id $app_id
 }
 
 # We now want to get the service principal ID.
-$ sp_id=$(az ad sp list --display-name $app_name --query [0].id | tr -d '"')
+$ sp_id=$(az ad sp list --filter "displayName eq '$app_name'" --query '[0].id' -o tsv)
 
 # Let's create a new role for this service principal.
 $ az role assignment create --role contributor --assignee-object-id $sp_id --assignee-principal-type ServicePrincipal --scope /subscriptions/$subscription_id/resourceGroups/$resourcegroup
@@ -208,11 +242,16 @@ $ az role assignment create --role contributor --assignee-object-id $sp_id --ass
 # It should reply with a big JSON object.
 }
 
+# Let's gather some IDs in order to create the immutable subject:
+# https://docs.github.com/en/enterprise-cloud@latest/actions/reference/security/oidc#immutable-subject-claims
+$ organization_id=$(curl -s https://api.github.com/users/${organization} | jq .id)
+$ repository_id=$(curl -s https://api.github.com/repos/${organization}/${repository} | jq .id)
+$ subject="repo:${organization}@${organization_id}/${repository}@${repository_id}:environment:${environment}"
 # Create the federated credential to be able to "az login" from the CI.
 $ az ad app federated-credential create --id $app_id --parameters <(echo "{
   \"name\": \"${federated_name}\",
   \"issuer\": \"https://token.actions.githubusercontent.com\",
-  \"subject\": \"repo:${organization}/${repository}:environment:${environment}\",
+  \"subject\": \"${subject}\",
   \"description\": \"AKS federated credentials for CI\",
   \"audiences\": [
     \"api://AzureADTokenExchange\"
@@ -248,7 +287,7 @@ to configure your AWS account.
 
 You need to create a role with the [minimum IAM
 policies](https://eksctl.io/usage/minimum-iam-policies/) needed by eksctl. Save the name of this
-role (including the rull `arn:aws..` prefix). in a [repository
+role (including the full `arn:aws..` prefix). in a [repository
 variable](https://docs.github.com/en/actions/learn-github-actions/variables#creating-configuration-variables-for-a-repository)
 named `AWS_ROLE`.
 
@@ -273,10 +312,10 @@ You can see the guide [here](https://cloud.google.com/kubernetes-engine/docs/how
 
 ## Benchmarks
 
-Inspektor Gadget has
-[benchmark tests](https://github.com/inspektor-gadget/inspektor-gadget/blob/main/internal/benchmarks/benchmarks_test.go)
-that are automatically executed and published by
-[github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark). You can see the results on:
+Inspektor Gadget has benchmark tests that are automatically executed and
+published by
+[github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark).
+You can see the results on:
 
 https://inspektor-gadget.github.io/ig-benchmarks/dev/bench/index.html
 

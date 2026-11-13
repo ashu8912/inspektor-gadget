@@ -1,9 +1,11 @@
-# Test commands in this Makefile only covers ig. 
+# Test commands in this Makefile only covers ig.
 # Kubectl-gadget test commands are covered in ../../Makefile.
 
 include $(shell pwd)/../../minikube.mk
 
-DNSTESTER_IMAGE ?= "ghcr.io/inspektor-gadget/dnstester:latest"
+GADGET_REPOSITORY ?= "ghcr.io/inspektor-gadget/gadget"
+GADGET_TAG ?= "main"
+DNSTESTER_IMAGE ?= "ghcr.io/inspektor-gadget/dnstester:main"
 GOPROXY ?= $(shell go env GOPROXY)
 
 # make does not allow implicit rules (with '%') to be phony so let's use
@@ -54,4 +56,4 @@ test-%: build build-tests
 	$(MINIKUBE) -p $${MINIKUBE_PROFILE} ssh "sudo ln -sf /var/lib/minikube/binaries/$(KUBERNETES_VERSION)/kubectl /bin/kubectl" && \
 	$(MINIKUBE) -p $${MINIKUBE_PROFILE} ssh "sudo ln -sf /etc/kubernetes/admin.conf /root/.kube/config" && \
 	echo "Running test in minikube with profile $${MINIKUBE_PROFILE} ..." && \
-	$(MINIKUBE) -p $${MINIKUBE_PROFILE} ssh "sudo ig-integration.test -test.v -test.timeout 30m -integration -dnstester-image $(DNSTESTER_IMAGE) -test-component=ig $${INTEGRATION_TESTS_PARAMS}"
+	$(MINIKUBE) -p $${MINIKUBE_PROFILE} ssh "sudo ig-integration.test -test.v -test.timeout 30m -integration -dnstester-image $(DNSTESTER_IMAGE) -gadget-repository $(GADGET_REPOSITORY) -gadget-tag $(GADGET_TAG) -test-component=ig $${INTEGRATION_TESTS_PARAMS}"

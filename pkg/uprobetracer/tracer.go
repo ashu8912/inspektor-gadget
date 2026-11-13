@@ -32,6 +32,7 @@
 package uprobetracer
 
 import (
+	"debug/elf"
 	"errors"
 	"fmt"
 	"os"
@@ -42,13 +43,16 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
-	securejoin "github.com/cyphar/filepath-securejoin"
 
 	containercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/container-collection"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/kfilefields"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/safeelf"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/secureopen"
 )
+
+var errSymbolNotFound = errors.New("symbol not found")
 
 type ProgType uint32
 
@@ -123,7 +127,7 @@ func NewTracer[Event any](logger logger.Logger) (*Tracer[Event], error) {
 // AttachProg loads the ebpf program, and try attaching if there are pending containers
 func (t *Tracer[Event]) AttachProg(progName string, progType ProgType, attachTo string, prog *ebpf.Program) error {
 	if progType != ProgUprobe && progType != ProgUretprobe && progType != ProgUSDT {
-		return fmt.Errorf("unsupported uprobe prog type: %q", progType)
+		return fmt.Errorf("unsupported uprobe prog type: %d", progType)
 	}
 
 	if prog == nil {
@@ -167,32 +171,17 @@ func (t *Tracer[Event]) AttachProg(progName string, progType ProgType, attachTo 
 }
 
 func (t *Tracer[Event]) searchForLibrary(containerPid uint32) ([]string, error) {
-	var targetPaths []string
-	var securedTargetPaths []string
-
 	filePath := t.attachFilePath
-	if !filepath.IsAbs(filePath) {
-		containerLdCachePath, err := securejoin.SecureJoin(filepath.Join(host.HostProcFs, fmt.Sprint(containerPid), "root"), "etc/ld.so.cache")
-		if err != nil {
-			return nil, fmt.Errorf("path %q: %w", filePath, err)
-		}
-		ldCachePaths, err := parseLdCache(containerLdCachePath, filePath)
-		if err != nil {
-			return nil, fmt.Errorf("parsing ld cache: %w", err)
-		}
-		targetPaths = ldCachePaths
-	} else {
-		targetPaths = append(targetPaths, filePath)
+	if filepath.IsAbs(filePath) {
+		return []string{filePath}, nil
 	}
-	for _, targetPath := range targetPaths {
-		securedTargetPath, err := securejoin.SecureJoin(filepath.Join(host.HostProcFs, fmt.Sprint(containerPid), "root"), targetPath)
-		if err != nil {
-			t.logger.Debugf("path %q in ld cache is not available: %s", filePath, err.Error())
-			continue
-		}
-		securedTargetPaths = append(securedTargetPaths, securedTargetPath)
+
+	ldCachePath := "/etc/ld.so.cache"
+	ldCachePaths, err := parseLdCache(containerPid, ldCachePath, filePath)
+	if err != nil {
+		return nil, fmt.Errorf("parsing ld cache: %w", err)
 	}
-	return securedTargetPaths, nil
+	return ldCachePaths, nil
 }
 
 // attach uprobe program to the inode of the file passed in parameter
@@ -204,9 +193,36 @@ func (t *Tracer[Event]) attachUprobe(file *os.File) (link.Link, error) {
 	}
 	switch t.progType {
 	case ProgUprobe:
-		return ex.Uprobe(t.attachSymbol, t.prog, nil)
+		// Resolve symbol in IG's hardened code, then pass the file offset
+		// to cilium/ebpf. This bypasses cilium/ebpf's Symbols()/
+		// DynamicSymbols() path which doesn't limit memory consumption.
+		offset, err := resolveSymbolOffset(file, t.attachSymbol)
+		if err == nil {
+			return ex.Uprobe("", t.prog, &link.UprobeOptions{Address: offset})
+		}
+		if !errors.Is(err, errSymbolNotFound) {
+			return nil, fmt.Errorf("resolving symbol %q: %w", t.attachSymbol, err)
+		}
+		// If the symbol was not found in the ELF symbol table, try
+		// resolving it from Go's .gopclntab section. This allows
+		// attaching uprobes to stripped Go binaries.
+		t.logger.Debugf("uprobe attach by symbol failed (%s), trying .gopclntab fallback", err)
+		offset, goErr := resolveGoSymbol(file, t.attachSymbol)
+		if goErr != nil {
+			return nil, fmt.Errorf("attaching uprobe (ELF: %w; gopclntab: %w)", err, goErr)
+		}
+		t.logger.Debugf("resolved %q from .gopclntab at offset 0x%x", t.attachSymbol, offset)
+		return ex.Uprobe("", t.prog, &link.UprobeOptions{Address: offset})
 	case ProgUretprobe:
-		return ex.Uretprobe(t.attachSymbol, t.prog, nil)
+		// Go uretprobes need Go-aware return handling because goroutine stacks can move.
+		// See https://github.com/inspektor-gadget/inspektor-gadget/pull/3552
+		// Resolve the ELF symbol ourselves to avoid cilium/ebpf's unbounded
+		// symbol table parsing.
+		offset, err := resolveSymbolOffset(file, t.attachSymbol)
+		if err != nil {
+			return nil, fmt.Errorf("resolving symbol %q: %w", t.attachSymbol, err)
+		}
+		return ex.Uretprobe("", t.prog, &link.UprobeOptions{Address: offset})
 	case ProgUSDT:
 		attachInfo, err := getUsdtInfo(attachPath, t.attachSymbol)
 		if err != nil {
@@ -218,27 +234,61 @@ func (t *Tracer[Event]) attachUprobe(file *os.File) (link.Link, error) {
 				RefCtrOffset: attachInfo.semaphoreAddress,
 			})
 	default:
-		return nil, fmt.Errorf("attaching to inode: unsupported prog type: %q", t.progType)
+		return nil, fmt.Errorf("attaching to inode: unsupported prog type: %d", t.progType)
 	}
+}
+
+// resolveSymbolOffset resolves a symbol name to a file offset using bounded
+// iteration. This avoids loading the full string table into memory.
+func resolveSymbolOffset(file *os.File, symbol string) (uint64, error) {
+	ef, err := safeelf.NewFile(file)
+	if err != nil {
+		return 0, fmt.Errorf("parsing ELF: %w", err)
+	}
+	defer ef.Close()
+
+	for _, typ := range []elf.SectionType{elf.SHT_SYMTAB, elf.SHT_DYNSYM} {
+		var found bool
+		var addr uint64
+		iterErr := ef.IterateSymbols(typ, func(sym elf.Symbol) bool {
+			if elf.ST_TYPE(sym.Info) != elf.STT_FUNC {
+				return false
+			}
+			if sym.Name == symbol {
+				addr = sym.Value
+				found = true
+			}
+			return found
+		})
+		if found {
+			return vaddr2ElfOffset(ef.File, addr)
+		}
+		if iterErr != nil {
+			return 0, iterErr
+		}
+	}
+	return 0, fmt.Errorf("symbol %q: %w", symbol, errSymbolNotFound)
 }
 
 // try attaching to a container, will update `containerPid2Inodes`
 func (t *Tracer[Event]) attach(containerPid uint32) {
 	var attachedRealInodes []uint64
-	attachFilePaths, err := t.searchForLibrary(containerPid)
+	unsecuredAttachFilePaths, err := t.searchForLibrary(containerPid)
 	if err != nil {
 		t.logger.Debugf("attaching to container %d: %s", containerPid, err.Error())
 	}
 
-	if len(attachFilePaths) == 0 {
+	if len(unsecuredAttachFilePaths) == 0 {
 		t.logger.Debugf("cannot find file to attach in container %d for symbol %q", containerPid, t.attachSymbol)
 	}
 
-	for _, filePath := range attachFilePaths {
-		// Do not use `O_PATH` flag here, because `ReadRealInodeFromFd` needs the `private_data` field
-		// in kernel "struct file", to access the underlying inode through overlayFS.
-		// Using `O_PATH` flag will cause the `private_data` field to be zero.
-		file, err := os.Open(filePath)
+	for _, filePath := range unsecuredAttachFilePaths {
+		// Thankfully, OpenInContainer returns a fd opened without `O_PATH`.
+		// This is necessary because `ReadRealInodeFromFd` needs the
+		// `private_data` field in kernel "struct file", to access the
+		// underlying inode through overlayFS. Using `O_PATH` flag will cause
+		// the `private_data` field to be zero.
+		file, err := secureopen.OpenInContainer(containerPid, filePath)
 		if err != nil {
 			t.logger.Debugf("opening file '%q' for uprobe: %s", filePath, err.Error())
 			continue
@@ -278,18 +328,19 @@ func (t *Tracer[Event]) AttachContainer(container *containercollection.Container
 		return errors.New("uprobetracer has been closed")
 	}
 
+	pid := container.ContainerPid()
 	if t.prog == nil {
-		_, exist := t.pendingContainerPids[container.Pid]
+		_, exist := t.pendingContainerPids[pid]
 		if exist {
-			return fmt.Errorf("container PID already exists: %d", container.Pid)
+			return fmt.Errorf("container PID already exists: %d", pid)
 		}
-		t.pendingContainerPids[container.Pid] = true
+		t.pendingContainerPids[pid] = true
 	} else {
-		_, exist := t.containerPid2Inodes[container.Pid]
+		_, exist := t.containerPid2Inodes[pid]
 		if exist {
-			return fmt.Errorf("container PID already exists: %d", container.Pid)
+			return fmt.Errorf("container PID already exists: %d", pid)
 		}
-		t.attach(container.Pid)
+		t.attach(pid)
 	}
 	return nil
 }
@@ -302,20 +353,21 @@ func (t *Tracer[Event]) DetachContainer(container *containercollection.Container
 		return nil
 	}
 
+	pid := container.ContainerPid()
 	if t.prog == nil {
 		// remove from pending list
-		_, exist := t.pendingContainerPids[container.Pid]
+		_, exist := t.pendingContainerPids[pid]
 		if !exist {
 			return errors.New("container has not been attached")
 		}
-		delete(t.pendingContainerPids, container.Pid)
+		delete(t.pendingContainerPids, pid)
 	} else {
 		// detach from container if attached
-		attachedRealInodes, exist := t.containerPid2Inodes[container.Pid]
+		attachedRealInodes, exist := t.containerPid2Inodes[pid]
 		if !exist {
 			return errors.New("container has not been attached")
 		}
-		delete(t.containerPid2Inodes, container.Pid)
+		delete(t.containerPid2Inodes, pid)
 
 		for _, realInodePtr := range attachedRealInodes {
 			keeper, exist := t.inodeRefCount[realInodePtr]

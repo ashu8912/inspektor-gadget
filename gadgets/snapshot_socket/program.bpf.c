@@ -9,7 +9,9 @@
 
 /* This BPF program uses the GPL-restricted function bpf_seq_write(). */
 
+#define UNKNOWN __IGNORE_UNKNOWN
 #include <vmlinux.h>
+#undef UNKNOWN
 
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
@@ -47,15 +49,34 @@
 #define tw_v6_rcv_saddr __tw_common.skc_v6_rcv_saddr
 #define tw_family __tw_common.skc_family
 
+enum socket_state {
+	UNKNOWN = 0,
+	ESTABLISHED = 1,
+	SYN_SENT = 2,
+	SYN_RECV = 3,
+	FIN_WAIT1 = 4,
+	FIN_WAIT2 = 5,
+	TIME_WAIT = 6,
+	CLOSE = 7,
+	CLOSE_WAIT = 8,
+	LAST_ACK = 9,
+	LISTEN = 10,
+	CLOSING = 11,
+	NEW_SYN_RECV = 12,
+	ACTIVE = 13,
+	INACTIVE = 14,
+};
+
 struct socket_entry {
 	struct gadget_l4endpoint_t src;
 	struct gadget_l4endpoint_t dst;
-	__u32 state;
+	__u8 state_raw;
+	enum socket_state normalized_state_raw;
 	__u32 ino;
-	gadget_netns_id netns;
+	gadget_netns_id netns_id;
 };
 
-GADGET_SNAPSHOTTER(sockets, socket_entry, ig_snap_tcp, ig_snap_udp);
+GADGET_ITER(sockets, socket_entry, ig_snap_tcp, ig_snap_udp);
 
 /**
  * sock_i_ino - Returns the inode identifier associated to a socket.
@@ -94,27 +115,44 @@ socket_bpf_seq_write(struct seq_file *seq, __u16 family, __u16 proto,
 
 	switch (family) {
 	case AF_INET:
-		entry.src.l3.version = entry.dst.l3.version = 4;
-		entry.src.l3.addr.v4 = src_v4;
-		entry.dst.l3.addr.v4 = dest_v4;
+		entry.src.version = entry.dst.version = 4;
+		entry.src.addr_raw.v4 = src_v4;
+		entry.dst.addr_raw.v4 = dest_v4;
 		break;
 	case AF_INET6:
-		entry.src.l3.version = entry.dst.l3.version = 6;
-		bpf_probe_read_kernel(&entry.dst.l3.addr.v6,
-				      sizeof(entry.dst.l3.addr.v6), dest_v6);
-		bpf_probe_read_kernel(&entry.src.l3.addr.v6,
-				      sizeof(entry.src.l3.addr.v6), src_v6);
+		entry.src.version = entry.dst.version = 6;
+		bpf_probe_read_kernel(&entry.dst.addr_raw.v6,
+				      sizeof(entry.dst.addr_raw.v6), dest_v6);
+		bpf_probe_read_kernel(&entry.src.addr_raw.v6,
+				      sizeof(entry.src.addr_raw.v6), src_v6);
 		break;
 	default:
 		return;
 	}
 
-	entry.src.proto = entry.dst.proto = proto;
+	entry.src.proto_raw = entry.dst.proto_raw = proto;
 	entry.src.port = bpf_htons(srcp);
 	entry.dst.port = bpf_htons(destp);
-	entry.state = state;
+	entry.state_raw = state;
+
+	if (proto == IPPROTO_UDP) {
+		switch (state) {
+		case 1:
+			entry.normalized_state_raw = ACTIVE;
+			break;
+		case 7:
+			entry.normalized_state_raw = INACTIVE;
+			break;
+		default:
+			entry.normalized_state_raw = UNKNOWN;
+			break;
+		}
+	} else {
+		entry.normalized_state_raw = (enum socket_state)state;
+	}
+
 	entry.ino = ino;
-	entry.netns = netns;
+	entry.netns_id = netns;
 
 	bpf_seq_write(seq, &entry, sizeof(entry));
 }

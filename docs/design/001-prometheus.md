@@ -1,5 +1,13 @@
 # Prometheus support in Inspektor Gadget
 
+:::warning
+
+This document is outdated. An initial implementation of this proposal was done,
+but it was removed later on for an implementation focused on image-based gadgets
+and OpenTelemetry. Check the new implementation on pkg/operators/otel-metrics/.
+
+:::
+
 Inspektor Gadget has a lot of tools that hook into the kernel to capture different events like file
 opened, process created, DNS requests, etc. Currently it's mostly designed as a troubleshooting
 tool: it prints those events as they happen to the terminal. However, it's an easy win to provide
@@ -127,8 +135,8 @@ metrics:
     gadget: exec
     labels:
       - k8s.namespace
-      - k8s.pod
-      - k8s.container
+      - k8s.podName
+      - k8s.containerName
 ```
 
 The category and gadget fields define which gadget to use. The labels indicate how metrics are
@@ -159,8 +167,8 @@ will only consider events in the default namespace.
   category: trace
   gadget: exec
   labels:
-    - k8s.pod
-    - k8s.container
+    - k8s.podName
+    - k8s.containerName
   selector:
     - "k8s.namespace:default"
 ```
@@ -175,8 +183,8 @@ Or only count events for a given command:
   gadget: exec
   labels:
     - k8s.namespace
-    - k8s.pod
-    - k8s.container
+    - k8s.podName
+    - k8s.containerName
   selector:
     - "comm:cat"
 ```
@@ -191,8 +199,8 @@ And finally, we can provide counters for failed operations:
   gadget: exec
   labels:
     - k8s.namespace
-    - k8s.pod
-    - k8s.container
+    - k8s.podName
+    - k8s.containerName
   selector:
     - "retval:!0"
 ```
@@ -225,8 +233,8 @@ Another example is:
   gadget: seccomp
   labels:
     - k8s.namespace
-    - k8s.pod
-    - k8s.container
+    - k8s.podName
+    - k8s.containerName
     - syscall
   selector:
     - "syscall:bpf"
@@ -243,8 +251,8 @@ increase a counter using a field on the event:
   gadget: fsslower
   labels:
     - k8s.namespace
-    - k8s.pod
-    - k8s.container
+    - k8s.podName
+    - k8s.containerName
   field: bytes
   selector:
     - "filesystem:ext4"
@@ -268,8 +276,8 @@ snapshotters.
   gadget: process
   labels:
     - k8s.namespace
-    - k8s.pod
-    - k8s.container
+    - k8s.podName
+    - k8s.containerName
 
 # Number of sockets in CLOSE_WAIT state
 - name: number_of_sockets_close_wait
@@ -278,8 +286,8 @@ snapshotters.
   gadget: socket
   labels:
     - k8s.namespace
-    - k8s.pod
-    - k8s.container
+    - k8s.podName
+    - k8s.containerName
   selector:
     - "status:CLOSE_WAIT"
 ```
@@ -309,7 +317,7 @@ We'll support the same bucket configuration as described in
     type: exp2
   labels:
     - k8s.namespace
-    - k8s.pod
+    - k8s.podName
   selector:
     - "qr:R"
 ```

@@ -1,4 +1,4 @@
-// Copyright 2022 The Inspektor Gadget authors
+// Copyright 2022-2024 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,26 +17,35 @@ package testutils
 import (
 	"context"
 
-	"github.com/docker/go-connections/nat"
+	"github.com/moby/moby/api/types/network"
 )
 
 const (
-	DefaultContainerImage    = "docker.io/library/busybox"
+	DefaultContainerImage    = "ghcr.io/inspektor-gadget/ci/busybox"
 	DefaultContainerImageTag = "latest"
 )
 
 type Option func(*containerOptions)
 
 type containerOptions struct {
-	ctx            context.Context
-	image          string
-	imageTag       string
-	seccompProfile string
-	namespace      string
-	wait           bool
-	logs           bool
-	removal        bool
-	portBindings   nat.PortMap
+	ctx                  context.Context
+	expectStartError     bool
+	image                string
+	imageTag             string
+	pullImage            bool
+	mounts               []string
+	seccompProfile       string
+	namespace            string
+	useExistingNamespace bool
+	wait                 bool
+	waitOrOomKilled      bool
+	logs                 bool
+	removal              bool
+	portBindings         network.PortMap
+	privileged           bool
+	limits               map[string]string
+	expectedExitCode     *int
+	sysctls              map[string]string
 
 	// forceDelete is mostly used for debugging purposes, when a container
 	// fails to be deleted and we want to force it.
@@ -45,12 +54,14 @@ type containerOptions struct {
 
 func defaultContainerOptions() *containerOptions {
 	return &containerOptions{
-		ctx:      context.TODO(),
-		image:    DefaultContainerImage,
-		imageTag: DefaultContainerImageTag,
-		logs:     true,
-		wait:     true,
-		removal:  true,
+		ctx:                  context.TODO(),
+		image:                DefaultContainerImage,
+		imageTag:             DefaultContainerImageTag,
+		pullImage:            true,
+		logs:                 true,
+		wait:                 true,
+		removal:              true,
+		useExistingNamespace: false,
 	}
 }
 
@@ -60,9 +71,33 @@ func WithContext(ctx context.Context) Option {
 	}
 }
 
+func WithExpectStartError() Option {
+	return func(opts *containerOptions) {
+		opts.expectStartError = true
+	}
+}
+
+func WithExpectedExitCode(code int) Option {
+	return func(opts *containerOptions) {
+		opts.expectedExitCode = &code
+	}
+}
+
 func WithImage(image string) Option {
 	return func(opts *containerOptions) {
 		opts.image = image
+	}
+}
+
+func WithoutImagePull() Option {
+	return func(opts *containerOptions) {
+		opts.pullImage = false
+	}
+}
+
+func WithBindMounts(mounts []string) Option {
+	return func(opts *containerOptions) {
+		opts.mounts = mounts
 	}
 }
 
@@ -85,15 +120,33 @@ func WithNamespace(namespace string) Option {
 	}
 }
 
+func WithUseExistingNamespace() Option {
+	return func(opts *containerOptions) {
+		opts.useExistingNamespace = true
+	}
+}
+
 func WithoutWait() Option {
 	return func(opts *containerOptions) {
 		opts.wait = false
 	}
 }
 
+func WithWaitOrOomKilled() Option {
+	return func(opts *containerOptions) {
+		opts.waitOrOomKilled = true
+	}
+}
+
 func WithoutLogs() Option {
 	return func(opts *containerOptions) {
 		opts.logs = false
+	}
+}
+
+func WithPrivileged() Option {
+	return func(opts *containerOptions) {
+		opts.privileged = true
 	}
 }
 
@@ -107,7 +160,7 @@ func withoutRemoval() Option {
 }
 
 // WithPortBindings sets the exposed ports of the container
-func WithPortBindings(portBindings nat.PortMap) Option {
+func WithPortBindings(portBindings network.PortMap) Option {
 	return func(opts *containerOptions) {
 		opts.portBindings = portBindings
 	}
@@ -118,5 +171,19 @@ func WithPortBindings(portBindings nat.PortMap) Option {
 func WithForceDelete() Option {
 	return func(opts *containerOptions) {
 		opts.forceDelete = true
+	}
+}
+
+// WithLimits sets the resource limits of the container
+func WithLimits(limits map[string]string) Option {
+	return func(opts *containerOptions) {
+		opts.limits = limits
+	}
+}
+
+// WithSysctls sets the sysctls of the container
+func WithSysctls(sysctls map[string]string) Option {
+	return func(opts *containerOptions) {
+		opts.sysctls = sysctls
 	}
 }

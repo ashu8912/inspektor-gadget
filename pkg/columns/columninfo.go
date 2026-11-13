@@ -49,6 +49,8 @@ type Attributes struct {
 	Name string `yaml:"name"`
 	// Name of the columns without inherited prefixes
 	RawName string `yaml:"raw_name"`
+	// Alias is an alternative shorter name to be used for header of the column; if not set, the Name will be used
+	Alias string `yaml:"alias"`
 	// Width to reserve for this column
 	Width int `yaml:"width"`
 	// MinWidth will be the minimum width this column will be scaled to when using auto-scaling
@@ -67,6 +69,8 @@ type Attributes struct {
 	FixedWidth bool `yaml:"fixed_width"`
 	// Precision defines how many decimals should be shown on float values, default: 2
 	Precision int `yaml:"precision"`
+	// Hex defines whether the value should be shown as a hexadecimal number
+	Hex bool `yaml:"hex"`
 	// Description can hold a short description of the field that can be used to aid the user
 	Description string `yaml:"description"`
 	// Order defines the default order in which columns are shown
@@ -189,6 +193,11 @@ func (ci *Column[T]) parseTagInfo(tagInfo []string) error {
 			default:
 				return fmt.Errorf("invalid ellipsis value %q for field %q", params[1], ci.Name)
 			}
+		case "hex":
+			if paramsLen != 1 {
+				return fmt.Errorf("parameter hex on field %q must not have a value", ci.Name)
+			}
+			ci.Hex = true
 		case "fixed":
 			if paramsLen != 1 {
 				return fmt.Errorf("parameter fixed on field %q must not have a value", ci.Name)
@@ -375,18 +384,12 @@ func (ci *Column[T]) HasTag(tag string) bool {
 }
 
 func (ci *Column[T]) HasNoTags() bool {
-	if len(ci.Tags) == 0 {
-		return true
-	}
-	return false
+	return len(ci.Tags) == 0
 }
 
 // IsEmbedded returns true, if the current column is a member of an embedded struct
 func (ci *Column[T]) IsEmbedded() bool {
-	if len(ci.subFieldIndex) == 0 {
-		return false
-	}
-	return true
+	return len(ci.subFieldIndex) != 0
 }
 
 // IsVirtual returns true, if the column has direct reference to a field

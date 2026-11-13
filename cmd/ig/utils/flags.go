@@ -19,11 +19,13 @@ import (
 	"strings"
 
 	"github.com/containerd/containerd/pkg/cri/constants"
+	securejoin "github.com/cyphar/filepath-securejoin"
 
 	commonutils "github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
 	containerutils "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils"
 	containerutilsTypes "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/types"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -40,7 +42,19 @@ type CommonFlags struct {
 	// Containername allows to filter containers by name.
 	Containername string
 
-	// The name of the container runtimes to be used separated by comma.
+	// ContainerImageDigest allows to filter containers by image digest.
+	ContainerImageDigest string
+
+	// ContainerImageID allows to filter containers by image ID.
+	ContainerImageID string
+
+	// Kubernetes-related filters
+	K8sPodName       string
+	K8sNamespace     string
+	K8sSelector      []string
+	K8sContainerName string
+
+	// Comma-separated list of container runtimes.
 	Runtimes string
 
 	// Host, when set to true, specifies to include all events both from
@@ -82,20 +96,25 @@ func AddCommonFlags(command *cobra.Command, commonFlags *CommonFlags) {
 			runtimeName := types.String2RuntimeName(strings.TrimSpace(p))
 			socketPath := ""
 			namespace := ""
+			var err error
 
 			switch runtimeName {
 			case types.RuntimeNameDocker:
-				socketPath = commonFlags.RuntimesSocketPathConfig.Docker
+				socketPath, err = securejoin.SecureJoin(host.HostRoot, commonFlags.Docker)
 			case types.RuntimeNameContainerd:
-				socketPath = commonFlags.RuntimesSocketPathConfig.Containerd
+				socketPath, err = securejoin.SecureJoin(host.HostRoot, commonFlags.Containerd)
 				namespace = commonFlags.ContainerdNamespace
 			case types.RuntimeNameCrio:
-				socketPath = commonFlags.RuntimesSocketPathConfig.Crio
+				socketPath, err = securejoin.SecureJoin(host.HostRoot, commonFlags.Crio)
 			case types.RuntimeNamePodman:
-				socketPath = commonFlags.RuntimesSocketPathConfig.Podman
+				socketPath, err = securejoin.SecureJoin(host.HostRoot, commonFlags.Podman)
 			default:
 				return commonutils.WrapInErrInvalidArg("--runtime / -r",
 					fmt.Errorf("runtime %q is not supported", p))
+			}
+
+			if err != nil {
+				return fmt.Errorf("securejoining %v to %v socket path: %w", host.HostRoot, runtimeName, err)
 			}
 
 			for _, r := range commonFlags.RuntimeConfigs {
@@ -137,8 +156,40 @@ func AddCommonFlags(command *cobra.Command, commonFlags *CommonFlags) {
 		"containername",
 		"c",
 		"",
-		"Show only data from containers with that name",
+		"Show data only from containers with the runtime-assigned name (not the name defined in the pod spec) (alias: runtime-containername)",
 	)
+	command.PersistentFlags().StringVarP(
+		&commonFlags.Containername,
+		"runtime-containername", "", "", "",
+	)
+	command.PersistentFlags().MarkHidden("runtime-containername")
+
+	command.PersistentFlags().StringVarP(
+		&commonFlags.ContainerImageDigest,
+		"containerimage-digest",
+		"",
+		"",
+		"Show data only from containers with the runtime-assigned image digest (alias: runtime-containerimage-digest)",
+	)
+	command.PersistentFlags().StringVarP(
+		&commonFlags.ContainerImageDigest,
+		"runtime-containerimage-digest", "", "", "",
+	)
+	command.PersistentFlags().MarkHidden("runtime-containerimage-digest")
+
+	command.PersistentFlags().StringVarP(
+		&commonFlags.ContainerImageID,
+		"containerimage-id",
+		"",
+		"",
+		"Show data only from containers with the runtime-assigned image ID (alias: runtime-containerimage-id)",
+	)
+	command.PersistentFlags().StringVarP(
+		&commonFlags.ContainerImageID,
+		"runtime-containerimage-id", "", "", "",
+	)
+	command.PersistentFlags().MarkHidden("runtime-containerimage-id")
+
 	command.PersistentFlags().BoolVarP(
 		&commonFlags.Host,
 		"host",
@@ -151,7 +202,7 @@ func AddCommonFlags(command *cobra.Command, commonFlags *CommonFlags) {
 		&commonFlags.Runtimes,
 		"runtimes", "r",
 		strings.Join(containerutils.AvailableRuntimes, ","),
-		fmt.Sprintf("Container runtimes to be used separated by comma. Supported values are: %s",
+		fmt.Sprintf("Comma-separated list of container runtimes. Supported values are: %s",
 			strings.Join(containerutils.AvailableRuntimes, ", ")),
 	)
 
@@ -175,6 +226,28 @@ func AddCommonFlags(command *cobra.Command, commonFlags *CommonFlags) {
 		containerutilsTypes.RuntimeProtocolInternal,
 		fmt.Sprintf("Container runtime protocol (docker and containerd). Supported values are: %s",
 			strings.Join(containerutils.AvailableRuntimeProtocols, ", ")),
+	)
+
+	// Kubernetes-related flags
+	command.PersistentFlags().StringVar(
+		&commonFlags.K8sPodName,
+		"k8s-podname",
+		"",
+		"Show only data from Kubernetes pods with that name",
+	)
+
+	command.PersistentFlags().StringVar(
+		&commonFlags.K8sNamespace,
+		"k8s-namespace",
+		"",
+		"Show only data from pods in a given Kubernetes namespace",
+	)
+
+	command.PersistentFlags().StringVar(
+		&commonFlags.K8sContainerName,
+		"k8s-containername",
+		"",
+		"Show data only from containers with the name defined in the pod spec",
 	)
 }
 

@@ -9,27 +9,18 @@
 /* This BPF program uses the GPL-restricted function bpf_seq_write(). */
 
 #include <vmlinux.h>
+#include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 
 #include <gadget/macros.h>
-#include <gadget/mntns_filter.h>
+#include <gadget/filter.h>
 #include <gadget/types.h>
 
 const volatile bool show_threads = false;
 
 GADGET_PARAM(show_threads);
 
-struct process_entry {
-	gadget_mntns_id mntns_id;
-	__u32 pid;
-	__u32 tid;
-	__u32 ppid;
-	__u32 uid;
-	__u32 gid;
-	char comm[TASK_COMM_LEN];
-};
-
-GADGET_SNAPSHOTTER(processes, process_entry, ig_snap_proc);
+GADGET_ITER(processes, gadget_process, ig_snap_proc);
 
 SEC("iter/task")
 int ig_snap_proc(struct bpf_iter__task *ctx)
@@ -37,9 +28,8 @@ int ig_snap_proc(struct bpf_iter__task *ctx)
 	struct seq_file *seq = ctx->meta->seq;
 	struct task_struct *task = ctx->task;
 	struct task_struct *parent;
-	pid_t ppid;
 
-	struct process_entry process = {};
+	struct gadget_process process = {};
 
 	if (task == NULL)
 		return 0;
@@ -47,23 +37,29 @@ int ig_snap_proc(struct bpf_iter__task *ctx)
 	if (!show_threads && task->tgid != task->pid)
 		return 0;
 
-	__u64 mntns_id = task->nsproxy->mnt_ns->ns.inum;
+	__u32 uid = BPF_CORE_READ(task, cred, uid.val);
+	__u32 gid = BPF_CORE_READ(task, cred, gid.val);
 
-	if (gadget_should_discard_mntns_id(mntns_id))
+	if (gadget_should_discard_data(task->nsproxy->mnt_ns->ns.inum,
+				       task->tgid, task->pid, task->comm, uid,
+				       gid))
 		return 0;
 
-	parent = task->real_parent;
-	ppid = parent ? parent->pid : -1;
-	__u32 uid = task->cred->uid.val;
-	__u32 gid = task->cred->gid.val;
-
-	process.mntns_id = mntns_id;
+	process.mntns_id = task->nsproxy->mnt_ns->ns.inum;
+	__builtin_memcpy(process.comm, task->comm, TASK_COMM_LEN);
 	process.pid = task->tgid;
 	process.tid = task->pid;
-	process.ppid = ppid;
-	process.uid = uid;
-	process.gid = gid;
-	__builtin_memcpy(process.comm, task->comm, TASK_COMM_LEN);
+	process.creds.uid = uid;
+	process.creds.gid = gid;
+
+	parent = BPF_CORE_READ(task, real_parent);
+	if (parent) {
+		process.parent.pid = BPF_CORE_READ(parent, tgid);
+		process.parent.tid = BPF_CORE_READ(parent, pid);
+		bpf_probe_read_kernel(&process.parent.comm,
+				      sizeof(process.parent.comm),
+				      parent->comm);
+	}
 
 	bpf_seq_write(seq, &process, sizeof(process));
 

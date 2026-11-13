@@ -16,9 +16,9 @@
 // track of the set of running containers and primitives to query that set with
 // various criteria.
 //
-// It is used by the Gadget Tracer Manager to keep track of containers part of
-// Kubernetes pods and by IG Manager to keep track of containers on a
-// Linux system.
+// It is used by the kube manager operator to keep track of containers part of
+// Kubernetes pods and by local manager to keep track of containers on a Linux
+// system (no matter they were created through Kubernetes or not).
 package containercollection
 
 import (
@@ -82,6 +82,10 @@ type ContainerCollection struct {
 
 	// disableContainerRuntimeWarnings is used to disable warnings about container runtimes.
 	disableContainerRuntimeWarnings bool
+
+	// kubeconfigPath is the path to the kubeconfig file, or empty for in-cluster config.
+	// Some options like WithPodInformer will use it.
+	kubeconfigPath string
 }
 
 // ContainerCollectionOption are options to pass to
@@ -201,6 +205,12 @@ func (cc *ContainerCollection) RemoveContainer(id string) {
 
 // AddContainer adds a container to the collection.
 func (cc *ContainerCollection) AddContainer(container *Container) {
+	if err := eventtypes.ValidateContainerID(container.Runtime.ContainerID); err != nil {
+		log.Warnf("container collection: ignoring container with invalid ID: %s", err)
+		container.close()
+		return
+	}
+
 	for _, enricher := range cc.containerEnrichers {
 		ok := enricher(container)
 		// Enrichers can decide to drop a container
@@ -313,7 +323,7 @@ func (cc *ContainerCollection) LookupPIDByContainer(namespace, pod, container st
 	cc.containers.Range(func(key, value interface{}) bool {
 		c := value.(*Container)
 		if namespace == c.K8s.Namespace && pod == c.K8s.PodName && container == c.K8s.ContainerName {
-			pid = c.Pid
+			pid = c.Runtime.ContainerPID
 			// container found, stop iterating
 			return false
 		}
@@ -330,7 +340,7 @@ func (cc *ContainerCollection) LookupPIDByPod(namespace, pod string) map[string]
 	cc.containers.Range(func(key, value interface{}) bool {
 		c := value.(*Container)
 		if namespace == c.K8s.Namespace && pod == c.K8s.PodName {
-			ret[c.K8s.ContainerName] = c.Pid
+			ret[c.K8s.ContainerName] = c.Runtime.ContainerPID
 		}
 		return true
 	})
@@ -345,7 +355,7 @@ func (cc *ContainerCollection) LookupOwnerReferenceByMntns(mntns uint64) *metav1
 	cc.containers.Range(func(key, value interface{}) bool {
 		c := value.(*Container)
 		if mntns == c.Mntns {
-			ownerRef, err = c.GetOwnerReference()
+			ownerRef, err = c.GetOwnerReference(cc.kubeconfigPath)
 			if err != nil {
 				log.Warnf("Failed to get owner reference of %s/%s/%s: %s",
 					c.K8s.Namespace, c.K8s.PodName, c.K8s.ContainerName, err)
@@ -486,7 +496,8 @@ func (cc *ContainerCollection) Subscribe(key interface{}, selector ContainerSele
 	}
 	ret := []*Container{}
 	cc.pubsub.Subscribe(key, func(event PubSubEvent) {
-		if ContainerSelectorMatches(&selector, event.Container) {
+		// PRECREATE events cannot be filtered since they are not enriched yet.
+		if event.Type == EventTypePreCreateContainer || ContainerSelectorMatches(&selector, event.Container) {
 			f(event)
 		}
 	}, func() {

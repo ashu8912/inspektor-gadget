@@ -1,67 +1,67 @@
 name: trace tcpdrop
 description: trace TCP packets dropped by the kernel
 homepageURL: https://inspektor-gadget.io/
-documentationURL: https://inspektor-gadget.io/docs
-sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/
-tracers:
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/trace_tcpdrop
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/trace_tcpdrop
+datasources:
   tcpdrop:
-    mapName: events
-    structName: event
-structs:
-  event:
     fields:
-    - name: timestamp
-      attributes:
-        template: timestamp
-    - name: src
-      attributes:
-        minWidth: 24
-        maxWidth: 50
-    - name: dst
-      attributes:
-        minWidth: 24
-        maxWidth: 50
-    - name: task
-      attributes:
-        template: comm
-    - name: pid
-      attributes:
-        template: pid
-    - name: tid
-      description: Thread id that generated event
-      attributes:
-        hidden: true
-        template: pid
-    - name: uid
-      attributes:
-        template: uid
-    - name: gid
-      description: Group id of the event's process
-      attributes:
-        template: uid
-    - name: tcpflags
-      description: TCP flags from a TCP header
-      attributes:
-        width: 16
-        alignment: left
-        ellipsis: end
-    - name: reason
-      description: Reason for dropping a packet
-      attributes:
-        width: 16
-        alignment: left
-        ellipsis: start
-    - name: netns
-      description: Network namespace inode id
-      attributes:
-        template: ns
-    - name: mount_ns_id
-      description: Mount namespace inode id
-      attributes:
-        template: ns
-    - name: state
-      description: State of the TCP connection
-      attributes:
-        width: 16
-        alignment: left
-        ellipsis: end
+      src:
+        annotations:
+          template: l4endpoint
+      dst:
+        annotations:
+          template: l4endpoint
+      tcpflags_raw:
+        annotations:
+          columns.hidden: true
+      tcpflags:
+        annotations:
+          description: TCP flags from a TCP header
+      reason_raw:
+        annotations:
+          columns.hidden: true
+      reason:
+        annotations:
+          description: Reason for dropping a packet
+          columns.ellipsis: start
+          value.one-of: 'SKB_NOT_DROPPED_YET, SKB_CONSUMED, SKB_DROP_REASON_NOT_SPECIFIED, SKB_DROP_REASON_NO_SOCKET,
+            SKB_DROP_REASON_PKT_TOO_SMALL, SKB_DROP_REASON_TCP_CSUM, SKB_DROP_REASON_SOCKET_FILTER,
+            SKB_DROP_REASON_UDP_CSUM, SKB_DROP_REASON_NETFILTER_DROP, SKB_DROP_REASON_OTHERHOST,
+            SKB_DROP_REASON_IP_CSUM, SKB_DROP_REASON_IP_INHDR, SKB_DROP_REASON_IP_RPFILTER,
+            SKB_DROP_REASON_UNICAST_IN_L2_MULTICAST, SKB_DROP_REASON_XFRM_POLICY, SKB_DROP_REASON_IP_NOPROTO,
+            SKB_DROP_REASON_SOCKET_RCVBUFF, SKB_DROP_REASON_PROTO_MEM, SKB_DROP_REASON_TCP_MD5NOTFOUND,
+            SKB_DROP_REASON_TCP_MD5UNEXPECTED, SKB_DROP_REASON_TCP_MD5FAILURE, SKB_DROP_REASON_SOCKET_BACKLOG,
+            SKB_DROP_REASON_TCP_FLAGS, SKB_DROP_REASON_TCP_ZEROWINDOW, SKB_DROP_REASON_TCP_OLD_DATA,
+            SKB_DROP_REASON_TCP_OVERWINDOW, SKB_DROP_REASON_TCP_OFOMERGE, SKB_DROP_REASON_TCP_RFC7323_PAWS,
+            SKB_DROP_REASON_TCP_INVALID_SEQUENCE, SKB_DROP_REASON_TCP_RESET, SKB_DROP_REASON_TCP_INVALID_SYN,
+            SKB_DROP_REASON_TCP_CLOSE, SKB_DROP_REASON_TCP_FASTOPEN, SKB_DROP_REASON_TCP_OLD_ACK,
+            SKB_DROP_REASON_TCP_TOO_OLD_ACK, SKB_DROP_REASON_TCP_ACK_UNSENT_DATA, SKB_DROP_REASON_TCP_OFO_QUEUE_PRUNE,
+            SKB_DROP_REASON_TCP_OFO_DROP, SKB_DROP_REASON_IP_OUTNOROUTES, SKB_DROP_REASON_BPF_CGROUP_EGRESS,
+            SKB_DROP_REASON_IPV6DISABLED, SKB_DROP_REASON_NEIGH_CREATEFAIL, SKB_DROP_REASON_NEIGH_FAILED,
+            SKB_DROP_REASON_NEIGH_QUEUEFULL, SKB_DROP_REASON_NEIGH_DEAD, SKB_DROP_REASON_TC_EGRESS,
+            SKB_DROP_REASON_QDISC_DROP, SKB_DROP_REASON_CPU_BACKLOG, SKB_DROP_REASON_XDP, SKB_DROP_REASON_TC_INGRESS,
+            SKB_DROP_REASON_UNHANDLED_PROTO, SKB_DROP_REASON_SKB_CSUM, SKB_DROP_REASON_SKB_GSO_SEG,
+            SKB_DROP_REASON_SKB_UCOPY_FAULT, SKB_DROP_REASON_DEV_HDR, SKB_DROP_REASON_DEV_READY,
+            SKB_DROP_REASON_FULL_RING, SKB_DROP_REASON_NOMEM, SKB_DROP_REASON_HDR_TRUNC, SKB_DROP_REASON_TAP_FILTER,
+            SKB_DROP_REASON_TAP_TXFILTER, SKB_DROP_REASON_ICMP_CSUM, SKB_DROP_REASON_INVALID_PROTO,
+            SKB_DROP_REASON_IP_INADDRERRORS, SKB_DROP_REASON_IP_INNOROUTES, SKB_DROP_REASON_PKT_TOO_BIG,
+            SKB_DROP_REASON_DUP_FRAG, SKB_DROP_REASON_FRAG_REASM_TIMEOUT, SKB_DROP_REASON_FRAG_TOO_FAR,
+            SKB_DROP_REASON_MAX'
+      state_raw:
+        annotations:
+          columns.hidden: true
+      state:
+        annotations:
+          description: State of the TCP connection
+          value.one-of: 'tcp_established, tcp_syn_sent, tcp_syn_recv, tcp_fin_wait1,
+            tcp_fin_wait2, tcp_time_wait, tcp_close, tcp_close_wait, tcp_last_ack,
+            tcp_listen, tcp_closing, tcp_new_syn_recv, tcp_max_states'
+      kernel_stack_raw:
+        annotations:
+          columns.hidden: true
+      kernel_stack:
+        annotations:
+          description: Kernel stack
+          columns.hidden: true
+          columns.width: 20

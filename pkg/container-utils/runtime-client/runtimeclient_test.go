@@ -22,23 +22,23 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
 
-	utilstest "github.com/inspektor-gadget/inspektor-gadget/internal/test"
 	containerutils "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils"
 	runtimeclient "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/runtime-client"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/testutils"
 	containerutilsTypes "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/types"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
+	utilstest "github.com/inspektor-gadget/inspektor-gadget/pkg/testing/utils"
 )
 
 const (
 	containerNamePrefix = "test-container"
-	containerImageName  = "docker.io/library/alpine:latest"
+	containerImageName  = "ghcr.io/inspektor-gadget/ci/busybox:latest"
 	numContainers       = 2
 )
 
 func TestRuntimeClientInterface(t *testing.T) {
 	t.Parallel()
 	utilstest.RequireRoot(t)
+	utilstest.HostInit(t)
 
 	for _, runtime := range testutils.SupportedContainerRuntimes {
 		t.Run(runtime.String(), func(t *testing.T) {
@@ -49,11 +49,14 @@ func TestRuntimeClientInterface(t *testing.T) {
 			var expectedData []*runtimeclient.ContainerDetailsData
 			for i := 0; i < numContainers; i++ {
 				cn := fmt.Sprintf("%s-%s-%d", containerNamePrefix, runtime, i)
+				opts := []testutils.Option{
+					testutils.WithImage(containerImageName),
+				}
 				c, err := testutils.NewContainer(
 					runtime,
 					cn,
 					"sleep inf", // We simply want to keep the container running
-					testutils.WithImage(containerImageName),
+					opts...,
 				)
 				require.Nil(t, err)
 				require.NotNil(t, c)
@@ -67,13 +70,11 @@ func TestRuntimeClientInterface(t *testing.T) {
 					&runtimeclient.ContainerDetailsData{
 						ContainerData: runtimeclient.ContainerData{
 							Runtime: runtimeclient.RuntimeContainerData{
-								BasicRuntimeMetadata: types.BasicRuntimeMetadata{
-									RuntimeName:        runtime,
-									ContainerName:      cn,
-									ContainerID:        c.ID(),
-									ContainerImageName: containerImageName,
-								},
-								State: runtimeclient.StateRunning,
+								RuntimeName:        runtime,
+								ContainerName:      cn,
+								ContainerID:        c.ID(),
+								ContainerImageName: containerImageName,
+								State:              runtimeclient.StateRunning,
 							},
 							K8s: runtimeclient.K8sContainerData{},
 						},
@@ -107,8 +108,13 @@ func TestRuntimeClientInterface(t *testing.T) {
 				for _, eData := range expectedData {
 					found := false
 					for _, cData := range containers {
-						// ContainerImageDigest may vary among versions, so we do not check it for now
-						cData.Runtime.BasicRuntimeMetadata.ContainerImageDigest = ""
+						if cData.Runtime.ContainerID != eData.Runtime.ContainerID {
+							continue
+						}
+						require.NotEmpty(t, cData.Runtime.ContainerImageDigest, "ContainerImageDigest should be populated")
+						// ContainerImageDigest may vary among versions, so we do not check its value
+						cData.Runtime.ContainerImageDigest = ""
+						cData.Runtime.ContainerImageID = ""
 						if cmp.Equal(*cData, eData.ContainerData) {
 							found = true
 							break
@@ -124,10 +130,12 @@ func TestRuntimeClientInterface(t *testing.T) {
 
 				for _, eData := range expectedData {
 					cData, err := rc.GetContainer(eData.Runtime.ContainerID)
-					// ContainerImageDigest may vary among versions, so we do not check it for now
-					cData.Runtime.BasicRuntimeMetadata.ContainerImageDigest = ""
 					require.Nil(t, err)
 					require.NotNil(t, cData)
+					require.NotEmpty(t, cData.Runtime.ContainerImageDigest, "ContainerImageDigest should be populated")
+					// ContainerImageDigest may vary among versions, so we do not check its value
+					cData.Runtime.ContainerImageDigest = ""
+					cData.Runtime.ContainerImageID = ""
 					require.True(t, cmp.Equal(*cData, eData.ContainerData),
 						"unexpected container data:\n%s", cmp.Diff(*cData, eData.ContainerData))
 				}
@@ -138,10 +146,12 @@ func TestRuntimeClientInterface(t *testing.T) {
 
 				for _, eData := range expectedData {
 					cData, err := rc.GetContainerDetails(eData.Runtime.ContainerID)
-					// ContainerImageDigest may vary among versions, so we do not check it for now
-					cData.Runtime.BasicRuntimeMetadata.ContainerImageDigest = ""
 					require.Nil(t, err)
 					require.NotNil(t, cData)
+					require.NotEmpty(t, cData.Runtime.ContainerImageDigest, "ContainerImageDigest should be populated")
+					// ContainerImageDigest may vary among versions, so we do not check its value
+					cData.Runtime.ContainerImageDigest = ""
+					cData.Runtime.ContainerImageID = ""
 
 					// TODO: Is it worth to compare the cgroups path and mounts?
 					require.NotEmpty(t, cData.CgroupsPath)

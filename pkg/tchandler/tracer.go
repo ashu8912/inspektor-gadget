@@ -31,7 +31,7 @@ import (
 
 	containercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/container-collection"
 	containerutils "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/netnsenter"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/nsenter"
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpfel -cc clang -cflags ${CFLAGS} dispatcher ./bpf/dispatcher.bpf.c -- -I./bpf/
@@ -91,7 +91,7 @@ func NewHandler(direction AttachmentDirection) (*Handler, error) {
 
 	// We need to create the client on the host network namespace, otherwise it's not able to
 	// create the qdisc and filters.
-	err = netnsenter.NetnsEnter(1, func() error {
+	err = nsenter.NetnsEnter(1, func() error {
 		// Setup tc socket for communication with the kernel
 		tcnl, err = tc.Open(&tc.Config{})
 		if err != nil {
@@ -149,16 +149,17 @@ func (t *Handler) newAttachment(pid uint32, iface *net.Interface, netns uint64, 
 		}
 	}()
 
-	dispatcherSpec, err := loadDispatcher()
+	spec, err := loadDispatcher()
 	if err != nil {
 		return nil, err
 	}
-
-	consts := map[string]interface{}{
-		"current_netns": uint32(netns),
+	dispatcherSpec := &dispatcherSpecs{}
+	if err := spec.Assign(dispatcherSpec); err != nil {
+		return nil, err
 	}
-	if err := dispatcherSpec.RewriteConstants(consts); err != nil {
-		return nil, fmt.Errorf("RewriteConstants while attaching to pid %d: %w", pid, err)
+
+	if err := dispatcherSpec.CurrentNetns.Set(uint32(netns)); err != nil {
+		return nil, err
 	}
 
 	// We create the clsact qdisc and leak it. We can't remove it because we'll break any other
@@ -172,7 +173,7 @@ func (t *Handler) newAttachment(pid uint32, iface *net.Interface, netns uint64, 
 			tailCallMapName: t.dispatcherMap,
 		},
 	}
-	if err = dispatcherSpec.LoadAndAssign(&a.dispatcher, &optsIngress); err != nil {
+	if err = spec.LoadAndAssign(&a.dispatcher, &optsIngress); err != nil {
 		return nil, fmt.Errorf("loading ebpf program: %w", err)
 	}
 
@@ -190,7 +191,7 @@ func (t *Handler) AttachContainer(container *containercollection.Container) erro
 		return nil
 	}
 
-	pid := container.Pid
+	pid := container.ContainerPid()
 
 	netns, err := containerutils.GetNetNs(int(pid))
 	if err != nil {
@@ -217,7 +218,7 @@ func (t *Handler) AttachContainer(container *containercollection.Container) erro
 
 	// We need to perform these operations from the host network namespace, otherwise we won't
 	// be able to add the filter to the network interface.
-	err = netnsenter.NetnsEnter(1, func() error {
+	err = nsenter.NetnsEnter(1, func() error {
 		for _, iface := range ifaces {
 			if a, ok := t.attachments[iface.Name]; ok {
 				a.users[pid] = struct{}{}
@@ -243,7 +244,7 @@ func (t *Handler) DetachContainer(container *containercollection.Container) erro
 		return nil
 	}
 
-	pid := container.Pid
+	pid := container.ContainerPid()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()

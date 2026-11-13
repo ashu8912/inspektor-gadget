@@ -1,0 +1,37 @@
+name: deadlock
+description: use uprobe to trace pthread_mutex_lock and pthread_mutex_unlock in libc.so
+  and detect potential deadlocks
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/deadlock
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/deadlock
+datasources:
+  mutex:
+    annotations:
+      description: Edges of the mutex-wait directed graph
+  process_exit:
+    annotations:
+      description: Dead process IDs
+  deadlock:
+    annotations:
+      description: Potential deadlocks
+    fields:
+      pid:
+        annotations:
+          description: Process ID
+          template: pid
+      nodes:
+        annotations:
+          description: Number of mutexes involved in the deadlock
+          columns.width: 4
+      stack_ids:
+        annotations:
+          description: Stack IDs of all mutexes involved in the deadlock
+          columns.width: 30
+      mntns_id:
+        annotations:
+          description: Mount namespace inode id
+          columns.hidden: "true"
+      comm:
+        annotations:
+          description: Process name
+          template: comm

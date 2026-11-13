@@ -5,9 +5,12 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
+#include <gadget/types.h>
 #include <gadget/buffer.h>
+#include <gadget/common.h>
+#include <gadget/filter.h>
 #include <gadget/macros.h>
-#include <gadget/mntns_filter.h>
+#include <gadget/user_stack_map.h>
 
 #define MAX_ENTRIES 10240
 
@@ -27,14 +30,14 @@ enum memop {
 };
 
 struct event {
-	gadget_mntns_id mntns_id;
-	__u32 pid;
-	__u32 tid;
-	char comm[TASK_COMM_LEN];
-	enum memop operation;
+	gadget_timestamp timestamp_raw;
+	struct gadget_process proc;
+
+	struct gadget_user_stack ustack;
+
+	enum memop operation_raw;
 	__u64 addr;
 	__u64 size;
-	__u64 timestamp_ns;
 };
 
 /* used for context between uprobes and uretprobes of allocations */
@@ -85,15 +88,13 @@ static __always_inline int gen_alloc_enter(size_t size)
 static __always_inline int gen_alloc_exit(struct pt_regs *ctx,
 					  enum memop operation, u64 addr)
 {
-	u64 mntns_id;
 	struct event *event;
 	u64 pid_tgid;
 	u32 tid;
 	u64 *size_ptr;
 	u64 size;
 
-	mntns_id = gadget_get_mntns_id();
-	if (gadget_should_discard_mntns_id(mntns_id))
+	if (gadget_should_discard_data_current())
 		return 0;
 
 	pid_tgid = bpf_get_current_pid_tgid();
@@ -108,14 +109,13 @@ static __always_inline int gen_alloc_exit(struct pt_regs *ctx,
 	if (!event)
 		return 0;
 
-	event->mntns_id = mntns_id;
-	event->pid = pid_tgid >> 32;
-	event->tid = tid;
-	bpf_get_current_comm(event->comm, sizeof(event->comm));
-	event->operation = operation;
+	gadget_process_populate(&event->proc);
+	event->operation_raw = operation;
 	event->addr = addr;
 	event->size = size;
-	event->timestamp_ns = bpf_ktime_get_ns();
+	event->timestamp_raw = bpf_ktime_get_ns();
+
+	gadget_get_user_stack(ctx, &event->ustack);
 
 	gadget_submit_buf(ctx, &events, event, sizeof(*event));
 
@@ -125,30 +125,22 @@ static __always_inline int gen_alloc_exit(struct pt_regs *ctx,
 static __always_inline int gen_free_enter(struct pt_regs *ctx,
 					  enum memop operation, u64 addr)
 {
-	u64 mntns_id;
 	struct event *event;
-	u64 pid_tgid;
-	u32 tid;
 
-	mntns_id = gadget_get_mntns_id();
-	if (gadget_should_discard_mntns_id(mntns_id))
+	if (gadget_should_discard_data_current())
 		return 0;
 
 	event = gadget_reserve_buf(&events, sizeof(*event));
 	if (!event)
 		return 0;
 
-	pid_tgid = bpf_get_current_pid_tgid();
-	tid = (u32)pid_tgid;
-
-	event->mntns_id = mntns_id;
-	event->pid = pid_tgid >> 32;
-	event->tid = tid;
-	bpf_get_current_comm(event->comm, sizeof(event->comm));
-	event->operation = operation;
+	gadget_process_populate(&event->proc);
+	event->operation_raw = operation;
 	event->addr = addr;
 	event->size = 0;
-	event->timestamp_ns = bpf_ktime_get_ns();
+	event->timestamp_raw = bpf_ktime_get_ns();
+
+	gadget_get_user_stack(ctx, &event->ustack);
 
 	gadget_submit_buf(ctx, &events, event, sizeof(*event));
 

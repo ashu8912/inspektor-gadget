@@ -1,4 +1,4 @@
-// Copyright 2023-2024 The Inspektor Gadget authors
+// Copyright 2023-2025 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,8 +15,12 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -24,6 +28,28 @@ type (
 	Params      []*Param
 	ParamValues map[string]string
 )
+
+var (
+	idRegex   = regexp.MustCompile("^[a-f0-9]{32}$")
+	nameRegex = regexp.MustCompile("^[a-z0-9-_]{1,32}$")
+)
+
+func IsValidInstanceID(id string) bool {
+	return idRegex.MatchString(id)
+}
+
+func IsValidInstanceName(name string) bool {
+	return nameRegex.MatchString(name)
+}
+
+func NewInstanceID() (string, error) {
+	id := make([]byte, 16)
+	_, err := io.ReadFull(rand.Reader, id)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(id), nil
+}
 
 func ParseSocketAddress(addr string) (string, string, error) {
 	socketURL, err := url.Parse(addr)
@@ -67,4 +93,34 @@ func (pv ParamValues) ExtractPrefixedValues(prefix string) ParamValues {
 		}
 	}
 	return res
+}
+
+func SplitStringWithEscape(s string, sep rune) []string {
+	var result []string
+	var b strings.Builder
+	var escape bool
+	for _, c := range s {
+		if escape {
+			escape = false
+			if c != sep && c != '\\' {
+				// Leave escape char alone if not a sep or backslash
+				b.WriteByte('\\')
+			}
+			b.WriteRune(c)
+			continue
+		}
+		switch c {
+		case '\\':
+			escape = true
+		case sep:
+			result = append(result, b.String())
+			b.Reset()
+		default:
+			b.WriteRune(c)
+		}
+	}
+	if b.Len() > 0 {
+		result = append(result, b.String())
+	}
+	return result
 }

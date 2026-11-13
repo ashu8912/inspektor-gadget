@@ -252,12 +252,12 @@ func PrintLogsFn(namespaces ...string) func(t *testing.T) {
 
 		if DefaultTestComponent == InspektorGadgetTestComponent {
 			t.Logf("Inspektor Gadget pod logs:")
-			t.Logf(getPodLogs("gadget"))
+			t.Log(getPodLogs("gadget"))
 		}
 
 		for _, ns := range namespaces {
 			t.Logf("Logs in namespace %s:", ns)
-			t.Logf(getPodLogs(ns))
+			t.Log(getPodLogs(ns))
 		}
 	}
 }
@@ -281,7 +281,7 @@ func getPodLogs(ns string) string {
 		cmd := exec.Command("/bin/sh", "-xc", c)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
-			sb.WriteString(fmt.Sprintf("Error: failed to run log command: %s, %s\n", cmd.String(), err))
+			fmt.Fprintf(&sb, "Error: failed to run log command: %s, %s\n", cmd.String(), err)
 			continue
 		}
 		sb.WriteString(string(output))
@@ -331,7 +331,7 @@ func (c *Command) verifyOutputWihoutTest() error {
 }
 
 // kill kills a command by sending SIGKILL because we want to stop the process
-// immediatly and avoid that the signal is trapped.
+// immediately and avoid that the signal is trapped.
 func (c *Command) kill() error {
 	const sig syscall.Signal = syscall.SIGKILL
 
@@ -346,7 +346,7 @@ func (c *Command) kill() error {
 	// in our case, the process of /bin/sh and c.Cmd.
 	err := syscall.Kill(-c.command.Process.Pid, sig)
 	if err != nil {
-		return err
+		return fmt.Errorf("killing command(%s): %w", c.Name, err)
 	}
 
 	// In some cases, we do not have to wait here because the Cmd was executed
@@ -362,22 +362,19 @@ func (c *Command) kill() error {
 		// do not return error, it is what we were expecting.
 		var exiterr *exec.ExitError
 		if ok := errors.As(err, &exiterr); !ok {
-			return err
+			return fmt.Errorf("command returned error(%s): %w", c.Name, err)
 		}
 
 		waitStatus, ok := exiterr.Sys().(syscall.WaitStatus)
 		if !ok {
-			return err
+			return fmt.Errorf("command returned error(%s): %w", c.Name, err)
 		}
 
 		if waitStatus.Signal() != sig {
-			return err
+			return fmt.Errorf("command returned error(%s): %w", c.Name, err)
 		}
-
-		return nil
 	}
-
-	return err
+	return nil
 }
 
 // RunWithoutTest runs the Command, this is thought to be used in TestMain().
@@ -449,7 +446,7 @@ func (c *Command) KillWithoutTest() error {
 	fmt.Printf("Kill command(%s)\n", c.Name)
 
 	if err := c.kill(); err != nil {
-		return fmt.Errorf("killing command(%s): %w", c.Name, err)
+		return err
 	}
 
 	return nil
@@ -499,7 +496,7 @@ func (c *Command) Stop(t *testing.T) {
 	err := c.kill()
 	t.Logf("Command returned(%s):\n%s\n%s\n",
 		c.Name, c.stderr.String(), c.stdout.String())
-	require.NoError(t, err, "failed to kill command(%s)", c.Name)
+	require.NoError(t, err)
 
 	c.verifyOutput(t)
 
@@ -584,7 +581,7 @@ func BusyboxPodRepeatCommand(namespace, cmd string) *Command {
 
 // BusyboxPodCommand returns a Command that creates a pod and runs "cmd" in it.
 func BusyboxPodCommand(namespace, cmd string) *Command {
-	return PodCommand("test-pod", "busybox", namespace, `["/bin/sh", "-c"]`, cmd)
+	return PodCommand("test-pod", "ghcr.io/inspektor-gadget/ci/busybox:latest", namespace, `["/bin/sh", "-c"]`, cmd)
 }
 
 // GenerateTestNamespaceName returns a string which can be used as unique
@@ -646,7 +643,7 @@ func DeleteRemainingNamespacesCommand() *Command {
 func WaitUntilJobCompleteCommand(namespace string, jobname string) *Command {
 	return &Command{
 		Name:           fmt.Sprintf("WaitForJob: %s", jobname),
-		Cmd:            fmt.Sprintf("kubectl wait job --for condition=complete -n %s %s", namespace, jobname),
+		Cmd:            fmt.Sprintf("kubectl wait job --for condition=complete --timeout=60s -n %s %s", namespace, jobname),
 		ExpectedString: fmt.Sprintf("job.batch/%s condition met\n", jobname),
 	}
 }
@@ -655,8 +652,8 @@ func WaitUntilJobCompleteCommand(namespace string, jobname string) *Command {
 // the given as parameter namespace is ready.
 func WaitUntilPodReadyCommand(namespace string, podname string) *Command {
 	return &Command{
-		Name:           "WaitForTestPod",
-		Cmd:            fmt.Sprintf("kubectl wait pod --for condition=ready -n %s %s", namespace, podname),
+		Name:           "WaitForReadyTestPod",
+		Cmd:            fmt.Sprintf("timeout 10 bash -c 'until kubectl get pod -n %s %s > /dev/null 2>&1; do sleep 1; done' && kubectl wait pod --for condition=ready --timeout=60s -n %s %s", namespace, podname, namespace, podname),
 		ExpectedString: fmt.Sprintf("pod/%s condition met\n", podname),
 	}
 }
@@ -666,7 +663,7 @@ func WaitUntilPodReadyCommand(namespace string, podname string) *Command {
 func WaitUntilPodReadyOrOOMKilledCommand(namespace string, podname string) *Command {
 	return &Command{
 		Name:           "WaitForTestPod",
-		Cmd:            fmt.Sprintf("kubectl wait pod --for condition=ready -n %s %s || kubectl wait pod --for jsonpath='{.status.containerStatuses[0].state.terminated.reason}'=OOMKilled -n %s %s", namespace, podname, namespace, podname),
+		Cmd:            fmt.Sprintf("timeout 10 bash -c 'until kubectl get pod -n %s %s > /dev/null 2>&1; do sleep 1; done' && (kubectl wait pod --for condition=ready --timeout=60s -n %s %s || kubectl wait pod --for jsonpath='{.status.containerStatuses[0].state.terminated.reason}'=OOMKilled -n %s %s)", namespace, podname, namespace, podname, namespace, podname),
 		ExpectedString: fmt.Sprintf("pod/%s condition met\n", podname),
 	}
 }

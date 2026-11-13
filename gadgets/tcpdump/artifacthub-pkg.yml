@@ -1,0 +1,29 @@
+# Artifact Hub package metadata file
+version: 0.57.0
+name: "tcpdump"
+category: monitoring-logging
+displayName: "tcpdump"
+createdAt: "2026-10-05T18:06:50Z"
+digest: "2026-10-05T18:06:50Z"
+description: Capture network packets
+logoURL: "https://inspektor-gadget.io/media/brand-icon.svg"
+license: ""
+homeURL: "https://inspektor-gadget.io/docs/latest/gadgets/tcpdump"
+containersImages:
+    - name: gadget
+      image: "ghcr.io/inspektor-gadget/gadget/tcpdump:latest"
+      platforms:
+        - linux/amd64
+        - linux/arm64
+keywords:
+    - gadget
+links:
+    - name: source
+      url: "https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/tcpdump"
+install: |
+    # Run
+    ```bash
+    sudo ig run ghcr.io/inspektor-gadget/gadget/tcpdump:latest
+    ```
+provider:
+    name: Inspektor Gadget

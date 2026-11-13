@@ -15,34 +15,42 @@
 package formatters
 
 import (
-	"encoding/binary"
+	"errors"
 	"fmt"
-	"net"
+	"io/fs"
+	"math/bits"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"golang.org/x/sys/unix"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource/formatters/json"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
+	metadatav1 "github.com/inspektor-gadget/inspektor-gadget/pkg/metadata/v1"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators/common"
+	ebpftypes "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/ebpf/types"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/params"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/annotations"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/protocols"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/syscalls"
 )
 
-// Keep this aligned with include/gadget/types.h
 const (
-	// L3EndpointTypeName contains the name of the type that gadgets should use to store an L3 endpoint.
-	L3EndpointTypeName = "gadget_l3endpoint_t"
-
-	// L4EndpointTypeName contains the name of the type that gadgets should use to store an L4 endpoint.
-	L4EndpointTypeName = "gadget_l4endpoint_t"
-
-	// TimestampTypeName contains the name of the type to store a timestamp
-	TimestampTypeName = "gadget_timestamp"
-
-	// Name of the type to store a signal
-	SignalTypeName = "gadget_signal"
+	timestampTargetAnnotation = "formatters.timestamp.target"
+	syscallTargetAnnotation   = "formatters.syscall.target"
+	signalTargetAnnotation    = "formatters.signal.target"
+	errnoTargetAnnotation     = "formatters.errno.target"
+	bytesTargetAnnotation     = "formatters.bytes.target"
+	durationTargetAnnotation  = "formatters.duration.target"
+	fileModeTargetAnnotation  = "formatters.file_mode.target"
+	fileFlagsTargetAnnotation = "formatters.file_flags.target"
+	Priority                  = 0
 )
 
 type formattersOperator struct{}
@@ -79,7 +87,7 @@ func (f *formattersOperator) InstantiateDataOperator(gadgetCtx operators.GadgetC
 			}
 			logger.Debugf("> found %d fields for replacer %v", len(fields), r.selectors)
 			for _, field := range fields {
-				replFunc, err := r.replace(ds, field)
+				replFunc, err := r.replace(logger, ds, field)
 				if err != nil {
 					logger.Debugf(">  skipping field %q: %v", field.Name(), err)
 					continue
@@ -121,29 +129,159 @@ type replacer struct {
 	selectors []string
 
 	// replace will be called for incoming data with the source and target fields set
-	replace func(datasource.DataSource, datasource.FieldAccessor) (func(datasource.Data) error, error)
+	replace func(logger.Logger, datasource.DataSource, datasource.FieldAccessor) (func(datasource.Data) error, error)
 
 	// priority to be used when subscribing to the DataSource
 	priority int
+}
+
+func handleL3Endpoint(in datasource.FieldAccessor) (func(entry datasource.Data) (string, error), error) {
+	// We do some length checks in here - since we expect the in field to be part of an eBPF struct that
+	// is always sized statically, we can avoid checking the individual entries later on.
+	ips := in.GetSubFieldsWithTag("type:" + ebpftypes.IPAddrTypeName)
+	if len(ips) != 1 {
+		return nil, fmt.Errorf("expected %d %q field, got %d", 1, ebpftypes.IPAddrTypeName, len(ips))
+	}
+	ips[0].RemoveReference(true)
+
+	versions := in.GetSubFieldsWithTag("name:version")
+	if len(versions) != 1 {
+		return nil, fmt.Errorf("expected exactly 1 version field")
+	}
+
+	// Pretty L3 address
+	addrName := strings.TrimSuffix(ips[0].Name(), "_raw")
+	addrF, err := in.AddSubField(addrName, api.Kind_String)
+	if err != nil {
+		return nil, fmt.Errorf("adding address field: %w", err)
+	}
+
+	in.AddAnnotation(datasource.ColumnsReplaceAnnotation, addrF.FullName())
+
+	annotations.SetFieldVisibility(false, in)
+
+	return func(entry datasource.Data) (string, error) {
+		addrStr, err := common.GetIPForVersion(entry, versions[0], ips[0])
+		if err != nil {
+			return "", fmt.Errorf("getting IP address: %w", err)
+		}
+
+		addrF.PutString(entry, addrStr)
+		return addrStr, nil
+	}, nil
+}
+
+func formatDuration(d time.Duration) string {
+	switch {
+	case d < time.Microsecond:
+		return fmt.Sprintf("%dns", d.Nanoseconds())
+	case d < time.Millisecond:
+		return fmt.Sprintf("%.2fµs", float64(d)/float64(time.Microsecond))
+	case d < time.Second:
+		return fmt.Sprintf("%.2fms", float64(d)/float64(time.Millisecond))
+	default:
+		return d.String()
+	}
+}
+
+// Standard Linux file open flags from <fcntl.h>
+const (
+	// Access modes (handled separately)
+	O_RDONLY  = 0
+	O_WRONLY  = 1
+	O_RDWR    = 2
+	O_ACCMODE = 3
+
+	// Bit flags
+	O_CREAT     = 0o100
+	O_EXCL      = 0o200
+	O_NOCTTY    = 0o400
+	O_TRUNC     = 0o1000
+	O_APPEND    = 0o2000
+	O_NONBLOCK  = 0o4000
+	O_DSYNC     = 0o10000
+	O_FASYNC    = 0o20000
+	O_DIRECT    = 0o40000
+	O_LARGEFILE = 0o100000
+	O_DIRECTORY = 0o200000
+	O_NOFOLLOW  = 0o400000
+	O_NOATIME   = 0o1000000
+	O_CLOEXEC   = 0o2000000
+)
+
+// flagMap pairs the bitmask of a flag with its string representation.
+// Using a slice of structs makes the relationship explicit and order-independent.
+var flagMap = []struct {
+	val  int32
+	name string
+}{
+	{O_CREAT, "O_CREAT"},
+	{O_EXCL, "O_EXCL"},
+	{O_NOCTTY, "O_NOCTTY"},
+	{O_TRUNC, "O_TRUNC"},
+	{O_APPEND, "O_APPEND"},
+	{O_NONBLOCK, "O_NONBLOCK"},
+	{O_DSYNC, "O_DSYNC"},
+	{O_FASYNC, "O_FASYNC"},
+	{O_DIRECT, "O_DIRECT"},
+	{O_LARGEFILE, "O_LARGEFILE"},
+	{O_DIRECTORY, "O_DIRECTORY"},
+	{O_NOFOLLOW, "O_NOFOLLOW"},
+	{O_NOATIME, "O_NOATIME"},
+	{O_CLOEXEC, "O_CLOEXEC"},
+}
+
+func decodeFlags(flags int32) []string {
+	// Pre-allocate a slice with a reasonable capacity to avoid reallocations.
+	// The number of set bits gives an exact count.
+	capacity := bits.OnesCount32(uint32(flags))
+	out := make([]string, 0, capacity)
+
+	// Handle the access mode, which is not a bitmask.
+	switch flags & O_ACCMODE {
+	case O_RDONLY:
+		out = append(out, "O_RDONLY")
+	case O_WRONLY:
+		out = append(out, "O_WRONLY")
+	case O_RDWR:
+		out = append(out, "O_RDWR")
+	}
+
+	// Check each flag by its actual value.
+	for _, f := range flagMap {
+		if (flags & f.val) == f.val {
+			out = append(out, f.name)
+		}
+	}
+
+	return out
 }
 
 // careful: order and priority matter both!
 var replacers = []replacer{
 	{
 		name:      "signal",
-		selectors: []string{"type:" + SignalTypeName},
-		replace: func(ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
-			oldName := in.Name()
-
-			if err := in.Rename(oldName + "_raw"); err != nil {
-				return nil, fmt.Errorf("renaming field: %w", err)
-			}
-			in.SetHidden(true, false)
-
-			signalField, err := ds.AddField(oldName, api.Kind_String)
+		selectors: []string{"type:" + ebpftypes.SignalTypeName},
+		replace: func(logger logger.Logger, ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
+			outName, err := annotations.GetTargetNameFromAnnotation(logger, "formatters.signal", in, signalTargetAnnotation)
 			if err != nil {
 				return nil, err
 			}
+
+			opts := []datasource.FieldOption{
+				datasource.WithAnnotations(map[string]string{
+					metadatav1.ValueOneOfAnnotation: strings.Join(signalNames, ", "),
+				}),
+				datasource.WithSameParentAs(in),
+				datasource.WithSameOrderAs(in),
+			}
+			signalField, err := ds.AddField(outName, api.Kind_String, opts...)
+			if err != nil {
+				return nil, err
+			}
+
+			annotations.SetFieldVisibility(true, in)
+
 			return func(data datasource.Data) error {
 				inBytes := in.Get(data)
 				switch len(inBytes) {
@@ -152,6 +290,9 @@ var replacers = []replacer{
 				case 4:
 					signalNumber, _ := in.Uint32(data)
 					signalName := unix.SignalName(syscall.Signal(signalNumber))
+					if signalName == "" {
+						signalName = fmt.Sprintf("signal#%d", signalNumber)
+					}
 					signalField.Set(data, []byte(signalName))
 				}
 				return nil
@@ -160,29 +301,113 @@ var replacers = []replacer{
 		priority: 0,
 	},
 	{
+		name:      "errno",
+		selectors: []string{"type:" + ebpftypes.ErrnoTypeName},
+		replace: func(logger logger.Logger, ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
+			outName, err := annotations.GetTargetNameFromAnnotation(logger, "formatters.errno", in, errnoTargetAnnotation)
+			if err != nil {
+				return nil, err
+			}
+
+			opts := []datasource.FieldOption{
+				datasource.WithAnnotations(map[string]string{
+					metadatav1.TemplateAnnotation:   "errorString",
+					metadatav1.ValueOneOfAnnotation: strings.Join(errnoNames, ", "),
+				}),
+				datasource.WithSameParentAs(in),
+				datasource.WithSameOrderAs(in),
+			}
+			errnoField, err := ds.AddField(outName, api.Kind_String, opts...)
+			if err != nil {
+				return nil, err
+			}
+
+			annotations.SetFieldVisibility(true, in)
+
+			return func(data datasource.Data) error {
+				switch in.Type() {
+				case api.Kind_Uint32:
+					errnoNumber, _ := in.Uint32(data)
+					errnoName := unix.ErrnoName(syscall.Errno(errnoNumber))
+					if errnoNumber != 0 && errnoName == "" {
+						errnoName = fmt.Sprintf("error#%d", errnoNumber)
+					}
+					errnoField.PutString(data, errnoName)
+				}
+				return nil
+			}, nil
+		},
+		priority: 0,
+	},
+	{
+		name:      "syscall",
+		selectors: []string{"type:" + ebpftypes.SyscallTypeName},
+		replace: func(logger logger.Logger, ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
+			if in.Type() != api.Kind_Uint64 {
+				return nil, fmt.Errorf("checking field %q: expected uint64", in.Name())
+			}
+
+			outName, err := annotations.GetTargetNameFromAnnotation(logger, "formatters.syscall", in, syscallTargetAnnotation)
+			if err != nil {
+				return nil, err
+			}
+
+			opts := []datasource.FieldOption{
+				datasource.WithSameParentAs(in),
+				datasource.WithSameOrderAs(in),
+			}
+			syscallField, err := ds.AddField(outName, api.Kind_String, opts...)
+			if err != nil {
+				return nil, err
+			}
+
+			annotations.SetFieldVisibility(true, in)
+
+			return func(data datasource.Data) error {
+				syscallNumber, err := in.Uint64(data)
+				if err != nil {
+					return err
+				}
+
+				syscallName, exist := syscalls.GetSyscallNameByNumber(int(syscallNumber))
+				if !exist {
+					syscallName = "unknown"
+				}
+				syscallField.PutString(data, "SYS_"+strings.ToUpper(syscallName))
+
+				return nil
+			}, nil
+		},
+		priority: 0,
+	},
+	{
 		name:      "timestamp",
-		selectors: []string{"type:" + TimestampTypeName},
-		replace: func(ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
-			// Read annotations to allow user-defined behavior; this needs to be documented // TODO
-			annotations := in.Annotations()
-
-			// remove reference to old field for backwards compatibility
-			in.RemoveReference(false)
-
+		selectors: []string{"type:" + ebpftypes.TimestampTypeName},
+		replace: func(logger logger.Logger, ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
 			timestampFormat := "2006-01-02T15:04:05.000000000Z07:00"
-			if format := annotations["formatters.timestamp.format"]; format != "" {
+			if format := in.Annotations()["formatters.timestamp.format"]; format != "" {
+				logger.Debugf("formatter.timestamp: using custom timestamp format %q for field %q", format, in.Name())
 				timestampFormat = format
 			}
 
-			outName := in.Name()
-			if out := annotations["formatters.timestamp.target"]; out != "" {
-				outName = out
+			outName, err := annotations.GetTargetNameFromAnnotation(logger, "formatters.timestamp", in, timestampTargetAnnotation)
+			if err != nil {
+				return nil, err
 			}
 
-			out, err := ds.AddField(outName, api.Kind_String)
-			if err != nil {
-				return nil, nil
+			opts := []datasource.FieldOption{
+				datasource.WithAnnotations(map[string]string{
+					metadatav1.TemplateAnnotation: "timestamp",
+				}),
+				datasource.WithSameParentAs(in),
+				datasource.WithSameOrderAs(in),
 			}
+			out, err := ds.AddField(outName, api.Kind_String, opts...)
+			if err != nil {
+				return nil, err
+			}
+
+			annotations.SetFieldVisibility(true, in)
 
 			return func(data datasource.Data) error {
 				inBytes := in.Get(data)
@@ -190,57 +415,112 @@ var replacers = []replacer{
 				default:
 					return nil
 				case 8:
+					var errs []error
+
 					// TODO: WallTimeFromBootTime() converts too much for this, create a new func that does less
 					correctedTime := gadgets.WallTimeFromBootTime(ds.ByteOrder().Uint64(inBytes))
 					ds.ByteOrder().PutUint64(inBytes, uint64(correctedTime))
 					t := time.Unix(0, int64(correctedTime))
-					return out.Set(data, []byte(t.Format(timestampFormat)))
+					errs = append(errs, out.Set(data, []byte(t.Format(timestampFormat))))
+					errs = append(errs, in.PutUint64(data, uint64(correctedTime)))
+
+					return errors.Join(errs...)
 				}
 			}, nil
 		},
 		priority: 0,
 	},
 	{
-		name:      "l3endpoint",
-		selectors: []string{"type:" + L3EndpointTypeName},
-		replace: func(ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
-			// We do some length checks in here - since we expect the in field to be part of an eBPF struct that
-			// is always sized statically, we can avoid checking the individual entries later on.
-			in.SetHidden(true, false)
-			ips := in.GetSubFieldsWithTag("type:gadget_ip_addr_t")
-			if len(ips) != 1 {
-				return nil, fmt.Errorf("expected %d gadget_ip_addr_t field, got %d", 1, len(ips))
-			}
-			if ips[0].Size() != 16 {
-				return nil, fmt.Errorf("expected gadget_ip_addr_t to have 16 bytes")
-			}
-			versions := in.GetSubFieldsWithTag("name:version")
-			if len(versions) != 1 {
-				return nil, fmt.Errorf("expected exactly 1 version field")
-			}
-			out, err := in.AddSubField("string", api.Kind_String, datasource.WithTags("l3string"))
+		name:      "bytes",
+		selectors: []string{"type:" + ebpftypes.BytesTypeName},
+		replace: func(logger logger.Logger, ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
+			outName, err := annotations.GetTargetNameFromAnnotation(logger, "formatters.bytes", in, bytesTargetAnnotation)
 			if err != nil {
-				return nil, fmt.Errorf("adding string field: %w", err)
+				return nil, err
 			}
-			// Hide padding
-			for _, f := range in.GetSubFieldsWithTag("name:pad") {
-				f.SetHidden(true, false)
+
+			opts := []datasource.FieldOption{
+				datasource.WithAnnotations(map[string]string{
+					metadatav1.TemplateAnnotation: "bytes",
+				}),
+				datasource.WithSameParentAs(in),
+				datasource.WithSameOrderAs(in),
 			}
+
+			bytesField, err := ds.AddField(outName, api.Kind_String, opts...)
+			if err != nil {
+				return nil, err
+			}
+
+			annotations.SetFieldVisibility(true, in)
+
+			return func(data datasource.Data) error {
+				switch in.Type() {
+				case api.Kind_Uint64:
+					bytesValue, err := in.Uint64(data)
+					if err != nil {
+						return err
+					}
+
+					humanReadable := humanize.Bytes(bytesValue)
+					bytesField.PutString(data, humanReadable)
+				}
+				return nil
+			}, nil
+		},
+		priority: 0,
+	},
+	{
+		name:      "duration",
+		selectors: []string{"type:" + ebpftypes.DurationTypeName},
+		replace: func(logger logger.Logger, ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
+			outName, err := annotations.GetTargetNameFromAnnotation(logger, "formatters.duration", in, durationTargetAnnotation)
+			if err != nil {
+				return nil, err
+			}
+
+			opts := []datasource.FieldOption{
+				datasource.WithAnnotations(map[string]string{
+					metadatav1.TemplateAnnotation: "duration",
+				}),
+				datasource.WithSameParentAs(in),
+				datasource.WithSameOrderAs(in),
+			}
+
+			durationField, err := ds.AddField(outName, api.Kind_String, opts...)
+			if err != nil {
+				return nil, err
+			}
+
+			annotations.SetFieldVisibility(true, in)
+
+			return func(data datasource.Data) error {
+				switch in.Type() {
+				case api.Kind_Uint64:
+					durationValue, err := in.Uint64(data)
+					if err != nil {
+						return err
+					}
+
+					humanReadable := formatDuration(time.Duration(durationValue))
+					durationField.PutString(data, humanReadable)
+				}
+				return nil
+			}, nil
+		},
+		priority: 0,
+	},
+	{
+		name:      "l3endpoint",
+		selectors: []string{"type:" + ebpftypes.L3EndpointTypeName},
+		replace: func(logger logger.Logger, ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
+			replace, err := handleL3Endpoint(in)
+			if err != nil {
+				return nil, err
+			}
+
 			return func(entry datasource.Data) error {
-				ip := ips[0].Get(entry)
-				v := versions[0].Get(entry)
-				if len(v) != 1 {
-					return nil
-				}
-				var err error
-				switch v[0] {
-				case 4:
-					err = out.Set(entry, []byte(net.IP(ip[:4]).String()))
-				case 6:
-					err = out.Set(entry, []byte(net.IP(ip).String()))
-				default:
-					return fmt.Errorf("invalid IP version for l3endpoint")
-				}
+				_, err := replace(entry)
 				return err
 			}, nil
 		},
@@ -248,46 +528,154 @@ var replacers = []replacer{
 	},
 	{
 		name:      "l4endpoint",
-		selectors: []string{"type:" + L4EndpointTypeName},
-		replace: func(ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
-			// We do some length checks in here - since we expect the in field to be part of an eBPF struct that
-			// is always sized statically, we can avoid checking the individual entries later on.
-			in.SetHidden(true, false)
-			// Get accessors to required fields
+		selectors: []string{"type:" + ebpftypes.L4EndpointTypeName},
+		replace: func(logger logger.Logger, ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
+			l3Replace, err := handleL3Endpoint(in)
+			if err != nil {
+				return nil, err
+			}
+
 			ports := in.GetSubFieldsWithTag("name:port")
 			if len(ports) != 1 {
 				return nil, fmt.Errorf("expected exactly 1 port field")
 			}
-			if ports[0].Size() != 2 {
-				return nil, fmt.Errorf("port size expected to be 2 bytes")
-			}
-			l3 := in.GetSubFieldsWithTag("type:" + L3EndpointTypeName)
-			if len(l3) != 1 {
-				return nil, fmt.Errorf("expected exactly 1 l3endpoint field")
-			}
-			l3strings := l3[0].GetSubFieldsWithTag("l3string")
-			if len(l3strings) != 1 {
-				return nil, fmt.Errorf("expected exactly 1 l3string field")
+
+			protos := in.GetSubFieldsWithTag("name:proto_raw")
+			var protoField datasource.FieldAccessor
+			var protoFieldName string
+
+			if len(protos) == 1 {
+				protoFieldName = strings.TrimSuffix(protos[0].Name(), "_raw")
+				protoField, err = in.AddSubField(protoFieldName, api.Kind_String, datasource.WithFlags(datasource.FieldFlagHidden))
+				if err != nil {
+					return nil, err
+				}
+			} else if len(protos) > 1 {
+				return nil, fmt.Errorf("expected at most 1 proto_raw field, found %d", len(protos))
 			}
 
-			// Hide l3 & subfields of l3
-			l3[0].SetHidden(true, true)
-			out, err := in.AddSubField("address", api.Kind_String)
+			endpointF, err := in.AddSubField("endpoint", api.Kind_String,
+				datasource.WithAnnotations(map[string]string{
+					json.SkipFieldAnnotation: "true",
+				}),
+				datasource.WithTags("endpoint"),
+				datasource.WithFlags(datasource.FieldFlagHidden),
+			)
 			if err != nil {
-				return nil, fmt.Errorf("adding string field: %w", err)
+				return nil, fmt.Errorf("adding endpoint field: %w", err)
 			}
+
+			in.AddAnnotation(datasource.ColumnsReplaceAnnotation, endpointF.FullName())
+
 			return func(entry datasource.Data) error {
-				port := binary.BigEndian.Uint16(ports[0].Get(entry))
-				out.Set(entry, []byte(fmt.Sprintf("%s:%d", string(l3strings[0].Get(entry)), port)))
+				addrStr, err := l3Replace(entry)
+				if err != nil {
+					return err
+				}
+
+				port, err := ports[0].Uint16(entry)
+				if err != nil {
+					return fmt.Errorf("getting port: %w", err)
+				}
+				endpointF.PutString(entry, fmt.Sprintf("%s:%d", addrStr, port))
+
+				if len(protos) == 1 {
+					protoNumber, err := protos[0].Uint16(entry)
+					if err != nil {
+						return fmt.Errorf("getting proto: %w", err)
+					}
+					protoName, exist := protocols.GetProtocolNameByNumber(int(protoNumber))
+					if !exist {
+						protoName = fmt.Sprintf("proto#%d", protoNumber)
+					}
+					protoField.PutString(entry, protoName)
+				}
 				return nil
 			}, nil
 		},
 		priority: 1,
 	},
+	{
+		name:      "file_mode",
+		selectors: []string{"type:" + ebpftypes.FileModeTypeName},
+		replace: func(logger logger.Logger, ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
+			if in.Type() != api.Kind_Uint32 {
+				return nil, fmt.Errorf("checking field %q: expected uint32", in.Name())
+			}
+
+			outName, err := annotations.GetTargetNameFromAnnotation(logger, "formatters.file_mode", in, fileModeTargetAnnotation)
+			if err != nil {
+				return nil, err
+			}
+
+			opts := []datasource.FieldOption{
+				datasource.WithSameParentAs(in),
+				datasource.WithSameOrderAs(in),
+			}
+			fileModeField, err := ds.AddField(outName, api.Kind_String, opts...)
+			if err != nil {
+				return nil, err
+			}
+
+			annotations.SetFieldVisibility(true, in)
+
+			return func(data datasource.Data) error {
+				mode, err := in.Uint32(data)
+				if err != nil {
+					return err
+				}
+
+				fileModeField.PutString(data, fs.FileMode(mode).String())
+
+				return nil
+			}, nil
+		},
+		priority: 0,
+	},
+	{
+		name:      "file_flags",
+		selectors: []string{"type:" + ebpftypes.FileFlagsTypeName},
+		replace: func(logger logger.Logger, ds datasource.DataSource, in datasource.FieldAccessor) (func(data datasource.Data) error, error) {
+			if in.Type() != api.Kind_Uint32 {
+				return nil, fmt.Errorf("checking field %q: expected uint32", in.Name())
+			}
+
+			outName, err := annotations.GetTargetNameFromAnnotation(logger, "formatters.file_flags", in, fileFlagsTargetAnnotation)
+			if err != nil {
+				return nil, err
+			}
+
+			opts := []datasource.FieldOption{
+				datasource.WithSameParentAs(in),
+				datasource.WithSameOrderAs(in),
+			}
+			fileFlagsFields, err := ds.AddField(outName, api.Kind_String, opts...)
+			if err != nil {
+				return nil, err
+			}
+
+			annotations.SetFieldVisibility(true, in)
+
+			return func(data datasource.Data) error {
+				mode, err := in.Int32(data)
+				if err != nil {
+					return err
+				}
+
+				flags := decodeFlags(mode)
+				// TODO: the datasource doesn't support arrays yet.
+				flagsStr := strings.Join(flags, "|")
+				fileFlagsFields.PutString(data, flagsStr)
+
+				return nil
+			}, nil
+		},
+		priority: 0,
+	},
 }
 
 func (f *formattersOperator) Priority() int {
-	return 0
+	return Priority
 }
 
 type formattersOperatorInstance struct {
@@ -318,6 +706,12 @@ func (f *formattersOperatorInstance) Stop(gadgetCtx operators.GadgetContext) err
 	return nil
 }
 
+func (f *formattersOperatorInstance) Close(gadgetCtx operators.GadgetContext) error {
+	return nil
+}
+
 func init() {
 	operators.RegisterDataOperator(&formattersOperator{})
 }
+
+var FormattersOperator = &formattersOperator{}

@@ -26,9 +26,12 @@ import (
 	"strings"
 	"sync"
 
+	log "github.com/sirupsen/logrus"
+	"github.com/spf13/viper"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
+	metadatav1 "github.com/inspektor-gadget/inspektor-gadget/pkg/metadata/v1"
 )
 
 type dataElement api.DataElement
@@ -74,6 +77,28 @@ func (d *dataArray) Get(index int) Data {
 		return nil
 	}
 	return (*dataElement)(d.DataArray[index])
+}
+
+func (d *dataArray) Swap(i, j int) {
+	l := len(d.DataArray)
+	if i >= l || i < 0 || j >= l || j < 0 {
+		return
+	}
+	d.DataArray[i], d.DataArray[j] = d.DataArray[j], d.DataArray[i]
+}
+
+func (d *dataArray) Resize(size int) error {
+	if size < 0 {
+		return errors.New("resizing to an invalid size")
+	}
+	if size > len(d.DataArray) {
+		return errors.New("resizing to a larger size is not supported")
+	}
+	for i := size; i < len(d.DataArray); i++ {
+		d.Release(d.Get(i))
+	}
+	d.DataArray = d.DataArray[:size]
+	return nil
 }
 
 func (d *dataArray) New() Data {
@@ -124,6 +149,11 @@ func (f *field) ReflectType() reflect.Type {
 	}
 }
 
+type subscription struct {
+	priority int
+	fn       PacketFunc
+}
+
 type dataSource struct {
 	name string
 
@@ -140,38 +170,62 @@ type dataSource struct {
 
 	requestedFields map[string]bool
 
-	subscriptionsData   []*subscriptionData
-	subscriptionsArray  []*subscriptionArray
-	subscriptionsPacket []*subscriptionPacket
+	subscriptions []*subscription
 
-	requested bool
+	referenced bool
 
 	byteOrder binary.ByteOrder
 	lock      sync.RWMutex
+
+	config *viper.Viper
 }
 
-func newDataSource(t Type, name string) *dataSource {
-	return &dataSource{
+func newDataSource(t Type, name string, options ...DataSourceOption) (*dataSource, error) {
+	switch t {
+	case TypeSingle, TypeArray:
+	default:
+		return nil, fmt.Errorf("invalid data source type: %v", t)
+	}
+
+	ds := &dataSource{
 		name:            name,
 		dType:           t,
 		requestedFields: make(map[string]bool),
+		referenced:      true,
 		fieldMap:        make(map[string]*field),
 		byteOrder:       binary.NativeEndian,
 		tags:            make([]string, 0),
-		annotations:     map[string]string{},
+		annotations:     make(map[string]string),
 	}
+
+	for _, option := range options {
+		option(ds)
+	}
+
+	if ds.config != nil {
+		// Apply configuration
+		ds.tags = append(ds.tags, ds.config.GetStringSlice("tags")...)
+		annotations := ds.config.GetStringMapString("annotations")
+		for k, v := range annotations {
+			ds.annotations[k] = v
+		}
+	}
+	return ds, nil
 }
 
-func New(t Type, name string) DataSource {
-	return newDataSource(t, name)
+func New(t Type, name string, options ...DataSourceOption) (DataSource, error) {
+	return newDataSource(t, name, options...)
 }
 
 func NewFromAPI(in *api.DataSource) (DataSource, error) {
-	ds := newDataSource(Type(in.Type), in.Name)
+	ds, err := newDataSource(Type(in.Type), in.Name)
+	if err != nil {
+		return nil, fmt.Errorf("creating DataSource: %w", err)
+	}
 	for _, f := range in.Fields {
 		ds.fields = append(ds.fields, (*field)(f))
 		if !FieldFlagUnreferenced.In(f.Flags) {
-			ds.fieldMap[f.Name] = (*field)(f)
+			ds.fieldMap[f.FullName] = (*field)(f)
 		}
 	}
 	if in.Flags&api.DataSourceFlagsBigEndian != 0 {
@@ -179,6 +233,8 @@ func NewFromAPI(in *api.DataSource) (DataSource, error) {
 	} else {
 		ds.byteOrder = binary.LittleEndian
 	}
+	ds.tags = in.Tags
+	ds.annotations = in.Annotations
 	// TODO: add more checks / validation
 	return ds, nil
 }
@@ -324,7 +380,9 @@ func (ds *dataSource) AddStaticFields(size uint32, fields []StaticField) (FieldA
 			Index:        uint32(len(ds.fields) + len(newFields)),
 			PayloadIndex: idx,
 			Flags:        FieldFlagStaticMember.Uint32(),
+			Annotations:  maps.Clone(defaultFieldAnnotations),
 		}
+		nf.Order = int32(nf.Index)
 		nf.Size = f.FieldSize()
 		nf.Offs = f.FieldOffset()
 		if nf.Offs+nf.Size > size {
@@ -340,7 +398,9 @@ func (ds *dataSource) AddStaticFields(size uint32, fields []StaticField) (FieldA
 			nf.Flags |= uint32(s.FieldFlags())
 		}
 		if s, ok := f.(AnnotatedField); ok {
-			nf.Annotations = s.FieldAnnotations()
+			for k, v := range s.FieldAnnotations() {
+				nf.Annotations[k] = v
+			}
 		}
 		if s, ok := f.(ParentedField); ok {
 			parent := s.FieldParent()
@@ -352,11 +412,6 @@ func (ds *dataSource) AddStaticFields(size uint32, fields []StaticField) (FieldA
 			}
 		}
 		newFields = append(newFields, nf)
-	}
-
-	// Unref parent fields
-	for p := range parentFields {
-		FieldFlagUnreferenced.AddTo(&newFields[p].Flags)
 	}
 
 	// Check whether parent id is valid
@@ -375,10 +430,12 @@ func (ds *dataSource) AddStaticFields(size uint32, fields []StaticField) (FieldA
 		}
 	}
 
+	ds.applyFieldConfig(newFields...)
+
 	ds.fields = append(ds.fields, newFields...)
 
 	for _, f := range newFields {
-		ds.fieldMap[f.Name] = f
+		ds.fieldMap[f.FullName] = f
 	}
 
 	ds.payloadCount++
@@ -390,22 +447,98 @@ func (ds *dataSource) AddStaticFields(size uint32, fields []StaticField) (FieldA
 	}}, nil
 }
 
+func applyFieldTemplate(f *field, templateAnn string) {
+	ok := ApplyAnnotationTemplates(templateAnn, f.Annotations)
+	if !ok {
+		log.Warnf("template %q not found for field %q", templateAnn, f.Name)
+		return
+	}
+
+	log.Debugf("applying template %q to field %q", templateAnn, f.Name)
+}
+
+func (ds *dataSource) applyFieldConfig(newFields ...*field) {
+	var fields *viper.Viper
+
+	if ds.config != nil {
+		fields = ds.config.Sub("fields")
+	}
+
+	// first pass applying configuration from metadata
+	for _, field := range newFields {
+		// apply template first in case the field being added contains an
+		// annotation with it, for instance, when the field is created by an
+		// operator. The annotations added by the template can be changed by the
+		// field config below.
+		if templateAnn, ok := field.Annotations[metadatav1.TemplateAnnotation]; ok {
+			applyFieldTemplate(field, templateAnn)
+		}
+
+		// apply configuration from metadata
+		if fields == nil {
+			continue
+		}
+
+		fieldConfig := fields.Sub(field.FullName)
+		if fieldConfig == nil {
+			continue
+		}
+
+		field.Tags = append(field.Tags, fieldConfig.GetStringSlice("tags")...)
+
+		fieldAnnotations := fieldConfig.GetStringMapString("annotations")
+		if fieldAnnotations == nil {
+			continue
+		}
+
+		// apply template annotations first to allow user overwrite some
+		// annotations from the template
+		if templateAnn, ok := fieldAnnotations[metadatav1.TemplateAnnotation]; ok {
+			applyFieldTemplate(field, templateAnn)
+		}
+
+		for k, v := range fieldAnnotations {
+			field.Annotations[k] = v
+		}
+	}
+
+	// second pass setting flags based on annotations
+	for _, field := range newFields {
+		if field.Annotations[metadatav1.ColumnsHiddenAnnotation] == "true" {
+			FieldFlagHidden.AddTo(&field.Flags)
+		}
+	}
+}
+
 func (ds *dataSource) AddField(name string, kind api.Kind, opts ...FieldOption) (FieldAccessor, error) {
 	ds.lock.Lock()
 	defer ds.lock.Unlock()
 
-	if _, ok := ds.fieldMap[name]; ok {
-		return nil, fmt.Errorf("field %q already exists", name)
-	}
-
 	nf := &field{
-		Name:     name,
-		FullName: name,
-		Index:    uint32(len(ds.fields)),
-		Kind:     kind,
+		Name:        name,
+		FullName:    name,
+		Index:       uint32(len(ds.fields)),
+		Kind:        kind,
+		Annotations: maps.Clone(defaultFieldAnnotations),
 	}
+	// Default to the index; options such as WithOrder or WithSameOrderAs may
+	// override it, including with 0.
+	nf.Order = int32(nf.Index)
 	for _, opt := range opts {
 		opt(nf)
+	}
+
+	if FieldFlagHasParent.In(nf.Flags) {
+		// resolve fullname
+		resolved, err := resolveNames(nf.Parent, ds.fields, 0)
+		if err != nil {
+			return nil, fmt.Errorf("resolving parent field %q: %w", nf.Name, err)
+		}
+		nf.FullName = resolved + "." + name
+	}
+
+	if _, ok := ds.fieldMap[nf.FullName]; ok {
+		return nil, fmt.Errorf("field %q already exists", name)
 	}
 
 	// Reserve new payload for non-empty fields
@@ -413,6 +546,8 @@ func (ds *dataSource) AddField(name string, kind api.Kind, opts ...FieldOption) 
 		nf.PayloadIndex = ds.payloadCount
 		ds.payloadCount++
 	}
+
+	ds.applyFieldConfig(nf)
 
 	ds.fields = append(ds.fields, nf)
 	ds.fieldMap[nf.FullName] = nf
@@ -423,11 +558,17 @@ func (ds *dataSource) GetField(name string) FieldAccessor {
 	ds.lock.RLock()
 	defer ds.lock.RUnlock()
 
-	f, ok := ds.fieldMap[name]
-	if !ok {
-		return nil
+	if f, ok := ds.fieldMap[name]; ok {
+		return &fieldAccessor{ds: ds, f: f}
 	}
-	return &fieldAccessor{ds: ds, f: f}
+
+	for existingName, f := range ds.fieldMap {
+		if strings.EqualFold(existingName, name) {
+			return &fieldAccessor{ds: ds, f: f}
+		}
+	}
+
+	return nil
 }
 
 func (ds *dataSource) GetFieldsWithTag(tag ...string) []FieldAccessor {
@@ -454,13 +595,30 @@ func (ds *dataSource) Subscribe(fn DataFunc, priority int) error {
 	ds.lock.Lock()
 	defer ds.lock.Unlock()
 
-	ds.subscriptionsData = append(ds.subscriptionsData, &subscriptionData{
-		priority: priority,
-		fn:       fn,
-	})
-	sort.SliceStable(ds.subscriptionsData, func(i, j int) bool {
-		return ds.subscriptionsData[i].priority < ds.subscriptionsData[j].priority
-	})
+	switch ds.Type() {
+	case TypeSingle:
+		ds.addSubscription(&subscription{priority: priority, fn: func(source DataSource, p Packet) error {
+			return fn(ds, p.(*data))
+		}})
+	case TypeArray:
+		ds.addSubscription(&subscription{priority: priority, fn: func(source DataSource, p Packet) error {
+			i := 0
+			alen := len(p.(*dataArray).DataArray)
+			for i < alen {
+				err := fn(ds, (*dataElement)(p.(*dataArray).DataArray[i]))
+				if err != nil {
+					if errors.Is(err, ErrDiscard) {
+						p.(*dataArray).DataArray = slices.Delete(p.(*dataArray).DataArray, i, i+1)
+						alen--
+						continue
+					}
+					return err
+				}
+				i++
+			}
+			return nil
+		}})
+	}
 
 	return nil
 }
@@ -477,14 +635,9 @@ func (ds *dataSource) SubscribeArray(fn ArrayFunc, priority int) error {
 	ds.lock.Lock()
 	defer ds.lock.Unlock()
 
-	ds.subscriptionsArray = append(ds.subscriptionsArray, &subscriptionArray{
-		priority: priority,
-		fn:       fn,
-	})
-	sort.SliceStable(ds.subscriptionsArray, func(i, j int) bool {
-		return ds.subscriptionsArray[i].priority < ds.subscriptionsArray[j].priority
-	})
-
+	ds.addSubscription(&subscription{priority: priority, fn: func(source DataSource, p Packet) error {
+		return fn(ds, p.(*dataArray))
+	}})
 	return nil
 }
 
@@ -496,53 +649,32 @@ func (ds *dataSource) SubscribePacket(fn PacketFunc, priority int) error {
 	ds.lock.Lock()
 	defer ds.lock.Unlock()
 
-	ds.subscriptionsPacket = append(ds.subscriptionsPacket, &subscriptionPacket{
-		priority: priority,
-		fn:       fn,
-	})
-	sort.SliceStable(ds.subscriptionsPacket, func(i, j int) bool {
-		return ds.subscriptionsPacket[i].priority < ds.subscriptionsPacket[j].priority
-	})
-
+	ds.addSubscription(&subscription{priority: priority, fn: func(source DataSource, p Packet) error {
+		return fn(ds, p)
+	}})
 	return nil
+}
+
+func (ds *dataSource) addSubscription(s *subscription) {
+	ds.subscriptions = append(ds.subscriptions, s)
+	sort.SliceStable(ds.subscriptions, func(i, j int) bool {
+		return ds.subscriptions[i].priority < ds.subscriptions[j].priority
+	})
 }
 
 func (ds *dataSource) EmitAndRelease(p Packet) error {
 	defer ds.Release(p)
 
-	switch ds.dType {
-	case TypeSingle:
-		for _, sub := range ds.subscriptionsData {
-			err := sub.fn(ds, p.(*data))
-			if err != nil {
-				return err
-			}
+	var err error
+	for _, s := range ds.subscriptions {
+		err = s.fn(ds, p)
+		if errors.Is(err, ErrDiscard) {
+			return nil
 		}
-	case TypeArray:
-		for _, sub := range ds.subscriptionsData {
-			for _, d := range p.(*dataArray).GetDataArray() {
-				err := sub.fn(ds, (*dataElement)(d))
-				if err != nil {
-					return err
-				}
-			}
-		}
-		for _, sub := range ds.subscriptionsArray {
-			err := sub.fn(ds, p.(*dataArray))
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	// Finally, send packet to packet-subscribers no matter the datasource type
-	for _, sub := range ds.subscriptionsPacket {
-		err := sub.fn(ds, p)
 		if err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
@@ -600,6 +732,35 @@ func (ds *dataSource) Fields() []*api.Field {
 	return res
 }
 
+func (ds *dataSource) CopyFieldsTo(out DataSource) error {
+	ds.lock.RLock()
+	defer ds.lock.RUnlock()
+
+	outDs, ok := out.(*dataSource)
+	if !ok {
+		return errors.New("invalid destination DataSource")
+	}
+
+	outDs.lock.Lock()
+	defer outDs.lock.Unlock()
+
+	if len(outDs.fields) == 0 {
+		outDs.fields = make([]*field, 0, len(ds.fields))
+		outDs.fieldMap = make(map[string]*field)
+	}
+
+	for _, f := range ds.fields {
+		msg := proto.Clone((*api.Field)(f))
+		nf, _ := msg.(*api.Field)
+		outDs.fields = append(outDs.fields, (*field)(nf))
+		if !FieldFlagUnreferenced.In(f.Flags) {
+			outDs.fieldMap[nf.FullName] = (*field)(nf)
+		}
+	}
+
+	return nil
+}
+
 func (ds *dataSource) Accessors(rootOnly bool) []FieldAccessor {
 	ds.lock.RLock()
 	defer ds.lock.RUnlock()
@@ -617,10 +778,16 @@ func (ds *dataSource) Accessors(rootOnly bool) []FieldAccessor {
 	return res
 }
 
-func (ds *dataSource) IsRequested() bool {
+func (ds *dataSource) Unreference() {
+	ds.lock.Lock()
+	defer ds.lock.Unlock()
+	ds.referenced = false
+}
+
+func (ds *dataSource) IsReferenced() bool {
 	ds.lock.RLock()
 	defer ds.lock.RUnlock()
-	return ds.requested
+	return ds.referenced
 }
 
 func (ds *dataSource) AddAnnotation(key, value string) {
@@ -629,10 +796,10 @@ func (ds *dataSource) AddAnnotation(key, value string) {
 	ds.annotations[key] = value
 }
 
-func (ds *dataSource) AddTag(tag string) {
+func (ds *dataSource) AddTags(tags ...string) {
 	ds.lock.Lock()
 	defer ds.lock.Unlock()
-	ds.tags = append(ds.tags, tag)
+	ds.tags = append(ds.tags, tags...)
 }
 
 func (ds *dataSource) Annotations() map[string]string {

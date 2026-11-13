@@ -1,0 +1,62 @@
+# This workflow mirrors few container images we use on the CI from Dockerhub to
+# ghcr.io to avoid pull rate limit issues. Images are mirrored to
+# ghcr.io/inspektor-gadget/ci/<image-name>.
+#
+# based on https://github.com/rblaine95/dockerhub-mirror/
+name: Mirror Dockerhub
+env:
+  REGISTRY: ghcr.io
+  CONTAINER_REPO: ${{ github.repository_owner }}
+  GO_VERSION: 1.26.10
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+permissions: read-all
+jobs:
+  mirror:
+    if: github.repository == 'inspektor-gadget/inspektor-gadget'
+    name: Mirror
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: busybox:latest
+            repo: docker.io/library
+          - image: gcc:latest
+            repo: docker.io/library
+          - image: nginx:latest
+            repo: docker.io/library
+          # Pinned to 3.13 (not the floating "3" tag): the OTel eBPF profiler
+          # only symbolizes CPython up to 3.14, so a newer default would break
+          # stack-symbolization tests. See maxVer in:
+          # https://github.com/open-telemetry/opentelemetry-ebpf-profiler/blob/1de801e979a36561ea1308533388dc61d1290150/interpreter/python/python.go#L796-L797
+          - image: python:3.13-slim
+            repo: docker.io/library
+          - image: registry:2
+            repo: docker.io/library
+          - image: network-multitool:latest
+            repo: docker.io/wbitt
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+            registry: ${{ env.REGISTRY }}
+            username: ${{ github.actor }}
+            password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+         go-version: ${{ env.GO_VERSION }}
+      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+      - name: Mirror
+        run: |
+          crane copy \
+            ${{ matrix.repo }}/${{ matrix.image }} \
+            ${REGISTRY}/${CONTAINER_REPO}/ci/${{ matrix.image }}

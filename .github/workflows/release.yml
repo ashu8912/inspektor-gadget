@@ -1,17 +1,29 @@
 name: Inspektor Gadget Release
+env:
+  REGISTRY: ghcr.io
 on:
   release:
     types: [published]
+
+permissions: read-all
 
 jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
+    permissions:
+      # This is needed by below action used to open PR:
+      # https://github.com/peter-evans/create-pull-request#token
+      contents: write
+      pull-requests: write
+      packages: write
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
     - name: Update new version in krew-index
       if: github.repository == 'inspektor-gadget/inspektor-gadget'
-      uses: rajatjindal/krew-release-bot@v0.0.46
+      uses: rajatjindal/krew-release-bot@c970b8a8f6dbc2f2285a26e3ae160903b87002c3 # v0.0.51
       with:
         workdir: /home/runner/work/inspektor-gadget/inspektor-gadget
         krew_template_file: .krew.yaml
@@ -24,9 +36,16 @@ jobs:
 
         echo "version=${inspektor_gadget_version}" >> $GITHUB_OUTPUT
 
+        DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
         for PKGFILE in $(find gadgets/ -name artifacthub-pkg.yml) ; do
+            # - The 'createdAt' field identifies the release date. It should not
+            #   be changed in between releases.
+            # - The 'digest' field is modified to request reindexing from
+            #   artifacthub. It is fine to modify it more often.
             sed -i \
                 -e "s/^version:.*$/version: ${inspektor_gadget_version}/" \
+                -e "s/^createdAt:.*$/createdAt: \"${DATE}\"/" \
+                -e "s/^digest:.*$/digest: \"${DATE}\"/" \
                 $PKGFILE
         done
 
@@ -37,10 +56,11 @@ jobs:
         echo "EOF" >> $GITHUB_OUTPUT
     - name: Create PR
       if: ${{ steps.bump_gadgets.outputs.changes != '' }}
-      uses: peter-evans/create-pull-request@v6
+      uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
         commit-message: 'Artifact Hub: Update gadgets version to v${{ steps.bump_gadgets.outputs.version }}'
+        signoff: true
         branch: 'auto_bump_gadgets_v${{ steps.bump_gadgets.outputs.version }}'
         base: main
         delete-branch: true
@@ -67,3 +87,20 @@ jobs:
           In case of problems, please check the logs in the [Artifact Hub control panel](https://artifacthub.io/control-panel).
 
           Best regards.
+    - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+    - name: Update latest tag
+      env:
+        IMAGE_TAG: ${{ github.event.release.tag_name }}
+        GADGET_TAG: ${{ github.event.release.tag_name }}
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        LATEST_TAG=$(gh release list --limit 1000 --json tagName | jq -r '.[].tagName' | sort -V | tail -n1)
+        echo "LATEST_TAG=$LATEST_TAG, CURRENT_IMAGE_TAG=$IMAGE_TAG"
+        if [ "$LATEST_TAG" = "$IMAGE_TAG" ]; then
+          make update-latest-tag
+        fi

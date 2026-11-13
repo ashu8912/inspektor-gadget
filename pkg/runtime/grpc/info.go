@@ -16,51 +16,29 @@ package grpcruntime
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"time"
 
-	"github.com/inspektor-gadget/inspektor-gadget/internal/deployinfo"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
 )
 
-// InitDeployInfo loads the locally stored deploy info. If no deploy info is stored locally,
-// it will try to fetch it from one of the remotes and store it locally. It will issue warnings on
-// failures.
-func (r *Runtime) InitDeployInfo() (*deployinfo.DeployInfo, error) {
-	// Initialize info
-	info, err := deployinfo.Load()
-	if err == nil {
-		r.info = info
-		return info, nil
-	}
+type Info struct {
+	Experimental  bool
+	ServerVersion string
 
-	info, err = r.loadRemoteDeployInfo()
-	if err != nil {
-		return nil, fmt.Errorf("loading gadget info from remote: %w", err)
-	}
-
-	r.info = info
-
-	err = deployinfo.Store(info)
-	if err != nil {
-		return nil, fmt.Errorf("storing gadget info: %w", err)
-	}
-
-	return info, nil
+	// ServerIsHostPidNs and ServerIsInitPidNs tell whether the gadget service
+	// runs in the host and initial PID namespaces. They are nil when the
+	// server could not determine them or is too old to report them.
+	ServerIsHostPidNs *bool
+	ServerIsInitPidNs *bool
 }
 
-func (r *Runtime) UpdateDeployInfo() error {
-	info, err := r.loadRemoteDeployInfo()
-	if err != nil {
-		return fmt.Errorf("loading remote gadget info: %w", err)
+func (r *Runtime) GetInfo() (*Info, error) {
+	if r.info != nil {
+		return r.info, nil
 	}
 
-	return deployinfo.Store(info)
-}
-
-func (r *Runtime) loadRemoteDeployInfo() (*deployinfo.DeployInfo, error) {
 	duration := r.globalParams.Get(ParamConnectionTimeout).AsUint()
 	if duration > math.MaxInt64 {
 		return nil, fmt.Errorf("duration (%d) exceeds math.MaxInt64 (%d)", duration, math.MaxInt64)
@@ -83,14 +61,11 @@ func (r *Runtime) loadRemoteDeployInfo() (*deployinfo.DeployInfo, error) {
 		return nil, fmt.Errorf("get info from gadget pod: %w", err)
 	}
 
-	retInfo := &deployinfo.DeployInfo{
-		Experimental:  info.Experimental,
-		ServerVersion: info.ServerVersion,
+	r.info = &Info{
+		Experimental:      info.Experimental,
+		ServerVersion:     info.ServerVersion,
+		ServerIsHostPidNs: info.ServerIsHostPidNs,
+		ServerIsInitPidNs: info.ServerIsInitPidNs,
 	}
-	err = json.Unmarshal(info.Catalog, &retInfo.Catalog)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshaling info: %w", err)
-	}
-
-	return retInfo, nil
+	return r.info, nil
 }

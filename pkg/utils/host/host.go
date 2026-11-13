@@ -27,8 +27,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
+
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 )
 
 var (
@@ -57,8 +60,11 @@ type Config struct {
 	AutoMountFilesystems bool
 }
 
+type ProcStat struct {
+	StartedAt types.Time
+}
+
 var (
-	autoSdUnitRestartFlag    bool
 	autoMountFilesystemsFlag bool
 	autoWSLWorkaroundFlag    bool
 
@@ -73,27 +79,6 @@ func Init(config Config) error {
 	// TODO: understand why we need to call Init() twice and fix it.
 	if initDone {
 		return nil
-	}
-
-	// Apply systemd workaround first because it might start a new process and
-	// exit before the other workarounds.
-	if autoSdUnitRestartFlag {
-		exit, err := autoSdUnitRestart()
-		if exit {
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "error: %v\n", err)
-				os.Exit(1)
-			}
-			os.Exit(0)
-		}
-		if err != nil {
-			return err
-		}
-	} else {
-		if err := suggestSdUnitRestart(); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
 	}
 
 	// The mount workaround could either be applied unconditionally (in the
@@ -135,19 +120,8 @@ func Init(config Config) error {
 
 // AddFlags adds CLI flags for various workarounds
 func AddFlags(command *cobra.Command) {
-	command.PersistentFlags().BoolVarP(
-		&autoSdUnitRestartFlag,
-		"auto-sd-unit-restart",
-		"",
-		false,
-		"Automatically run in a privileged systemd unit if lacking enough capabilities",
-	)
+	automountFilesystemsDefault := HostRoot != "" && HostRoot != "/"
 
-	// Enable the mount workaround by default when running inside a container.
-	automountFilesystemsDefault := false
-	if HostRoot != "" && HostRoot != "/" {
-		automountFilesystemsDefault = true
-	}
 	command.PersistentFlags().BoolVarP(
 		&autoMountFilesystemsFlag,
 		"auto-mount-filesystems",
@@ -174,4 +148,18 @@ func GetProcCmdline(pid int) []string {
 	pidStr := fmt.Sprint(pid)
 	cmdlineBytes, _ := os.ReadFile(filepath.Join(HostProcFs, pidStr, "cmdline"))
 	return strings.Split(string(cmdlineBytes), "\x00")
+}
+
+func GetProcStat(pid int) (ProcStat, error) {
+	var stat syscall.Stat_t
+	path := filepath.Join(HostProcFs, fmt.Sprint(pid))
+	if err := syscall.Stat(path, &stat); err != nil {
+		return ProcStat{}, fmt.Errorf("reading %s: %w", path, err)
+	}
+
+	mtim := stat.Mtim.Nano()
+
+	return ProcStat{
+		StartedAt: types.Time(mtim),
+	}, nil
 }

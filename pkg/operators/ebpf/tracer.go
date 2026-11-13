@@ -1,4 +1,4 @@
-// Copyright 2024 The Inspektor Gadget authors
+// Copyright 2024-2025 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,13 @@
 package ebpfoperator
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
@@ -26,20 +30,27 @@ import (
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
-	metadatav1 "github.com/inspektor-gadget/inspektor-gadget/pkg/metadata/v1"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
 )
 
 type Tracer struct {
-	metadatav1.Tracer
+	mapName    string
+	structName string
 
-	ds       datasource.DataSource
-	accessor datasource.FieldAccessor
+	ds              datasource.DataSource
+	accessor        datasource.FieldAccessor
+	restAccessor    datasource.FieldAccessor
+	restLenAccessor datasource.FieldAccessor
 
 	mapType       ebpf.MapType
 	eventSize     uint32 // needed to trim trailing bytes when reading for perf event array
+	lostSampleMap *ebpf.Map
 	ringbufReader *ringbuf.Reader
 	perfReader    *perf.Reader
+	slowBuf       []byte
+	logger        logger.Logger
+	done          chan struct{}
 }
 
 func validateTracerMap(traceMap *ebpf.MapSpec) error {
@@ -47,6 +58,22 @@ func validateTracerMap(traceMap *ebpf.MapSpec) error {
 		return fmt.Errorf("map %q has a wrong type, expected: ringbuf or perf event array, got: %s",
 			traceMap.Name, traceMap.Type.String())
 	}
+	return nil
+}
+
+// fixTracerMap updates the tracer map type in case ringbuf is not available.
+func (i *ebpfInstance) fixTracerMap(t btf.Type, varName string) error {
+	bufMap, ok := i.collectionSpec.Maps[varName]
+	if !ok {
+		return fmt.Errorf("map %q not found in eBPF object", varName)
+	}
+
+	if !isRingbufAvailable() {
+		bufMap.Type = ebpf.PerfEventArray
+		bufMap.KeySize = 4
+		bufMap.ValueSize = 4
+	}
+
 	return nil
 }
 
@@ -66,24 +93,6 @@ func (i *ebpfInstance) populateTracer(t btf.Type, varName string) error {
 	i.logger.Debugf("> map name   : %q", mapName)
 	i.logger.Debugf("> struct name: %q", structName)
 
-	tracerConfig := i.config.Sub("tracers." + name)
-	if tracerConfig != nil {
-		if configMapName := tracerConfig.GetString("mapName"); configMapName != "" && configMapName != mapName {
-			return fmt.Errorf("validating tracer %q: mapName %q in eBPF program does not match %q from metadata file",
-				name, configMapName, mapName)
-		}
-		if configStructName := tracerConfig.GetString("structName"); configStructName != "" && configStructName != structName {
-			return fmt.Errorf("validating tracer %q: structName %q in eBPF program does not match %q from metadata file",
-				name, configStructName, structName)
-		}
-		i.logger.Debugf("> successfully validated with metadata")
-	}
-
-	if _, ok := i.tracers[name]; ok {
-		i.logger.Debugf("tracer %q already defined, skipping", name)
-		return nil
-	}
-
 	tracerMap, ok := i.collectionSpec.Maps[mapName]
 	if !ok {
 		return fmt.Errorf("map %q not found in eBPF object", mapName)
@@ -100,11 +109,10 @@ func (i *ebpfInstance) populateTracer(t btf.Type, varName string) error {
 
 	i.logger.Debugf("adding tracer %q", name)
 	i.tracers[name] = &Tracer{
-		Tracer: metadatav1.Tracer{
-			MapName:    mapName,
-			StructName: btfStruct.Name,
-		},
-		eventSize: btfStruct.Size,
+		mapName:    mapName,
+		structName: btfStruct.Name,
+		eventSize:  btfStruct.Size,
+		done:       make(chan struct{}),
 	}
 
 	err := i.populateStructDirect(btfStruct)
@@ -115,112 +123,183 @@ func (i *ebpfInstance) populateTracer(t btf.Type, varName string) error {
 	return nil
 }
 
-func (t *Tracer) receiveEvents(gadgetCtx operators.GadgetContext) error {
+func (t *Tracer) receiveEvents(gadgetCtx operators.GadgetContext, wg *sync.WaitGroup) error {
+	defer wg.Done()
+
+	var readCb func() (data []byte, lost uint64, err error)
+
+	cpus, err := ebpf.PossibleCPU()
+	if err != nil {
+		return fmt.Errorf("getting eBPF possibles CPUs: %w", err)
+	}
+
 	switch t.mapType {
 	case ebpf.RingBuf:
-		return t.receiveEventsFromRingReader(gadgetCtx)
+		var rec ringbuf.Record
+		lostSamples := uint64(0)
+
+		if t.lostSampleMap != nil {
+			readLostSamples := func() {
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-t.done:
+						return
+					case <-ticker.C:
+					}
+
+					// Ring buffer does not report the number of lost samples. For this,
+					// we have a specific map, for each ring buffer, which store the
+					// number of lost samples when gadget_reserve_buf() is used.
+					// We periodically read this map to know the number of lost samples
+					// for this period. The next time the ring buffer will be read, the
+					// number of lost samples will be reported and reset until next period.
+					readValues := make([]uint64, cpus)
+					zeroValues := make([]uint64, cpus)
+					zero := uint32(0)
+
+					err := t.lostSampleMap.Lookup(&zero, readValues)
+					if err != nil {
+						t.logger.Warnf("getting lost samples: %v", err)
+
+						continue
+					}
+
+					err = t.lostSampleMap.Update(&zero, zeroValues, ebpf.UpdateExist)
+					if err != nil {
+						t.logger.Warnf("resetting lost samples: %v", err)
+
+						continue
+					}
+
+					sum := uint64(0)
+					for i := range readValues {
+						sum += readValues[i]
+					}
+					atomic.StoreUint64(&lostSamples, sum)
+				}
+			}
+
+			go readLostSamples()
+		}
+
+		readCb = func() ([]byte, uint64, error) {
+			err := t.ringbufReader.ReadInto(&rec)
+			return rec.RawSample, atomic.SwapUint64(&lostSamples, 0), err
+		}
 	case ebpf.PerfEventArray:
-		return t.receiveEventsFromPerfReader(gadgetCtx)
+		var rec perf.Record
+		readCb = func() ([]byte, uint64, error) {
+			err := t.perfReader.ReadInto(&rec)
+			return rec.RawSample, rec.LostSamples, err
+		}
 	default:
 		return fmt.Errorf("invalid map type")
 	}
-}
 
-func (t *Tracer) receiveEventsFromRingReader(gadgetCtx operators.GadgetContext) error {
-	slowBuf := make([]byte, t.eventSize)
-	lastSlowLen := 0
+	t.slowBuf = make([]byte, t.eventSize)
 	for {
-		rec, err := t.ringbufReader.Read()
+		sample, lost, err := readCb()
 		if err != nil {
-			return err
-		}
-		pSingle, err := t.ds.NewPacketSingle()
-		if err != nil {
-			gadgetCtx.Logger().Warnf("error creating new packet: %v", err)
-			continue
-		}
-		sample := rec.RawSample
-		if uint32(len(rec.RawSample)) < t.eventSize {
-			// event is truncated; we need to copy
-			copy(slowBuf, rec.RawSample)
-
-			// zero difference; TODO: improve
-			if len(rec.RawSample) < lastSlowLen {
-				for i := len(rec.RawSample); i < lastSlowLen; i++ {
-					slowBuf[i] = 0
-				}
+			if errors.Is(err, os.ErrClosed) {
+				return err
 			}
-			lastSlowLen = len(rec.RawSample)
-			sample = slowBuf
-		}
-		err = t.accessor.Set(pSingle, sample)
-		if err != nil {
-			gadgetCtx.Logger().Warnf("error setting buffer: %v", err)
-			t.ds.Release(pSingle)
+			gadgetCtx.Logger().Warnf("error reading event: %v", err)
 			continue
 		}
-		err = t.ds.EmitAndRelease(pSingle)
-		if err != nil {
-			gadgetCtx.Logger().Warnf("error emitting data: %v", err)
+
+		if lost > 0 {
+			gadgetCtx.Logger().Warnf("reading event: lost %d samples", lost)
+			t.ds.ReportLostData(lost)
+			continue
+		}
+
+		if err := t.processEvent(gadgetCtx, sample); err != nil {
+			gadgetCtx.Logger().Warnf("error processing event: %v", err)
+			continue
 		}
 	}
 }
 
-func (t *Tracer) receiveEventsFromPerfReader(gadgetCtx operators.GadgetContext) error {
-	slowBuf := make([]byte, t.eventSize)
-	lastSlowLen := 0
-	for {
-		rec, err := t.perfReader.Read()
-		if err != nil {
-			return err
-		}
-		pSingle, err := t.ds.NewPacketSingle()
-		if err != nil {
-			gadgetCtx.Logger().Warnf("error creating new packet: %v", err)
-			continue
-		}
-		sample := rec.RawSample
-		sampleLen := len(rec.RawSample)
-		if uint32(sampleLen) < t.eventSize {
-			// event is truncated; we need to copy
-			copy(slowBuf, rec.RawSample)
+func (t *Tracer) processEvent(gadgetCtx operators.GadgetContext, fullSample []byte) error {
+	pSingle, err := t.ds.NewPacketSingle()
+	if err != nil {
+		return fmt.Errorf("creating new packet: %w", err)
+	}
 
-			// zero difference; TODO: improve
-			if sampleLen < lastSlowLen {
-				for i := sampleLen; i < lastSlowLen; i++ {
-					slowBuf[i] = 0
-				}
+	sample := fullSample
+	sampleLen := uint32(len(fullSample))
+	if sampleLen < t.eventSize {
+		// event is truncated; we need to copy
+		copy(t.slowBuf, fullSample)
+
+		// zero difference; TODO: improve
+		for i := len(fullSample); i < int(t.eventSize); i++ {
+			t.slowBuf[i] = 0
+		}
+		sample = t.slowBuf
+	} else if sampleLen > t.eventSize {
+		// event has trailing garbage, remove it
+		sample = sample[:t.eventSize]
+	}
+
+	if err := t.accessor.Set(pSingle, sample); err != nil {
+		t.ds.Release(pSingle)
+		return fmt.Errorf("setting buffer: %w", err)
+	}
+
+	if t.restAccessor != nil && sampleLen > t.eventSize {
+		xlen := sampleLen - t.eventSize
+
+		if t.restLenAccessor != nil {
+			// Read length
+			xlen, err = t.restLenAccessor.Uint32(pSingle)
+			if err != nil {
+				return fmt.Errorf("getting rest length: %w", err)
 			}
-			lastSlowLen = sampleLen
-			sample = slowBuf
-		} else if uint32(sampleLen) > t.eventSize {
-			// event has trailing garbage, remove it
-			sample = sample[:t.eventSize]
+
+			// Compare against the available trailing bytes directly.
+			// sampleLen > t.eventSize holds in this branch, so the
+			// subtraction cannot underflow; computing t.eventSize+xlen
+			// instead would overflow uint32 for an xlen coming from user
+			// data near 2^32 and let the guard pass.
+			if xlen > sampleLen-t.eventSize {
+				return fmt.Errorf("rest length %d is larger than data length %d - event size %d",
+					xlen, sampleLen, t.eventSize)
+			}
 		}
-		err = t.accessor.Set(pSingle, sample)
-		if err != nil {
-			gadgetCtx.Logger().Warnf("error setting buffer: %v", err)
-			t.ds.Release(pSingle)
-			continue
-		}
-		err = t.ds.EmitAndRelease(pSingle)
-		if err != nil {
-			gadgetCtx.Logger().Warnf("error emitting data: %v", err)
-		}
-		if rec.LostSamples > 0 {
-			t.ds.ReportLostData(rec.LostSamples)
-		}
+
+		t.restAccessor.Set(pSingle, fullSample[t.eventSize:t.eventSize+xlen])
+	}
+
+	if err := t.ds.EmitAndRelease(pSingle); err != nil {
+		return fmt.Errorf("emitting data: %w", err)
+	}
+
+	return nil
+}
+
+func (t *Tracer) close() {
+	if t.done != nil {
+		close(t.done)
+	}
+	if t.ringbufReader != nil {
+		t.ringbufReader.Close()
+	}
+	if t.perfReader != nil {
+		t.perfReader.Close()
 	}
 }
 
 func (i *ebpfInstance) runTracer(gadgetCtx operators.GadgetContext, tracer *Tracer) error {
-	if tracer.MapName == "" {
+	if tracer.mapName == "" {
 		return fmt.Errorf("tracer map name empty")
 	}
 
-	m, ok := i.collection.Maps[tracer.MapName]
+	m, ok := i.collection.Maps[tracer.mapName]
 	if !ok {
-		return fmt.Errorf("looking up tracer map %q: not found", tracer.MapName)
+		return fmt.Errorf("looking up tracer map %q: not found", tracer.mapName)
 	}
 
 	tracer.mapType = m.Type()
@@ -228,27 +307,35 @@ func (i *ebpfInstance) runTracer(gadgetCtx operators.GadgetContext, tracer *Trac
 	var err error
 	switch m.Type() {
 	case ebpf.RingBuf:
-		i.logger.Debugf("creating ringbuf reader for map %q", tracer.MapName)
+		i.logger.Debugf("creating ringbuf reader for map %q", tracer.mapName)
 		tracer.ringbufReader, err = ringbuf.NewReader(m)
+
+		lostSamplesMapName := tracer.mapName + "_lost_samples"
+		lostSamplesMap, ok := i.collection.Maps[lostSamplesMapName]
+		if !ok {
+			i.logger.Warnf("looking up lost sample map %q: not found; ring buffer lost samples will not be reported.", lostSamplesMapName)
+		}
+		tracer.lostSampleMap = lostSamplesMap
+		tracer.logger = i.logger
 	case ebpf.PerfEventArray:
-		i.logger.Debugf("creating perf reader for map %q", tracer.MapName)
+		i.logger.Debugf("creating perf reader for map %q", tracer.mapName)
 		tracer.perfReader, err = perf.NewReader(m, gadgets.PerfBufferPages*os.Getpagesize())
 	default:
-		return fmt.Errorf("unknown type for tracer map %q", tracer.MapName)
+		return fmt.Errorf("unknown type for tracer map %q", tracer.mapName)
 	}
 	if err != nil {
 		return fmt.Errorf("creating BPF map reader: %w", err)
 	}
 
-	go tracer.receiveEvents(gadgetCtx)
-
-	<-gadgetCtx.Context().Done()
-
-	if tracer.ringbufReader != nil {
-		tracer.ringbufReader.Close()
+	// TODO: freezing ringbuf doesn't work: "device or resource busy"
+	if m.Type() == ebpf.PerfEventArray {
+		if err := gadgets.FreezeMaps(m); err != nil {
+			return err
+		}
 	}
-	if tracer.perfReader != nil {
-		tracer.perfReader.Close()
-	}
+
+	i.wg.Add(1)
+	go tracer.receiveEvents(gadgetCtx, &i.wg)
+
 	return nil
 }

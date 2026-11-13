@@ -17,8 +17,10 @@ package oci
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/cilium/ebpf"
 	log "github.com/sirupsen/logrus"
@@ -51,7 +53,7 @@ func getAnySpec(opts *BuildGadgetImageOpts) (*ebpf.CollectionSpec, error) {
 	}
 
 	if progPath == "" {
-		return nil, fmt.Errorf("no eBPF object file found")
+		return nil, fmt.Errorf("no eBPF object file found: %w", os.ErrNotExist)
 	}
 
 	progContent, err := os.ReadFile(progPath)
@@ -75,7 +77,7 @@ func validateMetadataFile(ctx context.Context, opts *BuildGadgetImageOpts) error
 	}
 
 	spec, err := getAnySpec(opts)
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("loading spec: %w", err)
 	}
 
@@ -130,7 +132,7 @@ func createOrUpdateMetadataFile(ctx context.Context, opts *BuildGadgetImageOpts)
 
 	// fix owner of created metadata file
 	if !update {
-		if err := fixOwner(opts.MetadataPath, opts.EBPFSourcePath); err != nil {
+		if err := copyFileOwner(filepath.Dir(opts.MetadataPath), opts.MetadataPath); err != nil {
 			log.Warnf("Failed to fix metadata file owner: %v", err)
 		}
 	}

@@ -16,13 +16,36 @@ package types
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/columns"
 )
 
 type EventType string
+
+// ValidateContainerID rejects container IDs that are unsafe to use in logs,
+// paths, or runtime metadata. It uses the same rules as runc's validateID():
+// a non-empty string of [A-Za-z0-9_+-.] that is usable as a file name.
+func ValidateContainerID(containerID string) error {
+	if containerID == "" {
+		return errors.New("container ID is empty")
+	}
+	if strings.ContainsFunc(containerID, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') &&
+			r != '_' && r != '+' && r != '-' && r != '.'
+	}) {
+		return fmt.Errorf("container ID %q contains invalid characters", containerID)
+	}
+	// Reject IDs that cannot be used as a file name, such as "." and "..".
+	if "/"+containerID != path.Clean("/"+containerID) {
+		return fmt.Errorf("container ID %q is not usable as a file name", containerID)
+	}
+	return nil
+}
 
 var node string
 
@@ -33,8 +56,11 @@ func init() {
 	columns.MustRegisterTemplate("namespace", "width:30")
 	columns.MustRegisterTemplate("pod", "width:30,ellipsis:middle")
 	columns.MustRegisterTemplate("container", "width:30")
+	columns.MustRegisterTemplate("containerPid", "width:6,hide")
 	columns.MustRegisterTemplate("containerImageName", "width:30")
 	columns.MustRegisterTemplate("containerImageDigest", "width:30")
+	columns.MustRegisterTemplate("containerImageID", "width:30")
+	columns.MustRegisterTemplate("containerStartedAt", "width:35,hide")
 	columns.MustRegisterTemplate("comm", "maxWidth:16")
 	columns.MustRegisterTemplate("pid", "minWidth:7")
 	columns.MustRegisterTemplate("uid", "minWidth:8")
@@ -57,10 +83,6 @@ func init() {
 	columns.MustRegisterTemplate("syscall", "width:18,maxWidth:28")
 }
 
-func Init(nodeName string) {
-	node = nodeName
-}
-
 type Time int64
 
 func (t Time) String() string {
@@ -74,6 +96,7 @@ type EndpointKind string
 const (
 	EndpointKindPod     EndpointKind = "pod"
 	EndpointKindService EndpointKind = "svc"
+	EndpointKindHost    EndpointKind = "host"
 	EndpointKindRaw     EndpointKind = "raw"
 )
 
@@ -109,6 +132,9 @@ type Container interface {
 	K8sMetadata() *BasicK8sMetadata
 	RuntimeMetadata() *BasicRuntimeMetadata
 	UsesHostNetwork() bool
+	K8sOwnerReference() *K8sOwnerReference
+	ContainerPid() uint32
+	K8sPodLabelsAsString() string
 }
 
 type BasicRuntimeMetadata struct {
@@ -125,8 +151,11 @@ type BasicRuntimeMetadata struct {
 	// response with multiple containers, ContainerName contains only the first element.
 	ContainerName string `json:"containerName,omitempty" column:"containerName,template:container"`
 
+	// ContainerPID is the process ID of the first process in the container.
+	ContainerPID uint32 `json:"containerPid,omitempty" column:"containerPid,template:containerPid"`
+
 	// ContainerImageName is the name of the container image where the event comes from
-	// i.e. docker.io/library/busybox:latest
+	// i.e. ghcr.io/inspektor-gadget/ci/busybox:latest
 	// Sometimes the image name is not provided by the runtime (i.e. Docker), then ContainerImageName
 	// is the imageID
 	// i.e. sha256:6e38f40d628db3002f5617342c8872c935de530d867d0f709a2fbda1a302a562
@@ -134,10 +163,16 @@ type BasicRuntimeMetadata struct {
 	// i.e. 6e38f40d628d, when truncated
 	ContainerImageName string `json:"containerImageName,omitempty" column:"containerImageName,hide"`
 
+	// ContainerImageID is the runtime-provided image ID (opaque to users)
+	ContainerImageID string `json:"containerImageId,omitempty" column:"containerImageID,hide"`
+
 	// ContainerImageDigest is the (repo) digest of the container image where the event comes from
 	// containerd: events from both initial and new containers are enriched
 	// crio: events from initial containers are enriched
 	ContainerImageDigest string `json:"containerImageDigest,omitempty" column:"containerImageDigest,hide"`
+
+	// ContainerStartedAt is the unix timestamp at which the container was started at
+	ContainerStartedAt Time `json:"containerStartedAt,omitempty" column:"containerStartedAt,template:timestamp,stringer,hide"`
 }
 
 func (b *BasicRuntimeMetadata) IsEnriched() bool {
@@ -146,9 +181,14 @@ func (b *BasicRuntimeMetadata) IsEnriched() bool {
 
 type BasicK8sMetadata struct {
 	Namespace     string            `json:"namespace,omitempty" column:"namespace,template:namespace"`
-	PodName       string            `json:"podName,omitempty" column:"pod,template:pod"`
+	PodName       string            `json:"podName,omitempty" column:"podName,template:pod"`
 	PodLabels     map[string]string `json:"podLabels,omitempty" column:"labels,hide"`
-	ContainerName string            `json:"containerName,omitempty" column:"container,template:container"`
+	ContainerName string            `json:"containerName,omitempty" column:"containerName,template:container"`
+}
+
+type K8sOwnerReference struct {
+	Kind string `json:"kind,omitempty" column:"kind,hide"`
+	Name string `json:"name,omitempty" column:"name,hide"`
 }
 
 func (b *BasicK8sMetadata) IsEnriched() bool {
@@ -162,6 +202,8 @@ type K8sMetadata struct {
 
 	// HostNetwork is true if the container uses the host network namespace
 	HostNetwork bool `json:"hostNetwork,omitempty" column:"hostnetwork,hide"`
+
+	Owner K8sOwnerReference `json:"owner,omitempty" column:"owner,hide"`
 }
 
 type CommonData struct {
@@ -174,56 +216,46 @@ type CommonData struct {
 	K8s K8sMetadata `json:"k8s,omitempty" column:"k8s" columnTags:"kubernetes"`
 }
 
-func (c *CommonData) SetNode(node string) {
-	c.K8s.Node = node
-}
+func (k *K8sMetadata) UnmarshalJSON(data []byte) error {
+	type Alias K8sMetadata
+	aux := &struct {
+		PodLabels interface{} `json:"podLabels,omitempty"`
+		*Alias
+	}{
+		Alias: (*Alias)(k),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
 
-func (c *CommonData) SetPodMetadata(container Container) {
-	k8s := container.K8sMetadata()
-	runtime := container.RuntimeMetadata()
+	if aux.PodLabels == nil {
+		return nil
+	}
 
-	c.K8s.PodName = k8s.PodName
-	c.K8s.Namespace = k8s.Namespace
-	c.K8s.PodLabels = k8s.PodLabels
+	switch v := aux.PodLabels.(type) {
+	case string:
+		podLabels, err := parsePodLabels(v)
+		if err != nil {
+			return err
+		}
+		k.PodLabels = podLabels
+	case map[string]interface{}:
+		podLabels := make(map[string]string)
+		for key, value := range v {
+			strVal, ok := value.(string)
+			if !ok {
+				return fmt.Errorf("invalid value type for key %s in PodLabels", key)
+			}
+			podLabels[key] = strVal
+		}
+		if len(podLabels) != 0 {
+			k.PodLabels = podLabels
+		}
+	default:
+		return fmt.Errorf("unexpected type for PodLabels: %T", v)
+	}
 
-	// All containers in the same pod share the same container runtime
-	c.Runtime.RuntimeName = runtime.RuntimeName
-}
-
-func (c *CommonData) SetContainerMetadata(container Container) {
-	k8s := container.K8sMetadata()
-	runtime := container.RuntimeMetadata()
-
-	c.K8s.ContainerName = k8s.ContainerName
-	c.K8s.PodName = k8s.PodName
-	c.K8s.Namespace = k8s.Namespace
-	c.K8s.PodLabels = k8s.PodLabels
-
-	c.Runtime.RuntimeName = runtime.RuntimeName
-	c.Runtime.ContainerName = runtime.ContainerName
-	c.Runtime.ContainerID = runtime.ContainerID
-	c.Runtime.ContainerImageName = runtime.ContainerImageName
-	c.Runtime.ContainerImageDigest = runtime.ContainerImageDigest
-}
-
-func (c *CommonData) GetNode() string {
-	return c.K8s.Node
-}
-
-func (c *CommonData) GetPod() string {
-	return c.K8s.PodName
-}
-
-func (c *CommonData) GetNamespace() string {
-	return c.K8s.Namespace
-}
-
-func (c *CommonData) GetContainer() string {
-	return c.K8s.ContainerName
-}
-
-func (c *CommonData) GetContainerImageName() string {
-	return c.Runtime.ContainerImageName
+	return nil
 }
 
 type L3Endpoint struct {
@@ -231,27 +263,16 @@ type L3Endpoint struct {
 	Addr    string `json:"addr,omitempty" column:"addr,hide,template:ipaddr"`
 	Version uint8  `json:"version,omitempty" column:"v,hide,template:ipversion"`
 
-	// Namespace, Name, Kind and PodLabels get populated by the KubeIPResolver operator
+	// Namespace, Name, Node, Kind and PodLabels get populated by the KubeIPResolver operator
 	Namespace string            `json:"namespace,omitempty" column:"ns,template:namespace,hide"`
 	Name      string            `json:"podname,omitempty" column:"name,hide"`
+	Node      string            `json:"node,omitempty" column:"node,template:node,hide"`
 	Kind      EndpointKind      `json:"kind,omitempty" column:"kind,hide"`
 	PodLabels map[string]string `json:"podlabels,omitempty" column:"podLabels,hide"`
-}
 
-func (e *L3Endpoint) String() string {
-	switch e.Kind {
-	case EndpointKindPod:
-		return "p/" + e.Namespace + "/" + e.Name
-	case EndpointKindService:
-		return "s/" + e.Namespace + "/" + e.Name
-	case EndpointKindRaw:
-		return "r/" + e.Addr
-	default:
-		if e.Version == 6 {
-			return "[" + e.Addr + "]"
-		}
-		return e.Addr
-	}
+	// PodSelector contains the service's spec.selector when Kind is
+	// EndpointKindService. It holds the labels that select the backing pods
+	PodSelector map[string]string `json:"podSelector,omitempty" column:"podSelector,hide"`
 }
 
 type L4Endpoint struct {
@@ -259,38 +280,6 @@ type L4Endpoint struct {
 	// Port and Proto are filled by the gadget
 	Port  uint16 `json:"port" column:"port,hide,template:ipport"`
 	Proto uint16 `json:"proto,omitempty" column:"proto,hide,width:4"`
-}
-
-func (e *L4Endpoint) String() string {
-	return e.L3Endpoint.String() + ":" + fmt.Sprint(e.Port)
-}
-
-func MustAddVirtualL4EndpointColumn[Event any](
-	cols *columns.Columns[Event],
-	attr columns.Attributes,
-	getEndpoint func(*Event) L4Endpoint,
-) {
-	cols.MustAddColumn(
-		attr,
-		func(e *Event) any {
-			endpoint := getEndpoint(e)
-			return endpoint.String()
-		},
-	)
-}
-
-func MustAddVirtualL3EndpointColumn[Event any](
-	cols *columns.Columns[Event],
-	attr columns.Attributes,
-	getEndpoint func(*Event) L3Endpoint,
-) {
-	cols.MustAddColumn(
-		attr,
-		func(e *Event) any {
-			endpoint := getEndpoint(e)
-			return endpoint.String()
-		},
-	)
 }
 
 const (
@@ -314,102 +303,19 @@ const (
 	READY EventType = "ready"
 )
 
-type Event struct {
-	CommonData
-
-	// Timestamp in nanoseconds since January 1, 1970 UTC. An int64 is big
-	// enough to represent time between the year 1678 and 2262.
-	Timestamp Time `json:"timestamp,omitempty" column:"timestamp,template:timestamp,stringer"`
-
-	// Type indicates the kind of this event
-	Type EventType `json:"type"`
-
-	// Message when Type is ERR, WARN, DEBUG or INFO
-	Message string `json:"message,omitempty"`
-}
-
-// GetBaseEvent is needed to implement commonutils.BaseElement and
-// snapshot.SnapshotEvent interfaces.
-func (e Event) GetBaseEvent() *Event {
-	return &e
-}
-
-func (e *Event) GetType() EventType {
-	return e.Type
-}
-
-func (e *Event) GetMessage() string {
-	return e.Message
-}
-
-func Err(msg string) Event {
-	return Event{
-		CommonData: CommonData{
-			K8s: K8sMetadata{
-				Node: node,
-			},
-		},
-		Type:    ERR,
-		Message: msg,
+// parsePodLabels parses the podLabels string into a map
+func parsePodLabels(s string) (map[string]string, error) {
+	if s == "" {
+		return nil, nil
 	}
-}
-
-func Warn(msg string) Event {
-	return Event{
-		CommonData: CommonData{
-			K8s: K8sMetadata{
-				Node: node,
-			},
-		},
-		Type:    WARN,
-		Message: msg,
+	labels := map[string]string{}
+	pairs := strings.Split(s, ",")
+	for _, pair := range pairs {
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("invalid pod labels format: expected key=value, got %s", pair)
+		}
+		labels[kv[0]] = kv[1]
 	}
-}
-
-func Debug(msg string) Event {
-	return Event{
-		CommonData: CommonData{
-			K8s: K8sMetadata{
-				Node: node,
-			},
-		},
-		Type:    DEBUG,
-		Message: msg,
-	}
-}
-
-func Info(msg string) Event {
-	return Event{
-		CommonData: CommonData{
-			K8s: K8sMetadata{
-				Node: node,
-			},
-		},
-		Type:    INFO,
-		Message: msg,
-	}
-}
-
-func EventString(i interface{}) string {
-	b, err := json.Marshal(i)
-	if err != nil {
-		return fmt.Sprintf("error marshaling event: %s\n", err)
-	}
-	return string(b)
-}
-
-type WithMountNsID struct {
-	MountNsID uint64 `json:"mountnsid,omitempty" column:"mntns,template:ns"`
-}
-
-func (e *WithMountNsID) GetMountNSID() uint64 {
-	return e.MountNsID
-}
-
-type WithNetNsID struct {
-	NetNsID uint64 `json:"netnsid,omitempty" column:"netns,template:ns"`
-}
-
-func (e *WithNetNsID) GetNetNSID() uint64 {
-	return e.NetNsID
+	return labels, nil
 }

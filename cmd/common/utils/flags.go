@@ -22,6 +22,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
 	runtimeclient "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/runtime-client"
@@ -148,11 +149,11 @@ func AddRegistryAuthVariablesAndFlags(cmd *cobra.Command, authOptions *oci.AuthO
 	viper.BindPFlag("registry.auth_file", cmd.Flags().Lookup("authfile"))
 	viper.BindEnv("registry.auth_file", "REGISTRY_AUTH_FILE")
 
-	cmd.Flags().BoolVar(
-		&authOptions.Insecure,
-		"insecure",
-		false,
-		"Allow connections to HTTP only registries",
+	cmd.Flags().StringSliceVar(
+		&authOptions.InsecureRegistries,
+		"insecure-registries",
+		[]string{},
+		"List of registries to access over plain HTTP",
 	)
 }
 
@@ -162,7 +163,11 @@ func removeSplitSortArgs(args []string) []string {
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--sort" {
 			// Remove also the next element as it is the arg of --sort
-			return append(args[:i], args[i+2:]...)
+			if i == len(args)-1 {
+				return args[:len(args)-1]
+			} else {
+				return append(args[:i], args[i+2:]...)
+			}
 		}
 	}
 	return args
@@ -195,4 +200,10 @@ func ParseEarlyFlags(cmd *cobra.Command, rawArgs []string) error {
 	args = removeHelpArg(args)
 	err := cmd.ParseFlags(args)
 	return err
+}
+
+func CopyFlagSet(fs *pflag.FlagSet) *pflag.FlagSet {
+	flags := pflag.NewFlagSet("", pflag.ContinueOnError)
+	flags.AddFlagSet(fs)
+	return flags
 }

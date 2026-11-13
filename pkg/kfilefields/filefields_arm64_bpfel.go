@@ -12,6 +12,17 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	filefieldsMapIgFileFields  = "ig_file_fields"
+	filefieldsProgIgFgetX      = "ig_fget_x"
+	filefieldsProgIgScmSndE    = "ig_scm_snd_e"
+	filefieldsVarSocketIno     = "socket_ino"
+	filefieldsVarTracerPidTgid = "tracer_pid_tgid"
+)
+
 // loadFilefields returns the embedded CollectionSpec for filefields.
 func loadFilefields() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_FilefieldsBytes)
@@ -32,7 +43,7 @@ func loadFilefields() (*ebpf.CollectionSpec, error) {
 //	*filefieldsMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadFilefieldsObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadFilefieldsObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadFilefields()
 	if err != nil {
 		return err
@@ -47,9 +58,10 @@ func loadFilefieldsObjects(obj interface{}, opts *ebpf.CollectionOptions) error 
 type filefieldsSpecs struct {
 	filefieldsProgramSpecs
 	filefieldsMapSpecs
+	filefieldsVariableSpecs
 }
 
-// filefieldsSpecs contains programs before they are loaded into the kernel.
+// filefieldsProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type filefieldsProgramSpecs struct {
@@ -64,12 +76,21 @@ type filefieldsMapSpecs struct {
 	IgFileFields *ebpf.MapSpec `ebpf:"ig_file_fields"`
 }
 
+// filefieldsVariableSpecs contains global variables before they are loaded into the kernel.
+//
+// It can be passed ebpf.CollectionSpec.Assign.
+type filefieldsVariableSpecs struct {
+	SocketIno     *ebpf.VariableSpec `ebpf:"socket_ino"`
+	TracerPidTgid *ebpf.VariableSpec `ebpf:"tracer_pid_tgid"`
+}
+
 // filefieldsObjects contains all objects after they have been loaded into the kernel.
 //
 // It can be passed to loadFilefieldsObjects or ebpf.CollectionSpec.LoadAndAssign.
 type filefieldsObjects struct {
 	filefieldsPrograms
 	filefieldsMaps
+	filefieldsVariables
 }
 
 func (o *filefieldsObjects) Close() error {
@@ -90,6 +111,14 @@ func (m *filefieldsMaps) Close() error {
 	return _FilefieldsClose(
 		m.IgFileFields,
 	)
+}
+
+// filefieldsVariables contains all global variables after they have been loaded into the kernel.
+//
+// It can be passed to loadFilefieldsObjects or ebpf.CollectionSpec.LoadAndAssign.
+type filefieldsVariables struct {
+	SocketIno     *ebpf.Variable `ebpf:"socket_ino"`
+	TracerPidTgid *ebpf.Variable `ebpf:"tracer_pid_tgid"`
 }
 
 // filefieldsPrograms contains all programs after they have been loaded into the kernel.

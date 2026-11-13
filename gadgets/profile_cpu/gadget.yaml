@@ -1,0 +1,81 @@
+name: profile cpu
+description: The profile cpu gadget takes samples of the stack traces.
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/profile_cpu
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/profile_cpu
+programs:
+  profiler:
+    perf:
+      type: software
+      config: count_sw_cpu_clock
+      sampleType: sample_raw
+    sampler:
+      frequency: 49
+datasources:
+  samples:
+    annotations:
+      views.modes.flamegraph: true
+      views.defaults.mode: flamegraph
+      ebpf.map.flush-on-stop: true
+      cli.clear-screen-before: "true"
+      # profiling exporter annotations
+      profiles.stack-fields: kern_stack,user_stack_raw.symbols
+      profiles.value-field: samples
+      profiles.name: process_cpu
+      profiles.type: samples
+      profiles.unit: count
+    fields:
+      user_stack_id:
+        annotations:
+          # Internal aggregation key (equals user_stack_raw.stack_id); hide it
+          # so the output schema is unchanged for consumers.
+          json.skip: "true"
+          columns.hidden: "true"
+      runtime.containerName:
+        annotations:
+          flamegraph.level: 0
+          flamegraph.type: single
+          profiles.sample-attribute: "true"
+      proc.comm:
+        annotations:
+          flamegraph.level: 10
+          flamegraph.type: single
+          profiles.sample-attribute: "true"
+      user_stack:
+        annotations:
+          flamegraph.level: 20
+          flamegraph.type: stack
+      kern_stack:
+        annotations:
+          flamegraph.level: 30
+          flamegraph.type: stack
+params:
+  ebpf:
+    kernel_stacks_only:
+      key: kernel-stacks-only
+      defaultValue: "false"
+      description: Only include the kernel stack
+    user_stacks_only:
+      key: user-stacks-only
+      defaultValue: "false"
+      description: Only include the user stack
+    include_idle:
+      key: include-idle
+      defaultValue: "false"
+      description: Include time the cpu is idle
+    gpu_idle_only:
+      key: gpu-idle-only
+      defaultValue: "false"
+      description: Only sample processes that own GPU memory while their GPU is underutilized (requires the gpu-ebpf-bridge)
+    gpu_util_max_pct:
+      key: gpu-util-max-pct
+      defaultValue: "70"
+      description: With --gpu-idle-only, only record a sample when the primary GPU's SM utilization is below this percentage
+    min_gpu_mem_bytes:
+      key: min-gpu-mem-bytes
+      defaultValue: "1"
+      description: With --gpu-idle-only, minimum resident GPU memory (bytes) for a process to count as a GPU holder
+    stale_threshold_ms:
+      key: stale-threshold-ms
+      defaultValue: "300"
+      description: With --gpu-idle-only, discard samples when the bridge data is older than this many milliseconds

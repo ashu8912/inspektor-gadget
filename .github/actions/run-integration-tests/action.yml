@@ -16,13 +16,22 @@ inputs:
     required: true
   dnstester_image:
     description: 'The image used for the dnstester.'
-    default: 'ghcr.io/inspektor-gadget/dnstester:latest'
+    default: 'ghcr.io/inspektor-gadget/dnstester:main'
   gadget_repository:
     description: 'Repository where gadget images are stored.'
     required: true
   gadget_tag:
     description: 'Tag used for gadgets OCI images'
     required: true
+  gadget_verify_image:
+    description: 'Whether to verify the gadget image.'
+    default: 'true'
+  gadget_insecure_registry:
+    description: 'HTTP registry endpoint allowed for gadget images.'
+    required: false
+  gadget_public_key:
+    description: 'Public key used to verify gadget images.'
+    required: false
   test_summary_suffix:
     description: 'Suffix of the test summary file'
     required: true
@@ -31,23 +40,52 @@ runs:
   using: "composite"
   steps:
     - name: Get kubectl-gadget-linux-amd64.tar.gz from artifact.
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
         name: kubectl-gadget-linux-amd64-tar-gz
         path: /home/runner/work/inspektor-gadget/inspektor-gadget/
     - name: Deploy Inspektor Gadget
       id: deploy-ig
       shell: bash
+      env:
+        KUBERNETES_DISTRIBUTION: ${{ inputs.kubernetes_distribution }}
+        GADGET_VERIFY_IMAGE: ${{ inputs.gadget_verify_image }}
+        GADGET_INSECURE_REGISTRY: ${{ inputs.gadget_insecure_registry }}
+        GADGET_PUBLIC_KEY: ${{ inputs.gadget_public_key }}
+        CONTAINER_REPO: ${{ inputs.container_repo }}
+        IMAGE_TAG: ${{ inputs.image_tag }}
       run: |
         tar zxvf /home/runner/work/inspektor-gadget/inspektor-gadget/kubectl-gadget-linux-amd64.tar.gz
-        if [[ ${{ inputs.kubernetes_distribution }} == "minikube-github" ]]; then
+        extra_flags=()
+        if [[ "${KUBERNETES_DISTRIBUTION}" == "minikube-github" ]]; then
           # Inspektor-Gadget container image is loaded into the cluster using "minikube image load" instead of pushing the container image to a registry.
-          EXTRA_FLAGS='--image-pull-policy=Never'
+          extra_flags+=(--image-pull-policy=Never)
         fi
-        ./kubectl-gadget deploy $EXTRA_FLAGS --debug --experimental --image=${{ inputs.container_repo }}:${{ inputs.image_tag }}
+        daemon_config="${RUNNER_TEMP}/gadget-daemon-config.yaml"
+        printf 'operator.oci.verify-image: %s\n' "${GADGET_VERIFY_IMAGE}" > "${daemon_config}"
+        if [[ -n "${GADGET_INSECURE_REGISTRY}" ]]; then
+          registries="$(jq -cn --arg registry "${GADGET_INSECURE_REGISTRY}" '[$registry]')"
+          printf 'operator.oci.insecure-registries: %s\n' "${registries}" >> "${daemon_config}"
+        fi
+        if [[ -n "${GADGET_PUBLIC_KEY}" ]]; then
+          {
+            echo 'operator.oci.public-keys:'
+            echo '  - |'
+            sed 's/^/    /' <<< "${GADGET_PUBLIC_KEY}"
+          } >> "${daemon_config}"
+        fi
+        echo "daemon-config=${daemon_config}" >> "${GITHUB_OUTPUT}"
+        ./kubectl-gadget deploy --daemon-config="${daemon_config}" "${extra_flags[@]}" --debug --experimental --image="${CONTAINER_REPO}:${IMAGE_TAG}"
     - name: Integration tests
       id: integration-tests
       shell: bash
+      env:
+        KUBERNETES_DISTRIBUTION: ${{ inputs.kubernetes_distribution }}
+        KUBERNETES_ARCHITECTURE: ${{ inputs.kubernetes_architecture }}
+        DNSTESTER_IMAGE: ${{ inputs.dnstester_image }}
+        GADGET_REPOSITORY: ${{ inputs.gadget_repository }}
+        GADGET_TAG: ${{ inputs.gadget_tag }}
+        GADGET_DAEMON_CONFIG: ${{ steps.deploy-ig.outputs.daemon-config }}
       run: |
         cleanup() {
             echo "IntegrationTestsJob: Workflow run is being cancelled: $1 was received"
@@ -76,15 +114,17 @@ runs:
         trap 'cleanup SIGTERM' SIGTERM
 
         # https://mywiki.wooledge.org/SignalTrap#When_is_the_signal_handled.3F
-        echo "IntegrationTestsJob: Start"
+        echo "BuiltinIntegrationTestsJob: Start"
         set -o pipefail
         make \
-          KUBERNETES_DISTRIBUTION=${{ inputs.kubernetes_distribution }} \
-          KUBERNETES_ARCHITECTURE=${{ inputs.kubernetes_architecture }} \
-          DNSTESTER_IMAGE=${{ inputs.dnstester_image }} \
-          GADGET_REPOSITORY=${{ inputs.gadget_repository }} \
-          GADGET_TAG=${{ inputs.gadget_tag }} \
-          -o kubectl-gadget integration-tests |& tee integration.log & wait $!
+          integration-tests -o kubectl-gadget |& tee integration.log & wait $!
+        echo "BuiltinIntegrationTestsJob: Done"
+
+        echo "IntegrationTestsJob: Start"
+        make \
+          KUBECTL_GADGET=/home/runner/work/inspektor-gadget/inspektor-gadget/kubectl-gadget \
+          IG_RUNTIME=kubernetes \
+          -C gadgets/ test-k8s -o build |& tee -a integration.log & wait $!
         echo "IntegrationTestsJob: Done"
     - name: Undeploy Inspektor Gadget
       id: undeploy-ig

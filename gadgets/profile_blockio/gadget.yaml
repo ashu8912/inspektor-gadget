@@ -1,0 +1,14 @@
+name: profile blockio
+description: TODO
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/profile_blockio
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/profile_blockio
+dataSources:
+  blockio:
+    annotations:
+      metrics.print: "true"
+      cli.clear-screen-before: "true"
+    fields:
+      latency:
+        annotations:
+          metrics.unit: µs

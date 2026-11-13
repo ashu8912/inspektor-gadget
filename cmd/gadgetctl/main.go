@@ -24,8 +24,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/inspektor-gadget/inspektor-gadget/cmd/common"
+	"github.com/inspektor-gadget/inspektor-gadget/cmd/common/image"
 	commonutils "github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
-	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/all-gadgets"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/config"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/environment"
 	grpcruntime "github.com/inspektor-gadget/inspektor-gadget/pkg/runtime/grpc"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/experimental"
@@ -42,6 +43,7 @@ func main() {
 		Use:   filepath.Base(os.Args[0]),
 		Short: "Collection of gadgets for containers",
 	}
+	common.AddConfigFlag(rootCmd)
 	common.AddVerboseFlag(rootCmd)
 
 	skipInfo := false
@@ -57,6 +59,9 @@ func main() {
 
 	runtime := grpcruntime.New()
 
+	// save the root flags for later use before we modify them (e.g. add runtime flags)
+	rootFlags := commonutils.CopyFlagSet(rootCmd.PersistentFlags())
+
 	runtimeGlobalParams := runtime.GlobalParamDescs().ToParams()
 	common.AddFlags(rootCmd, runtimeGlobalParams, nil, runtime)
 	err := runtime.Init(runtimeGlobalParams)
@@ -67,7 +72,7 @@ func main() {
 	if !skipInfo {
 		// evaluate flags early for runtimeGlobalFlags; this will make
 		// sure that --remote-address has already been parsed when calling
-		// InitDeployInfo(), so it can target the specified address
+		// GetInfo(), so it can target the specified address
 
 		err := commonutils.ParseEarlyFlags(rootCmd, os.Args[1:])
 		if err != nil {
@@ -75,19 +80,35 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		info, err := runtime.InitDeployInfo()
+
+		info, err := runtime.GetInfo()
 		if err != nil {
 			log.Warnf("Failed to load deploy info: %s", err)
 		} else if err := commonutils.CheckServerVersionSkew(info.ServerVersion); err != nil {
-			log.Warnf(err.Error())
+			log.Warn(err.Error())
 		}
 	}
 
-	hiddenColumnTags := []string{"kubernetes"}
-	common.AddCommandsFromRegistry(rootCmd, runtime, hiddenColumnTags)
+	// ensure that the runtime flags are set from the config file
+	if err := common.InitConfig(rootFlags); err != nil {
+		log.Fatalf("initializing config: %v", err)
+	}
+	if err = common.SetFlagsForParams(rootCmd, runtimeGlobalParams, config.RuntimeKey); err != nil {
+		log.Fatalf("setting runtime flags from config: %v", err)
+	}
 
-	rootCmd.AddCommand(common.NewSyncCommand(runtime))
-	rootCmd.AddCommand(common.NewRunCommand(rootCmd, runtime, hiddenColumnTags))
+	// add image subcommands to be added, for now only inspect is supported
+	imgCommands := []*cobra.Command{
+		image.NewInspectCmd(runtime),
+	}
+
+	hiddenColumnTags := []string{"kubernetes"}
+
+	common.AddInstanceCommands(rootCmd, runtime)
+	rootCmd.AddCommand(common.NewRunCommand(rootCmd, runtime, hiddenColumnTags, common.CommandModeRun))
+	rootCmd.AddCommand(common.NewRunCommand(rootCmd, runtime, hiddenColumnTags, common.CommandModeAttach))
+	rootCmd.AddCommand(common.NewConfigCmd(runtime, rootFlags))
+	rootCmd.AddCommand(image.NewImageCmd(runtime, imgCommands))
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

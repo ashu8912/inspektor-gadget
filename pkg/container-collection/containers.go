@@ -19,14 +19,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/moby/moby/pkg/stringid"
-	ocispec "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/moby/moby/client/pkg/stringid"
 	"golang.org/x/sys/unix"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/rest"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/columns"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/k8sutil"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 )
 
@@ -38,12 +37,9 @@ type Container struct {
 	// K8s contains the Kubernetes metadata of the container.
 	K8s K8sMetadata `json:"k8s,omitempty" column:"k8s" columnTags:"kubernetes"`
 
-	// Pid is the process id of the container
-	Pid uint32 `json:"pid,omitempty" column:"pid,template:pid,hide"`
-
 	// Container's configuration is the config.json from the OCI runtime
 	// spec
-	OciConfig *ocispec.Spec `json:"ociConfig,omitempty"`
+	OciConfig string `json:"ociConfig,omitempty"`
 
 	// Bundle is the directory containing the config.json from the OCI
 	// runtime spec
@@ -64,6 +60,11 @@ type Container struct {
 	CgroupV1 string `json:"cgroupV1,omitempty"`
 	CgroupV2 string `json:"cgroupV2,omitempty"`
 
+	// podLabelsAsString is the same as K8s.PodLabels but in a string representation.
+	// Kept in sync via SetPodLabels() and GetPodLabelsAsString() helpers.
+	// It is used to avoid re-serializing the map[string]string for every event.
+	podLabelsAsString string
+
 	// We keep an open file descriptor of the containers mount and net namespaces to be sure the
 	// kernel doesn't reuse the inode id before we get rid of this container. This logic avoids
 	// a race condition when the ns inode id is reused by a new container and we erroneously
@@ -78,14 +79,18 @@ type Container struct {
 
 // close releases any resources (like  file descriptors) the container is using.
 func (c *Container) close() {
-	if c.mntNsFd != 0 {
-		unix.Close(c.mntNsFd)
-		c.mntNsFd = 0
-	}
-	if c.netNsFd != 0 {
-		unix.Close(c.netNsFd)
-		c.netNsFd = 0
-	}
+	// we run this in a goroutine to avoid blocking the caller as it can happen
+	// if the container has an NFS mount
+	go func() {
+		if c.mntNsFd != 0 {
+			unix.Close(c.mntNsFd)
+			c.mntNsFd = 0
+		}
+		if c.netNsFd != 0 {
+			unix.Close(c.netNsFd)
+			c.netNsFd = 0
+		}
+	}()
 }
 
 type RuntimeMetadata struct {
@@ -105,7 +110,9 @@ type K8sSelector struct {
 
 type RuntimeSelector struct {
 	// TODO: Support filtering by all the fields in BasicRuntimeMetadata
-	ContainerName string
+	ContainerName        string
+	ContainerImageID     string
+	ContainerImageDigest string
 }
 
 type ContainerSelector struct {
@@ -118,16 +125,15 @@ type ContainerSelector struct {
 // to help users to identify the workflow of the profile. We "lazily
 // enrich" this information because this operation is expensive and this
 // information is only needed in some cases.
-func (c *Container) GetOwnerReference() (*metav1.OwnerReference, error) {
+func (c *Container) GetOwnerReference(kubeconfigPath string) (*metav1.OwnerReference, error) {
 	if c.K8s.ownerReference != nil {
 		return c.K8s.ownerReference, nil
 	}
 
-	kubeconfig, err := rest.InClusterConfig()
+	kubeconfig, err := k8sutil.NewKubeConfig(kubeconfigPath, "container-collection/GetOwnerReference")
 	if err != nil {
 		return nil, fmt.Errorf("getting Kubernetes config: %w", err)
 	}
-
 	dynamicClient, err := dynamic.NewForConfig(kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("getting get dynamic Kubernetes client: %w", err)
@@ -141,6 +147,12 @@ func (c *Container) GetOwnerReference() (*metav1.OwnerReference, error) {
 	return c.K8s.ownerReference, nil
 }
 
+// maxOwnerReferenceDepth caps how many owner-reference hops the enricher will
+// follow before giving up. Legitimate Kubernetes controller chains are shallow
+// (Pod -> ReplicaSet -> Deployment, Pod -> Job -> CronJob: depth 3); this cap
+// is a defensive backstop paired with the visited-set cycle check below.
+const maxOwnerReferenceDepth = 8
+
 func ownerReferenceEnrichment(
 	dynamicClient dynamic.Interface,
 	container *Container,
@@ -153,10 +165,24 @@ func ownerReferenceEnrichment(
 
 	var highestOwnerRef *metav1.OwnerReference
 
+	// Kubernetes tolerates cycles in metadata.ownerReferences (the garbage
+	// collector declines to delete them rather than rejecting them at
+	// admission), so an unprivileged namespaced user can craft a cyclic
+	// ownership graph. Without a visited set this loop walks the graph as
+	// if it were a tree and never terminates, hammering the apiserver and
+	// wedging the caller (the container-hook FAN_ACCESS_PERM permission
+	// response is deferred until AddContainer returns).
+	type visitedKey struct {
+		namespace, kind, name string
+	}
+	visited := map[visitedKey]struct{}{
+		{resNamespace, resKind, resName}: {},
+	}
+
 	// Iterate until we reach the highest level of reference with one of the
 	// expected resource kind. Take into account that if this logic is changed,
 	// the gadget cluster role needs to be updated accordingly.
-	for {
+	for depth := 0; depth < maxOwnerReferenceDepth; depth++ {
 		if len(ownerReferences) == 0 {
 			var err error
 			ownerReferences, err = getOwnerReferences(dynamicClient,
@@ -184,6 +210,15 @@ func ownerReferenceEnrichment(
 		resKind = strings.ToLower(ownerRef.Kind) + "s"
 		resName = ownerRef.Name
 		ownerReferences = nil
+
+		next := visitedKey{resNamespace, resKind, resName}
+		if _, seen := visited[next]; seen {
+			// Cycle in ownerReferences; stop walking and keep the last
+			// valid owner we saw. Returning an error would just make the
+			// caller log and continue, dropping the partial enrichment.
+			break
+		}
+		visited[next] = struct{}{}
 	}
 
 	// Update container's owner reference (If any)
@@ -225,4 +260,40 @@ func (c *Container) RuntimeMetadata() *types.BasicRuntimeMetadata {
 
 func (c *Container) UsesHostNetwork() bool {
 	return c.HostNetwork
+}
+
+func (c *Container) ContainerPid() uint32 {
+	return c.Runtime.ContainerPID
+}
+
+func (c *Container) K8sOwnerReference() *types.K8sOwnerReference {
+	if c.K8s.ownerReference == nil {
+		return &types.K8sOwnerReference{}
+	}
+	return &types.K8sOwnerReference{
+		Kind: c.K8s.ownerReference.Kind,
+		Name: c.K8s.ownerReference.Name,
+	}
+}
+
+func (c *Container) K8sPodLabelsAsString() string {
+	return c.podLabelsAsString
+}
+
+func (c *Container) SetPodLabels(podLabels map[string]string) {
+	if len(podLabels) == 0 {
+		// IsEnriched relies on c.K8s.PodLabels == nil to know if it
+		// has been initialized.
+		c.K8s.PodLabels = nil
+		c.podLabelsAsString = ""
+		return
+	}
+
+	kvPairs := make([]string, 0, len(podLabels))
+	c.K8s.PodLabels = make(map[string]string, len(podLabels))
+	for k, v := range podLabels {
+		c.K8s.PodLabels[k] = v
+		kvPairs = append(kvPairs, fmt.Sprintf("%s=%s", k, v))
+	}
+	c.podLabelsAsString = strings.Join(kvPairs, ",")
 }

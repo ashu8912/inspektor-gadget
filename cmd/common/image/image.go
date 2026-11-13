@@ -17,15 +17,24 @@ package image
 import (
 	"github.com/spf13/cobra"
 
-	"github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/runtime"
 )
 
-func NewImageCmd() *cobra.Command {
+func NewImageCmd(r runtime.Runtime, addCommands []*cobra.Command) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "image",
 		Short: "Manage gadget images",
 	}
 
+	// add only specific subcommands (only grpc-supported commands in case of gadgetctl/kubectl-gadget)
+	if addCommands != nil {
+		for _, c := range addCommands {
+			cmd.AddCommand(c)
+		}
+		return cmd
+	}
+
+	// add all subcommands if not specified (in case of ig)
 	cmd.AddCommand(NewBuildCmd())
 	cmd.AddCommand(NewExportCmd())
 	cmd.AddCommand(NewImportCmd())
@@ -33,7 +42,10 @@ func NewImageCmd() *cobra.Command {
 	cmd.AddCommand(NewPullCmd())
 	cmd.AddCommand(NewTagCmd())
 	cmd.AddCommand(NewListCmd())
+	cmd.AddCommand(NewInspectCmd(r))
+	cmd.AddCommand(NewPruneCmd())
 	cmd.AddCommand(NewRemoveCmd())
+	cmd.AddCommand(NewVerifyCmd())
 
-	return utils.MarkExperimental(cmd)
+	return cmd
 }

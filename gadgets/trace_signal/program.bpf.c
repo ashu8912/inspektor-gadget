@@ -5,8 +5,9 @@
 #include <bpf/bpf_core_read.h>
 
 #include <gadget/buffer.h>
+#include <gadget/common.h>
+#include <gadget/filter.h>
 #include <gadget/macros.h>
-#include <gadget/mntns_filter.h>
 #include <gadget/types.h>
 
 struct value {
@@ -15,23 +16,19 @@ struct value {
 };
 
 struct event {
-	__u32 pid;
+	gadget_timestamp timestamp_raw;
+	struct gadget_process proc;
+
 	__u32 tpid;
-	gadget_mntns_id mntns_id;
-	gadget_timestamp timestamp;
-	__u32 uid;
-	__u32 gid;
-	gadget_signal sig;
-	int ret;
-	char comm[TASK_COMM_LEN];
+
+	gadget_signal sig_raw;
+	gadget_errno error_raw;
 };
 
-const volatile pid_t filtered_pid = 0;
 const volatile int target_signal = 0;
 const volatile bool failed_only = false;
 const volatile bool kill_only = false;
 
-GADGET_PARAM(filtered_pid);
 GADGET_PARAM(target_signal);
 GADGET_PARAM(failed_only);
 GADGET_PARAM(kill_only);
@@ -51,25 +48,22 @@ static int probe_entry(pid_t tpid, int sig)
 {
 	struct value v = {};
 	__u64 pid_tgid;
-	__u32 pid, tid;
+	__u32 tid;
 	u64 mntns_id;
 
 	if (!kill_only)
 		return 0;
 
-	mntns_id = gadget_get_mntns_id();
-
-	if (gadget_should_discard_mntns_id(mntns_id))
+	if (gadget_should_discard_data_current())
 		return 0;
+
+	mntns_id = gadget_get_current_mntns_id();
 
 	if (target_signal && sig != target_signal)
 		return 0;
 
 	pid_tgid = bpf_get_current_pid_tgid();
-	pid = pid_tgid >> 32;
 	tid = (__u32)pid_tgid;
-	if (filtered_pid && pid != filtered_pid)
-		return 0;
 
 	v.sig = sig;
 	v.mntns_id = mntns_id;
@@ -80,7 +74,6 @@ static int probe_entry(pid_t tpid, int sig)
 static int probe_exit(void *ctx, int ret)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	__u64 uid_gid = bpf_get_current_uid_gid();
 	__u32 tid = (__u32)pid_tgid;
 	struct event *eventp;
 	struct value *vp;
@@ -99,12 +92,10 @@ static int probe_exit(void *ctx, int ret)
 	if (!eventp)
 		goto cleanup;
 
-	eventp->ret = ret;
-	eventp->timestamp = bpf_ktime_get_boot_ns();
-	eventp->uid = (u32)uid_gid;
-	eventp->gid = (u32)(uid_gid >> 32);
-	eventp->sig = vp->sig;
-	eventp->mntns_id = vp->mntns_id;
+	gadget_process_populate(&eventp->proc);
+	eventp->error_raw = -ret;
+	eventp->timestamp_raw = bpf_ktime_get_boot_ns();
+	eventp->sig_raw = vp->sig;
 	gadget_submit_buf(ctx, &events, eventp, sizeof(*eventp));
 
 cleanup:
@@ -164,17 +155,11 @@ int ig_sig_generate(struct trace_event_raw_signal_generate *ctx)
 	pid_t tpid = ctx->pid;
 	int ret = ctx->errno;
 	int sig = ctx->sig;
-	__u64 pid_tgid;
-	__u32 pid;
-	u64 mntns_id;
-	__u64 uid_gid = bpf_get_current_uid_gid();
 
 	if (kill_only)
 		return 0;
 
-	mntns_id = gadget_get_mntns_id();
-
-	if (gadget_should_discard_mntns_id(mntns_id))
+	if (gadget_should_discard_data_current())
 		return 0;
 
 	if (failed_only && ret == 0)
@@ -183,24 +168,15 @@ int ig_sig_generate(struct trace_event_raw_signal_generate *ctx)
 	if (target_signal && sig != target_signal)
 		return 0;
 
-	pid_tgid = bpf_get_current_pid_tgid();
-	pid = pid_tgid >> 32;
-	if (filtered_pid && pid != filtered_pid)
-		return 0;
-
 	event = gadget_reserve_buf(&events, sizeof(*event));
 	if (!event)
 		return 0;
 
-	event->pid = pid;
+	gadget_process_populate(&event->proc);
 	event->tpid = tpid;
-	event->mntns_id = mntns_id;
-	event->sig = sig;
-	event->ret = ret;
-	event->uid = (u32)uid_gid;
-	event->gid = (u32)(uid_gid >> 32);
-	bpf_get_current_comm(event->comm, sizeof(event->comm));
-	event->timestamp = bpf_ktime_get_boot_ns();
+	event->sig_raw = sig;
+	event->error_raw = -ret;
+	event->timestamp_raw = bpf_ktime_get_boot_ns();
 	gadget_submit_buf(ctx, &events, event, sizeof(*event));
 	return 0;
 }

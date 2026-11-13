@@ -11,7 +11,6 @@ import (
 
 // This is a compile-time assertion to ensure that this generated file
 // is compatible with the grpc package it is being compiled against.
-// Requires gRPC-Go v1.32.0 or later.
 const _ = grpc.SupportPackageIsVersion7
 
 // BuiltInGadgetManagerClient is the client API for BuiltInGadgetManager service.
@@ -19,7 +18,6 @@ const _ = grpc.SupportPackageIsVersion7
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type BuiltInGadgetManagerClient interface {
 	GetInfo(ctx context.Context, in *InfoRequest, opts ...grpc.CallOption) (*InfoResponse, error)
-	RunBuiltInGadget(ctx context.Context, opts ...grpc.CallOption) (BuiltInGadgetManager_RunBuiltInGadgetClient, error)
 }
 
 type builtInGadgetManagerClient struct {
@@ -39,43 +37,11 @@ func (c *builtInGadgetManagerClient) GetInfo(ctx context.Context, in *InfoReques
 	return out, nil
 }
 
-func (c *builtInGadgetManagerClient) RunBuiltInGadget(ctx context.Context, opts ...grpc.CallOption) (BuiltInGadgetManager_RunBuiltInGadgetClient, error) {
-	stream, err := c.cc.NewStream(ctx, &BuiltInGadgetManager_ServiceDesc.Streams[0], "/api.BuiltInGadgetManager/RunBuiltInGadget", opts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &builtInGadgetManagerRunBuiltInGadgetClient{stream}
-	return x, nil
-}
-
-type BuiltInGadgetManager_RunBuiltInGadgetClient interface {
-	Send(*BuiltInGadgetControlRequest) error
-	Recv() (*GadgetEvent, error)
-	grpc.ClientStream
-}
-
-type builtInGadgetManagerRunBuiltInGadgetClient struct {
-	grpc.ClientStream
-}
-
-func (x *builtInGadgetManagerRunBuiltInGadgetClient) Send(m *BuiltInGadgetControlRequest) error {
-	return x.ClientStream.SendMsg(m)
-}
-
-func (x *builtInGadgetManagerRunBuiltInGadgetClient) Recv() (*GadgetEvent, error) {
-	m := new(GadgetEvent)
-	if err := x.ClientStream.RecvMsg(m); err != nil {
-		return nil, err
-	}
-	return m, nil
-}
-
 // BuiltInGadgetManagerServer is the server API for BuiltInGadgetManager service.
 // All implementations must embed UnimplementedBuiltInGadgetManagerServer
 // for forward compatibility
 type BuiltInGadgetManagerServer interface {
 	GetInfo(context.Context, *InfoRequest) (*InfoResponse, error)
-	RunBuiltInGadget(BuiltInGadgetManager_RunBuiltInGadgetServer) error
 	mustEmbedUnimplementedBuiltInGadgetManagerServer()
 }
 
@@ -86,9 +52,6 @@ type UnimplementedBuiltInGadgetManagerServer struct {
 func (UnimplementedBuiltInGadgetManagerServer) GetInfo(context.Context, *InfoRequest) (*InfoResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetInfo not implemented")
 }
-func (UnimplementedBuiltInGadgetManagerServer) RunBuiltInGadget(BuiltInGadgetManager_RunBuiltInGadgetServer) error {
-	return status.Errorf(codes.Unimplemented, "method RunBuiltInGadget not implemented")
-}
 func (UnimplementedBuiltInGadgetManagerServer) mustEmbedUnimplementedBuiltInGadgetManagerServer() {}
 
 // UnsafeBuiltInGadgetManagerServer may be embedded to opt out of forward compatibility for this service.
@@ -98,8 +61,8 @@ type UnsafeBuiltInGadgetManagerServer interface {
 	mustEmbedUnimplementedBuiltInGadgetManagerServer()
 }
 
-func RegisterBuiltInGadgetManagerServer(s grpc.ServiceRegistrar, srv BuiltInGadgetManagerServer) {
-	s.RegisterService(&BuiltInGadgetManager_ServiceDesc, srv)
+func RegisterBuiltInGadgetManagerServer(s *grpc.Server, srv BuiltInGadgetManagerServer) {
+	s.RegisterService(&_BuiltInGadgetManager_serviceDesc, srv)
 }
 
 func _BuiltInGadgetManager_GetInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -120,36 +83,7 @@ func _BuiltInGadgetManager_GetInfo_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
-func _BuiltInGadgetManager_RunBuiltInGadget_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(BuiltInGadgetManagerServer).RunBuiltInGadget(&builtInGadgetManagerRunBuiltInGadgetServer{stream})
-}
-
-type BuiltInGadgetManager_RunBuiltInGadgetServer interface {
-	Send(*GadgetEvent) error
-	Recv() (*BuiltInGadgetControlRequest, error)
-	grpc.ServerStream
-}
-
-type builtInGadgetManagerRunBuiltInGadgetServer struct {
-	grpc.ServerStream
-}
-
-func (x *builtInGadgetManagerRunBuiltInGadgetServer) Send(m *GadgetEvent) error {
-	return x.ServerStream.SendMsg(m)
-}
-
-func (x *builtInGadgetManagerRunBuiltInGadgetServer) Recv() (*BuiltInGadgetControlRequest, error) {
-	m := new(BuiltInGadgetControlRequest)
-	if err := x.ServerStream.RecvMsg(m); err != nil {
-		return nil, err
-	}
-	return m, nil
-}
-
-// BuiltInGadgetManager_ServiceDesc is the grpc.ServiceDesc for BuiltInGadgetManager service.
-// It's only intended for direct use with grpc.RegisterService,
-// and not to be introspected or modified (even as a copy)
-var BuiltInGadgetManager_ServiceDesc = grpc.ServiceDesc{
+var _BuiltInGadgetManager_serviceDesc = grpc.ServiceDesc{
 	ServiceName: "api.BuiltInGadgetManager",
 	HandlerType: (*BuiltInGadgetManagerServer)(nil),
 	Methods: []grpc.MethodDesc{
@@ -158,14 +92,7 @@ var BuiltInGadgetManager_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _BuiltInGadgetManager_GetInfo_Handler,
 		},
 	},
-	Streams: []grpc.StreamDesc{
-		{
-			StreamName:    "RunBuiltInGadget",
-			Handler:       _BuiltInGadgetManager_RunBuiltInGadget_Handler,
-			ServerStreams: true,
-			ClientStreams: true,
-		},
-	},
+	Streams:  []grpc.StreamDesc{},
 	Metadata: "api/api.proto",
 }
 
@@ -195,7 +122,7 @@ func (c *gadgetManagerClient) GetGadgetInfo(ctx context.Context, in *GetGadgetIn
 }
 
 func (c *gadgetManagerClient) RunGadget(ctx context.Context, opts ...grpc.CallOption) (GadgetManager_RunGadgetClient, error) {
-	stream, err := c.cc.NewStream(ctx, &GadgetManager_ServiceDesc.Streams[0], "/api.GadgetManager/RunGadget", opts...)
+	stream, err := c.cc.NewStream(ctx, &_GadgetManager_serviceDesc.Streams[0], "/api.GadgetManager/RunGadget", opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -253,8 +180,8 @@ type UnsafeGadgetManagerServer interface {
 	mustEmbedUnimplementedGadgetManagerServer()
 }
 
-func RegisterGadgetManagerServer(s grpc.ServiceRegistrar, srv GadgetManagerServer) {
-	s.RegisterService(&GadgetManager_ServiceDesc, srv)
+func RegisterGadgetManagerServer(s *grpc.Server, srv GadgetManagerServer) {
+	s.RegisterService(&_GadgetManager_serviceDesc, srv)
 }
 
 func _GadgetManager_GetGadgetInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -301,10 +228,7 @@ func (x *gadgetManagerRunGadgetServer) Recv() (*GadgetControlRequest, error) {
 	return m, nil
 }
 
-// GadgetManager_ServiceDesc is the grpc.ServiceDesc for GadgetManager service.
-// It's only intended for direct use with grpc.RegisterService,
-// and not to be introspected or modified (even as a copy)
-var GadgetManager_ServiceDesc = grpc.ServiceDesc{
+var _GadgetManager_serviceDesc = grpc.ServiceDesc{
 	ServiceName: "api.GadgetManager",
 	HandlerType: (*GadgetManagerServer)(nil),
 	Methods: []grpc.MethodDesc{
@@ -321,5 +245,196 @@ var GadgetManager_ServiceDesc = grpc.ServiceDesc{
 			ClientStreams: true,
 		},
 	},
+	Metadata: "api/api.proto",
+}
+
+// GadgetInstanceManagerClient is the client API for GadgetInstanceManager service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type GadgetInstanceManagerClient interface {
+	CreateGadgetInstance(ctx context.Context, in *CreateGadgetInstanceRequest, opts ...grpc.CallOption) (*CreateGadgetInstanceResponse, error)
+	ListGadgetInstances(ctx context.Context, in *ListGadgetInstancesRequest, opts ...grpc.CallOption) (*ListGadgetInstanceResponse, error)
+	GetGadgetInstance(ctx context.Context, in *GadgetInstanceId, opts ...grpc.CallOption) (*GadgetInstance, error)
+	RemoveGadgetInstance(ctx context.Context, in *GadgetInstanceId, opts ...grpc.CallOption) (*StatusResponse, error)
+}
+
+type gadgetInstanceManagerClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewGadgetInstanceManagerClient(cc grpc.ClientConnInterface) GadgetInstanceManagerClient {
+	return &gadgetInstanceManagerClient{cc}
+}
+
+func (c *gadgetInstanceManagerClient) CreateGadgetInstance(ctx context.Context, in *CreateGadgetInstanceRequest, opts ...grpc.CallOption) (*CreateGadgetInstanceResponse, error) {
+	out := new(CreateGadgetInstanceResponse)
+	err := c.cc.Invoke(ctx, "/api.GadgetInstanceManager/CreateGadgetInstance", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gadgetInstanceManagerClient) ListGadgetInstances(ctx context.Context, in *ListGadgetInstancesRequest, opts ...grpc.CallOption) (*ListGadgetInstanceResponse, error) {
+	out := new(ListGadgetInstanceResponse)
+	err := c.cc.Invoke(ctx, "/api.GadgetInstanceManager/ListGadgetInstances", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gadgetInstanceManagerClient) GetGadgetInstance(ctx context.Context, in *GadgetInstanceId, opts ...grpc.CallOption) (*GadgetInstance, error) {
+	out := new(GadgetInstance)
+	err := c.cc.Invoke(ctx, "/api.GadgetInstanceManager/GetGadgetInstance", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gadgetInstanceManagerClient) RemoveGadgetInstance(ctx context.Context, in *GadgetInstanceId, opts ...grpc.CallOption) (*StatusResponse, error) {
+	out := new(StatusResponse)
+	err := c.cc.Invoke(ctx, "/api.GadgetInstanceManager/RemoveGadgetInstance", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GadgetInstanceManagerServer is the server API for GadgetInstanceManager service.
+// All implementations must embed UnimplementedGadgetInstanceManagerServer
+// for forward compatibility
+type GadgetInstanceManagerServer interface {
+	CreateGadgetInstance(context.Context, *CreateGadgetInstanceRequest) (*CreateGadgetInstanceResponse, error)
+	ListGadgetInstances(context.Context, *ListGadgetInstancesRequest) (*ListGadgetInstanceResponse, error)
+	GetGadgetInstance(context.Context, *GadgetInstanceId) (*GadgetInstance, error)
+	RemoveGadgetInstance(context.Context, *GadgetInstanceId) (*StatusResponse, error)
+	mustEmbedUnimplementedGadgetInstanceManagerServer()
+}
+
+// UnimplementedGadgetInstanceManagerServer must be embedded to have forward compatible implementations.
+type UnimplementedGadgetInstanceManagerServer struct {
+}
+
+func (UnimplementedGadgetInstanceManagerServer) CreateGadgetInstance(context.Context, *CreateGadgetInstanceRequest) (*CreateGadgetInstanceResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateGadgetInstance not implemented")
+}
+func (UnimplementedGadgetInstanceManagerServer) ListGadgetInstances(context.Context, *ListGadgetInstancesRequest) (*ListGadgetInstanceResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListGadgetInstances not implemented")
+}
+func (UnimplementedGadgetInstanceManagerServer) GetGadgetInstance(context.Context, *GadgetInstanceId) (*GadgetInstance, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetGadgetInstance not implemented")
+}
+func (UnimplementedGadgetInstanceManagerServer) RemoveGadgetInstance(context.Context, *GadgetInstanceId) (*StatusResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RemoveGadgetInstance not implemented")
+}
+func (UnimplementedGadgetInstanceManagerServer) mustEmbedUnimplementedGadgetInstanceManagerServer() {}
+
+// UnsafeGadgetInstanceManagerServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to GadgetInstanceManagerServer will
+// result in compilation errors.
+type UnsafeGadgetInstanceManagerServer interface {
+	mustEmbedUnimplementedGadgetInstanceManagerServer()
+}
+
+func RegisterGadgetInstanceManagerServer(s *grpc.Server, srv GadgetInstanceManagerServer) {
+	s.RegisterService(&_GadgetInstanceManager_serviceDesc, srv)
+}
+
+func _GadgetInstanceManager_CreateGadgetInstance_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateGadgetInstanceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GadgetInstanceManagerServer).CreateGadgetInstance(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/api.GadgetInstanceManager/CreateGadgetInstance",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GadgetInstanceManagerServer).CreateGadgetInstance(ctx, req.(*CreateGadgetInstanceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GadgetInstanceManager_ListGadgetInstances_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListGadgetInstancesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GadgetInstanceManagerServer).ListGadgetInstances(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/api.GadgetInstanceManager/ListGadgetInstances",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GadgetInstanceManagerServer).ListGadgetInstances(ctx, req.(*ListGadgetInstancesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GadgetInstanceManager_GetGadgetInstance_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GadgetInstanceId)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GadgetInstanceManagerServer).GetGadgetInstance(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/api.GadgetInstanceManager/GetGadgetInstance",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GadgetInstanceManagerServer).GetGadgetInstance(ctx, req.(*GadgetInstanceId))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GadgetInstanceManager_RemoveGadgetInstance_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GadgetInstanceId)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GadgetInstanceManagerServer).RemoveGadgetInstance(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/api.GadgetInstanceManager/RemoveGadgetInstance",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GadgetInstanceManagerServer).RemoveGadgetInstance(ctx, req.(*GadgetInstanceId))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+var _GadgetInstanceManager_serviceDesc = grpc.ServiceDesc{
+	ServiceName: "api.GadgetInstanceManager",
+	HandlerType: (*GadgetInstanceManagerServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "CreateGadgetInstance",
+			Handler:    _GadgetInstanceManager_CreateGadgetInstance_Handler,
+		},
+		{
+			MethodName: "ListGadgetInstances",
+			Handler:    _GadgetInstanceManager_ListGadgetInstances_Handler,
+		},
+		{
+			MethodName: "GetGadgetInstance",
+			Handler:    _GadgetInstanceManager_GetGadgetInstance_Handler,
+		},
+		{
+			MethodName: "RemoveGadgetInstance",
+			Handler:    _GadgetInstanceManager_RemoveGadgetInstance_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
 	Metadata: "api/api.proto",
 }

@@ -1,10 +1,8 @@
 # Gadgets
 
-This folder contains the
-[image-based](https://github.com/inspektor-gadget/inspektor-gadget/issues/1929) gadgets provided by
-Inspektor Gadget. We're in the [process of
-converting](https://github.com/inspektor-gadget/inspektor-gadget/issues/2032) the
-[built-in](../pkg/gadgets/) gadgets to use this approach. Hence, not all gadgets are available here
-and the ones available could be [missing some
-features](https://github.com/inspektor-gadget/inspektor-gadget/issues/2316) comparared to their
-built-in counterparts.
+This folder contains the gadgets provided by Inspektor Gadget. Check our online
+documentation to get more details:
+
+- [Running Gadgets](https://www.inspektor-gadget.io/docs/latest/reference/run)
+- [Gadgets Documentation](https://www.inspektor-gadget.io/docs/latest/gadgets/)
+- [Gadget Development](https://www.inspektor-gadget.io/docs/latest/gadget-devel/)

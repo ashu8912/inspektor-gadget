@@ -1,0 +1,149 @@
+---
+title: trace_oomkill
+sidebar_position: 0
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# trace_oomkill
+
+The trace_oomkill gadget is used to trace OOM kill events.
+
+## Requirements
+
+- Minimum Kernel Version : 5.4
+
+## Getting started
+
+Running the gadget:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl gadget run ghcr.io/inspektor-gadget/gadget/trace_oomkill:%IG_TAG% [flags]
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ sudo ig run ghcr.io/inspektor-gadget/gadget/trace_oomkill:%IG_TAG% [flags]
+        ```
+    </TabItem>
+</Tabs>
+
+## Guide
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        Kubernetes allows you to set memory limits on containers. When a container exceeds its memory limit, the kernel's out-of-memory (OOM) killer is invoked, which kills the process requesting more memory than allowed in such a container.
+        Before Kubernetes version `1.28.0`, the OOM kill events were only generated if the main container process (PID 1) was OOM killed. If any other process in the container was OOM killed, it would remain "invisible" to Kubernetes, meaning users wouldn't be notified.
+        Even after version `1.28.0`, OOM kill events will not be generated if [cgroup v2 isn't enabled](https://kubernetes.io/docs/concepts/architecture/cgroups/#using-cgroupv2) or if [singleProcessOOMKill](https://github.com/kubernetes/kubernetes/pull/126096) is being used.
+
+        To ensure you are notified whenever any process within a container is OOM killed, regardless of whether it is PID 1 or not, you can use the `trace_oomkill` gadget.
+        To demonstrate it, let's start by creating a deployment in a namespace:
+
+        :::note
+        This guide uses Kubernetes version `1.27.0` to ensure that OOM kill events (other than main process) are not reported by Kubernetes.
+        :::
+
+        ```bash
+        $ kubectl create namespace oomkill-demo
+        namespace/oomkill-demo created
+        $ kubectl create deployment oomkill-demo --image=busybox --namespace oomkill-demo -- sleep inf
+        deployment.apps/oomkill-demo created
+        ```
+
+        Set the memory limit of the pod to a low value:
+
+        ```bash
+        $ kubectl set resources deployment oomkill-demo --namespace oomkill-demo --limits=memory=128Mi
+        deployment.apps/oomkill-demo resource requirements updated
+        $ kubectl wait --for=condition=Ready pod -l app=oomkill-demo --namespace oomkill-demo
+        pod/oomkill-demo-<...> condition met
+        ```
+
+        Run the gadget in a terminal:
+
+        ```bash
+        $ kubectl gadget run trace_oomkill:%IG_TAG% --namespace oomkill-demo
+        K8S.NODE           K8S.NAMESPACE             K8S.PODNAME               K8S.CONTAINERNAME         MNTNS_ID      FPID          FUID          FGID          TPID          PAGES        FCOMM        TCOMM
+        ```
+
+        The gadget is waiting for the OOM killer to get triggered and kill a process in `oomkill-demo` namespace (alternatively, we could use `-A` and get out-of-memory killer events in all namespaces).
+        To trigger the OOM killer, in *another terminal*, `exec` a container and run this command to exhaust the memory:
+
+        ```bash
+        $ kubectl exec -n oomkill-demo -ti deployments/oomkill-demo -- tail /dev/zero
+        command terminated with exit code 137
+        ```
+
+        First check if pod was restarted:
+
+        ```bash
+        $ kubectl get pod -l app=oomkill-demo -n oomkill-demo
+        NAME                           READY   STATUS    RESTARTS   AGE
+        oomkill-demo-f5976f447-pr486   1/1     Running   0          70s
+
+        Now, check if the OOM kill event was reported by Kubernetes:
+
+        ```bash
+        $ kubectl get events --field-selector=reason=OOMKilled -n oomkill-demo
+        No resources found in oomkill-demo namespace.
+        ```
+
+        or check the `lastState` of the pod:
+
+        ```bash
+        $ kubectl get pod -l app=oomkill-demo -n oomkill-demo -o jsonpath="{.items[*].status.containerStatuses[*].lastState}"
+        {}
+        ```
+
+        Even if the OOM kill event is not reported by Kubernetes, the `trace_oomkill` gadget will capture it.  So, go back to *the first terminal* and see:
+
+        ```bash
+        K8S.NODE           K8S.NAMESPACE             K8S.PODNAME               K8S.CONTAINERNAME         MNTNS_ID      FPID          FUID          FGID          TPID          PAGES        FCOMM        TCOMM
+        minikube-docker    oomkill-demo              oomkill-demo…dbf85d-r9tls busybox                   4026533320    728870        0             0             728870        4227071      tail         tail
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        Start the gadget in a terminal:
+
+        ```bash
+        $ sudo ig run trace_oomkill:%IG_TAG% --containername test-trace-oomkill
+        RUNTIME.CONTAINERNAME               MNTNS_ID            FPID                FUID                FGID                TPID                PAGES              FCOMM              TCOMM
+        ```
+
+        Run a container that will be killed by the OOM killer:
+
+        ```bash
+        $ docker run --name test-trace-oomkill -m 512M -it busybox tail /dev/zero
+        ```
+
+        ```bash
+        RUNTIME.CONTAINERNAME               MNTNS_ID            FPID                FUID                FGID                TPID                PAGES              FCOMM              TCOMM
+        test-trace-oomkill                  4026532205          733494              0                   0                   733494              262144             tail               tail
+        ```
+    </TabItem>
+</Tabs>
+
+The printed lined corresponds to the killing of the `tail` process by the OOM killer.
+Note that, in this case, the command which was killed by the OOM killer is the same which triggered it, **this is not always the case**.
+
+Congratulations! You reached the end of this guide!
+You can now delete the resource we created:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl delete namespace oomkill-demo
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ docker rm -f test-trace-oomkill
+        ```
+    </TabItem>
+</Tabs>

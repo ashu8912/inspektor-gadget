@@ -1,6 +1,6 @@
 name: "Output the container repository and image tag to be used"
 description: "Container repository is inputs.registry/inputs.container-image.
-  Image tag is latest if branch is main, otherwise it is the tag or branch name with slashes replaced by hyphens."
+  Image tag is the tag or branch name with slashes replaced by hyphens."
 
 inputs:
   registry:
@@ -30,20 +30,23 @@ runs:
     - name: Output container repository
       id: choose-repo
       shell: bash
+      env:
+        REGISTRY: ${{ inputs.registry }}
+        CONTAINER_IMAGE: ${{ inputs.container-image }}
       run: |
-        if [ -z '${{ inputs.registry }}' ]; then
+        if [ -z "${REGISTRY}" ]; then
           echo 'inputs.registry should not be empty! Set it before calling this action' 1>&2
 
           exit 1
         fi
 
-        if [ -z '${{ inputs.container-image }}' ]; then
+        if [ -z "${CONTAINER_IMAGE}" ]; then
           echo 'inputs.container-image should not be empty! Set it before calling this action' 1>&2
 
           exit 1
         fi
 
-        container_repo=${{ inputs.registry }}/${{ inputs.container-image }}
+        container_repo="${REGISTRY}/${CONTAINER_IMAGE}"
         echo "container-repo=${container_repo}" >> $GITHUB_OUTPUT
     - name: Output image tag
       id: craft-image-tag
@@ -52,24 +55,20 @@ runs:
         # If GITHUB_REF_NAME is 'foo/bar', image_tag will be 'foo-bar', we need
         # this because it is not possible to have slash in image tag.
         image_tag=${GITHUB_REF_NAME//\//-}
-        if [ "$image_tag" = "main" ]; then
-            image_tag="latest"
-        fi
-
         echo "image-tag=${image_tag}" >> $GITHUB_OUTPUT
     - name: Output gadgets repository
       id: gadget-repository
       shell: bash
+      env:
+        REGISTRY: ${{ inputs.registry }}
+        REPOSITORY_OWNER: ${{ github.repository_owner }}
       run: |
-        if [ -z '${{ inputs.registry }}' ]; then
+        if [ -z "${REGISTRY}" ]; then
           echo 'inputs.registry should not be empty! Set it before calling this action' 1>&2
           exit 1
         fi
 
-        gadget_repository=${{ inputs.registry }}/${{ github.repository_owner }}/gadget
-        if [ ${{ github.event_name }} == 'pull_request' ]; then
-          gadget_repository=ttl.sh/${{ github.sha }}
-        fi
+        gadget_repository="${REGISTRY}/${REPOSITORY_OWNER}/gadget"
 
         echo "gadget-repository=${gadget_repository}" >> $GITHUB_OUTPUT
     - name: Output gadgets image tag
@@ -79,8 +78,4 @@ runs:
         # If GITHUB_REF_NAME is 'foo/bar', image_tag will be 'foo-bar', we need
         # this because it is not possible to have slash in image tag.
         gadget_tag=${GITHUB_REF_NAME//\//-}
-        if [ "$gadget_tag" = "main" ]; then
-            gadget_tag="latest"
-        fi
-
         echo "gadget-tag=${gadget_tag}" >> $GITHUB_OUTPUT

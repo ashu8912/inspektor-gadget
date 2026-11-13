@@ -17,6 +17,8 @@
 package btfhelpers
 
 import (
+	"bytes"
+	"fmt"
 	"reflect"
 
 	"github.com/cilium/ebpf/btf"
@@ -49,6 +51,10 @@ func GetType(typ btf.Type) (reflect.Type, []string) {
 		default:
 			return GetType(typed)
 		}
+	case *btf.Volatile:
+		return GetType(typed.Type)
+	case *btf.Const:
+		return GetType(typed.Type)
 	default:
 		refType = getSimpleType(typ)
 	}
@@ -61,6 +67,21 @@ func GetUnderlyingType(tf *btf.Typedef) btf.Type {
 	switch typed := tf.Type.(type) {
 	case *btf.Typedef:
 		return GetUnderlyingType(typed)
+	default:
+		return typed
+	}
+}
+
+// ResolveType returns the underlying type removing qualifiers like typedef,
+// const, volatile.
+func ResolveType(tf btf.Type) btf.Type {
+	switch typed := tf.(type) {
+	case *btf.Typedef:
+		return ResolveType(typed.Type)
+	case *btf.Volatile:
+		return ResolveType(typed.Type)
+	case *btf.Const:
+		return ResolveType(typed.Type)
 	default:
 		return typed
 	}
@@ -130,4 +151,23 @@ func getSimpleType(typ btf.Type) reflect.Type {
 		}
 	}
 	return nil
+}
+
+func BuildSpec(types []btf.Type) (*btf.Spec, error) {
+	builder, err := btf.NewBuilder(types, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating BTF builder: %w", err)
+	}
+
+	buf, err := builder.Marshal(nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling BTF: %w", err)
+	}
+
+	spec, err := btf.LoadSpecFromReader(bytes.NewReader(buf))
+	if err != nil {
+		return nil, fmt.Errorf("loading BTF spec: %w", err)
+	}
+
+	return spec, nil
 }

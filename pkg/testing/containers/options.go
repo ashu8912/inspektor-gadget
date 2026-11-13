@@ -24,9 +24,9 @@ type cOptions struct {
 	startAndStop bool
 }
 
-// containerOption is a function that modifies a ContainerSpec and exposes only
+// ContainerOption is a function that modifies a ContainerSpec and exposes only
 // few options from testutils.Option to the user.
-type containerOption func(opts *cOptions)
+type ContainerOption func(opts *cOptions)
 
 func (o *cOptions) IsCleanup() bool {
 	return o.cleanup
@@ -36,26 +36,74 @@ func (o *cOptions) IsStartAndStop() bool {
 	return o.startAndStop
 }
 
-func WithContainerImage(image string) containerOption {
+func WithContainerImage(image string) ContainerOption {
 	return func(opts *cOptions) {
 		opts.options = append(opts.options, testutils.WithImage(image))
 	}
 }
 
-func WithContainerSeccompProfile(profile string) containerOption {
+func WithoutContainerImagePull() ContainerOption {
+	return func(opts *cOptions) {
+		opts.options = append(opts.options, testutils.WithoutImagePull())
+	}
+}
+
+func WithContainerSeccompProfile(profile string) ContainerOption {
 	return func(opts *cOptions) {
 		opts.options = append(opts.options, testutils.WithSeccompProfile(profile))
 	}
 }
 
-func WithCleanup() containerOption {
+func WithContainerNamespace(namespace string) ContainerOption {
+	return func(opts *cOptions) {
+		opts.options = append(opts.options, testutils.WithNamespace(namespace))
+	}
+}
+
+func WithUseExistingNamespace() ContainerOption {
+	return func(opts *cOptions) {
+		opts.options = append(opts.options, testutils.WithUseExistingNamespace())
+	}
+}
+
+func WithPrivileged() ContainerOption {
+	return func(opts *cOptions) {
+		opts.options = append(opts.options, testutils.WithPrivileged())
+	}
+}
+
+func WithLimits(limits map[string]string) ContainerOption {
+	return func(opts *cOptions) {
+		opts.options = append(opts.options, testutils.WithLimits(limits))
+	}
+}
+
+func WithSysctls(sysctls map[string]string) ContainerOption {
+	return func(opts *cOptions) {
+		opts.options = append(opts.options, testutils.WithSysctls(sysctls))
+	}
+}
+
+func WithCleanup() ContainerOption {
 	return func(opts *cOptions) {
 		opts.cleanup = true
 	}
 }
 
-func WithStartAndStop() containerOption {
+func WithStartAndStop() ContainerOption {
 	return func(opts *cOptions) {
 		opts.startAndStop = true
+	}
+}
+
+func WithWaitOrOomKilled() ContainerOption {
+	return func(opts *cOptions) {
+		opts.options = append(opts.options, testutils.WithWaitOrOomKilled())
+	}
+}
+
+func WithExpectedExitCode(code int) ContainerOption {
+	return func(opts *cOptions) {
+		opts.options = append(opts.options, testutils.WithExpectedExitCode(code))
 	}
 }

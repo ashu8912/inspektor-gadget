@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/docker/go-connections/nat"
+	"github.com/moby/moby/api/types/network"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 )
@@ -30,9 +30,10 @@ type containerSpec struct {
 
 	// Internal state
 	id           string
+	ip           string
 	pid          int
 	started      bool
-	portBindings nat.PortMap
+	portBindings network.PortMap
 }
 
 type Container interface {
@@ -41,13 +42,18 @@ type Container interface {
 	Start(t *testing.T)
 	Stop(t *testing.T)
 	ID() string
+	IP() string
 	Pid() int
 	Running() bool
-	PortBindings() nat.PortMap
+	PortBindings() network.PortMap
 }
 
 func (c *containerSpec) ID() string {
 	return c.id
+}
+
+func (c *containerSpec) IP() string {
+	return c.ip
 }
 
 func (c *containerSpec) Pid() int {
@@ -58,7 +64,7 @@ func (c *containerSpec) Running() bool {
 	return c.started
 }
 
-func (c *containerSpec) PortBindings() nat.PortMap {
+func (c *containerSpec) PortBindings() network.PortMap {
 	return c.portBindings
 }
 

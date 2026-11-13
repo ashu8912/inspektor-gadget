@@ -1,0 +1,457 @@
+---
+title: Stack traces
+sidebar_position: 1300
+description: Kernel and user stack traces
+---
+
+Inspektor Gadget supports collecting kernel and user space stack traces through
+eBPF. Stack traces provide valuable context about what code paths led to an
+event, helping with debugging, performance analysis (including generating
+flamegraphs), and security investigations.
+
+## Usage
+
+Gadgets making use of stack trace functionality typically disable it by default
+due to the additional overhead. When enabled, stack traces can be collected
+from:
+
+- **Kernel space**: Shows the kernel call stack when an event occurred. Enabled
+  with `--collect-kstack`.
+- **User space**: Shows the application call stack when an event occurred.
+  Enabled with `--collect-ustack`.
+
+The stack traces contain the addresses of the functions in the call stack. To
+convert these addresses into human-readable function names, symbolization is
+performed. Inspektor Gadget supports different symbolization methods, including
+client-side and server-side symbolization.
+
+- **Kallsyms**: Uses the kernel's kallsyms mechanism to resolve kernel addresses
+  (server-side only). This is always enabled for kernel stack traces.
+- **Symtab**: Uses the user space application's symbol table to resolve user
+  addresses (server-side only). This is enabled by default. You can use
+  `--symbolizers=symtab` to be explicit.
+- **Debuginfod cache**: Uses the debuginfod cache to resolve user addresses
+  (server-side or client-side) from build ids and offsets. This requires
+  `--collect-build-id`. This is disabled by default for performance reasons. Use
+  `--symbolizers=debuginfod-cache` to enable it on the client or on the
+  standalone ig. Use `--symbolizers=debuginfod-cache-on-ig-server` to enable it
+  on the server only.
+- **OpenTelemetry**: Uses OpenTelemetry eBPF profiler to resolve user addresses
+  (server-side only). This requires `--collect-otel-stack`. This is disabled by
+  default for performance reasons. Use `--symbolizers=otel-ebpf-profiler` to enable it.
+
+### Examples
+
+```bash
+kubectl gadget run trace_capabilities:%IG_TAG% \
+    --collect-kstack \
+    --collect-ustack \
+    --collect-build-id \
+    --symbolizers symtab,debuginfod-cache \
+    -o yaml
+```
+
+### Output Format
+
+When stack traces are enabled, the output includes additional columns or fields showing the stack traces. For example:
+
+```
+ustack:
+  addresses: '[0]0x00007ff9dd7734fb; [1]0x00007ff9dd6763b8; [2]0x00007ff9dd67647b;
+    [3]0x00005617712fa2d5; '
+  buildid: '[0]91f01b4ad171c80b6303d08d1f08cba8b990413d +1274fb; [1]91f01b4ad171c80b6303d08d1f08cba8b990413d
+    +2a3b8; [2]91f01b4ad171c80b6303d08d1f08cba8b990413d +2a47b; [3]ae03c7096b4806aa173c0fd1861b019daf6a057a
+    +32d5; '
+  symbols: '[0]chroot; [1]__libc_start_call_main; [2]__libc_start_main_alias_1; [3]_start; '
+```
+
+The raw stack trace output consists of memory addresses. Symbolization converts
+these addresses into human-readable function names.
+
+## Architecture
+
+Stack trace collection in Inspektor Gadget works as follows:
+
+1. **Collection**: The eBPF program uses BPF helpers like `bpf_get_stack()` to
+   collect stack traces at specific trace points. Inspektor Gadget provides a
+   helper API at `gadget/kernel_stack_map.h` and `gadget/user_stack_map.h` to
+   help gadget authors. See [Stack maps in Gadget eBPF
+   API](../gadget-devel/gadget-ebpf-api.md#Stack-maps) for more information.
+2. **Transfer**: Stack traces are sent to userspace as part of the event data.
+3. **Processing**: The ebpf operator and the ustack operator process and
+   optionally symbolize the stack traces.
+
+
+## Performance Considerations
+
+Enabling stack traces increases overhead in several ways:
+
+- Additional CPU cycles for the eBPF program to collect the stack trace
+- Increased memory usage for storing stack frames
+- Greater data transfer between kernel and user space
+- CPU usage for symbolization
+
+The most impactful is the symbolization because it needs to parse the ELF file
+and load the symbol table.
+
+## Limitations
+
+### Stack depth
+
+Inspektor Gadget collects up to 127 frames for kernel stack traces and 127
+frames for user stack traces.
+
+It can be a problem with Java because Java applications often have deep call
+stacks, and hitting the frame limit may result in incomplete stack traces that
+miss important context.
+
+### Missing symbols
+
+- The symtab symbolization method only works if the executable has debug symbols
+  available.
+- The debuginfod symbolization method does not download the debuginfo packages
+  itself but leaves it to the user.
+- The debuginfod symbolization method relies on the build id being available in
+  an ELF note such as `.note.gnu.build-id` or `.note.go.buildid`. When building
+  with gcc, this can be added with `-Wl,--build-id`.
+  ```bash
+  $ readelf -n /bin/cat|grep 'Build ID:'
+    Build ID: 54d277fac459da46ee1a054d1ef6a5d02a3d9346
+  ```
+
+### Limitations specific to the OpenTelemetry eBPF Profiler
+
+The OpenTelemetry symbolization method requires hostPid=true due to limitations in
+the OpenTelemetry eBPF profiler library.
+
+It cannot resolve symbols when it does not know about the process in advance.
+Once the process is noticed, it can resolve the symbols correctly.
+
+The OpenTelemetry eBPF profiler resolves user addresses through a correlation id
+that is computed by an OpenTelemetry entry program reached with a BPF tail call.
+Since a tail call requires the caller and the callee to share the same eBPF
+program type, this symbolization is only available for gadget programs whose type
+has a matching OpenTelemetry entry program:
+
+- `kprobe`, `kretprobe`, `uprobe` and `uretprobe` programs (all
+  `BPF_PROG_TYPE_KPROBE`), for example `trace_capabilities`, `trace_malloc` or
+  `profile_cuda`.
+- `perf_event` programs (`BPF_PROG_TYPE_PERF_EVENT`), for example `profile_cpu`.
+
+Other program types, such as `tracepoint` gadgets (e.g. `trace_open`), cannot use
+the OpenTelemetry symbolization method. Their user stacks are still collected and
+can be symbolized by the other methods (symtab, debuginfod). Requesting
+`--collect-otel-stack` from such a gadget causes the eBPF program to be rejected
+at load time rather than silently returning empty OpenTelemetry stacks.
+
+A tracepoint gadget can still obtain OpenTelemetry stacks indirectly, by
+attaching an additional `kprobe` on a function called on the same code path,
+collecting the stack there and storing it in a map that the tracepoint program
+looks up when it builds the event. `trace_selinux` uses this pattern.
+
+Frames of interpreted languages are only resolved for the interpreter versions
+supported by the OpenTelemetry eBPF profiler. For Python, that range is 3.6 to
+3.14 at the time of writing. With a newer interpreter the native frames are
+still unwound, but the interpreter frames are replaced by offsets into the
+interpreter library, and the profiler logs the reason:
+
+```
+Failed to load /usr/lib64/libpython3.15.so.1.0: unsupported Python 3.15 (need >= 3.6 and <= 3.14)
+```
+
+The OpenTelemetry eBPF profiler requires a minimum Linux kernel version of 5.4.
+See the [upstream documentation](https://github.com/open-telemetry/opentelemetry-ebpf-profiler#supported-linux-kernel-version)
+for details on kernel version requirements.
+
+## Guide
+
+### C Programs
+
+Prepare a simple program:
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
+
+__attribute__((noinline)) void level3() {
+    chroot("/");
+}
+__attribute__((noinline)) void level2() {
+    level3();
+}
+__attribute__((noinline)) void level1() {
+    level2();
+}
+
+int main() {
+    level1();
+    sleep(1);
+    return 0;
+}
+```
+
+Create a container for compiling and running the example application:
+
+```bash
+$ docker run -ti --rm --name test ghcr.io/inspektor-gadget/ci/gcc:latest
+cat > chroot.c
+: copy/paste the program, then ctrl-d
+gcc -Wall -o basic chroot.c
+gcc -Wall -static -o static chroot.c
+cp basic stripped ; strip stripped
+cp static static-stripped ; strip static-stripped
+gcc -Wall -Wl,--build-id -o stripped-buildid chroot.c ; strip stripped-buildid
+gcc -Wall -fPIE -pie -o pie chroot.c
+```
+
+Use the trace_capabilities gadget to collect the stack traces:
+
+```bash
+sudo ig run \
+    ghcr.io/inspektor-gadget/gadget/trace_capabilities:%IG_TAG% \
+    --collect-ustack \
+    --collect-build-id \
+    --symbolizers symtab,debuginfod-cache \
+    -c test --fields proc.comm,ustack.symbols
+```
+
+We can now run the various versions of the program. Observe the output:
+```
+COMM             USTACK.SYMBOLS
+static           [0]chroot; [1]level2; [2]level1; [3]main; [4]__libc_start_call_main;
+static-stripped  [0][unknown]; [1][unknown]; [2][unknown]; [3][unknown]; [4][unknown];
+```
+
+When the binary is not stripped of symbol table, the symbtab symbolizer works
+correctly. The stripped binary does not have symbols, so the symtab symbolizer
+cannot resolve the addresses.
+
+Some Linux distributions strip the binaries by default, but provide ways to
+retrieve the symbols, either with debuginfo packages or by using [public
+debuginfod database](https://sourceware.org/elfutils/Debuginfod.html). The
+debuginfod database is indexed by build id, which is a unique identifier for the
+binary generated at compile time with `gcc -Wl,--build-id`. This is what is
+suggested by the warnings:
+
+```
+WARN[0084] Debuginfo def5460e3cee00bfee25b429c97bcc4853e5b3a8 for test/stripped-buildi not found in /root/.cache/debuginfod_client/def5460e3cee00bfee25b429c97bcc4853e5b3a8/debuginfo. Suggested remedial: "DEBUGINFOD_CACHE_PATH=/root/.cache/debuginfod_client DEBUGINFOD_URLS=https://debuginfod.elfutils.org debuginfod-find debuginfo def5460e3cee00bfee25b429c97bcc4853e5b3a8"
+WARN[0084] Debuginfo 448b87dfff9599434fba6b1086ee18447460151f for test/stripped-buildi not found in /root/.cache/debuginfod_client/448b87dfff9599434fba6b1086ee18447460151f/debuginfo. Suggested remedial: "DEBUGINFOD_CACHE_PATH=/root/.cache/debuginfod_client DEBUGINFOD_URLS=https://debuginfod.elfutils.org debuginfod-find debuginfo 448b87dfff9599434fba6b1086ee18447460151f"
+stripped-buildi  [0][unknown]; [1][unknown]; [2][unknown]; [3][unknown]; [4][unknown];
+```
+
+Let's use another container to demonstrate this:
+```bash
+$ docker run -ti --rm --name test ubuntu:24.10
+# chroot / chroot / id
+```
+
+At first, Inspektor Gadget will not be able to resolve the symbols:
+```
+WARN[0282] Debuginfo 91f01b4ad171c80b6303d08d1f08cba8b990413d for test/chroot not found in /root/.cache/debuginfod_client/91f01b4ad171c80b6303d08d1f08cba8b990413d/debuginfo. Suggested remedial: "DEBUGINFOD_CACHE_PATH=/root/.cache/debuginfod_client DEBUGINFOD_URLS=https://debuginfod.elfutils.org debuginfod-find debuginfo 91f01b4ad171c80b6303d08d1f08cba8b990413d"
+WARN[0282] Debuginfo ae03c7096b4806aa173c0fd1861b019daf6a057a for test/chroot not found in /root/.cache/debuginfod_client/ae03c7096b4806aa173c0fd1861b019daf6a057a/debuginfo. Suggested remedial: "DEBUGINFOD_CACHE_PATH=/root/.cache/debuginfod_client DEBUGINFOD_URLS=https://debuginfod.elfutils.org debuginfod-find debuginfo ae03c7096b4806aa173c0fd1861b019daf6a057a"
+chroot           [0][unknown]; [1][unknown]; [2][unknown]; [3][unknown];
+chroot           [0][unknown]; [1][unknown]; [2][unknown]; [3][unknown];
+```
+
+Ubuntu 24.10 provides debuginfod packages on the federated server
+https://debuginfod.elfutils.org, so we can run the suggested commands as root:
+```bash
+sudo DEBUGINFOD_CACHE_PATH=/root/.cache/debuginfod_client DEBUGINFOD_URLS=https://debuginfod.elfutils.org debuginfod-find debuginfo 91f01b4ad171c80b6303d08d1f08cba8b990413d
+sudo DEBUGINFOD_CACHE_PATH=/root/.cache/debuginfod_client DEBUGINFOD_URLS=https://debuginfod.elfutils.org debuginfod-find debuginfo ae03c7096b4806aa173c0fd1861b019daf6a057a
+```
+
+Now, Inspektor Gadget can resolve the symbols even though the running executable is stripped:
+```
+COMM             USTACK.SYMBOLS
+chroot           [0]chroot; [1]__libc_start_call_main; [2]__libc_start_main_alias_1; [3]_start;
+chroot           [0]chroot; [1]__libc_start_call_main; [2]__libc_start_main_alias_1; [3]_start;
+```
+
+The same can apply for dynamic libraries. Even though `basic` was built without
+build id, it uses libc which was built with build id. So after using the
+debuginfod-find command to retrieve the missing debuginfo files, we can see the
+libc symbols for `basic`:
+
+```
+COMM             USTACK.SYMBOLS
+basic            [0]__GI_chroot; [1]level2; [2]level1; [3]main; [4]__libc_start_call_main;
+```
+
+Inspektor Gadget also supports Position-Independent Executables (PIE), so you
+can also see symbols for `pie`:
+
+```
+COMM             USTACK.SYMBOLS
+pie              [0]__GI_chroot; [1]level2; [2]level1; [3]main; [4]__libc_start_call_main;
+```
+
+We can also collect the kernel stack with `--collect-kstack`:
+```bash
+sudo ig run \
+    ghcr.io/inspektor-gadget/gadget/trace_capabilities:%IG_TAG% \
+    --collect-kstack \
+    -c test --fields proc.comm,kstack
+```
+Here is the output:
+```
+COMM             KSTACK
+chroot           [0]security_capable; [1]ns_capable; [2]__x64_sys_chroot; [3]do_syscall_64; [4]entry_SYSCALL_64_after_hwframe;
+```
+
+### Using OpenTelemetry eBPF Profiler
+
+For interpreted languages like Python, Ruby, or Java, we need the OpenTelemetry
+symbolizer. It uses the OpenTelemetry eBPF profiler to collect and symbolize
+the user stack traces. It requires `--collect-otel-stack` and `--symbolizers
+=otel-ebpf-profiler`. Note that it needs hostPid=true due to limitations in the OpenTelemetry
+eBPF profiler.
+
+Prepare a simple program:
+```python
+#!/usr/bin/python3
+
+import os
+import time
+import sys
+
+def level3():
+    for _ in range(2):
+        try:
+            # attempt to chroot to "/", report success or failure
+            os.chroot("/")
+            print("chroot succeeded")
+        except Exception as e:
+            print("chroot failed:", e)
+        time.sleep(2)
+    sys.exit(0)
+
+
+def level2():
+    level3()
+    level3()
+
+
+def level1():
+    level2()
+    level2()
+
+
+def main():
+    level1()
+    time.sleep(1)
+    level1()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+```bash
+sudo ig run \
+    ghcr.io/inspektor-gadget/gadget/trace_capabilities:%IG_TAG% \
+    --collect-ustack --collect-otel-stack \
+    --symbolizers otel-ebpf-profiler \
+    --host --comm=pychroot.py -v
+```
+
+```
+DEBU[0069] Received OpenTelemetry trace (correlation ID 1650940607864638, pid 3716492, tid 3716492):
+  #0: security_capable +0x6e94c0
+  #1: ns_capable +0x11eeea
+  #2: __x64_sys_chroot +0x457bdf
+  #3: do_syscall_64 +0xfbe46c
+  #4: entry_SYSCALL_64_after_hwframe +0x10000e9
+  #5:  +0x107d8a
+  #6:  +0x189e87
+  #7:  +0x1c8349
+  #8:  +0x1c82b6
+  #9: level3 +0x0
+    /home/alban/test/mychroot/python/pychroot.py:11
+  #10: level2 +0x0
+    /home/alban/test/mychroot/python/pychroot.py:20
+  #11: level1 +0x0
+    /home/alban/test/mychroot/python/pychroot.py:25
+  #12: main +0x0
+    /home/alban/test/mychroot/python/pychroot.py:30
+  #13: <module> +0x0
+    /home/alban/test/mychroot/python/pychroot.py:36
+  #14:  +0x1bae8c
+  #15:  +0x1b7159
+  #16:  +0x23d27b
+  #17:  +0x25a722
+  #18:  +0x256c89
+  #19:  +0x26bfc1
+  #20:  +0x26b7a7
+  #21:  +0x26b467
+  #22:  +0x265d77
+  #23:  +0x22d43a
+  #24:  +0x27b89
+  #25:  +0x27c4a
+  #26:  +0x1094
+```
+
+Note that the stack has more entries compared to the findings from
+bpf_get_stack(). This is because:
+- It gets the kernel frames and the user frames together
+- It is able to get the frames from the Python interpreter
+
+OpenTelemetry is also able to collect stack traces from stripped GO binaries
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+	"syscall"
+	"time"
+)
+
+func level3() {
+	for range 2 {
+		err := syscall.Chroot("/")
+		fmt.Printf("chroot: %v\n", err)
+		time.Sleep(2 * time.Second)
+	}
+	os.Exit(0)
+}
+
+func level2() {
+	level3()
+	level3()
+}
+func level1() {
+	level2()
+	level2()
+}
+
+func main() {
+	level1()
+	time.Sleep(time.Second)
+	level1()
+}
+```
+Compile it:
+```bash
+go build -o gochroot gochroot.go
+strip gochroot
+```
+
+```bash
+sudo ig run \
+    ghcr.io/inspektor-gadget/gadget/trace_capabilities:%IG_TAG% \
+    --collect-ustack --collect-otel-stack \
+    --symbolizers otel-ebpf-profiler \
+    --host --comm=gochroot3 \
+    --fields proc.comm,ustack.symbols
+```
+
+```
+COMM             USTACK.SYMBOLS
+gochroot         [0]; [1]; [2]; [3]; [4]; [5]; [6]; [7]; [8];
+gochroot         [0]internal/runtime/syscall.Syscall6; [1]syscall.RawSyscall6; [2]syscall.Syscall; [3]syscall.Chroot; [4]main.level3; [5]main.level2; [6]main.level1; [7]main.main; [8]runtime.main;
+```
+
+The first line shows a limitation of OpenTelemetry eBPF profiler: it cannot
+resolve symbols when it does not know about the process in advance. Once the
+process is noticed, it can resolve the symbols correctly.

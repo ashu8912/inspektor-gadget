@@ -20,41 +20,101 @@ package socketenricher
 import (
 	"fmt"
 	"net"
+	"os"
 	"reflect"
 	"testing"
 	"unsafe"
 
+	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
-	utilstest "github.com/inspektor-gadget/inspektor-gadget/internal/test"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/testing/utils"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
 )
 
 func TestSocketEnricherCreate(t *testing.T) {
 	t.Parallel()
 
-	utilstest.RequireRoot(t)
-	utilstest.HostInit(t)
+	utils.RequireRoot(t)
+	utils.HostInit(t)
 
-	tracer, err := NewSocketEnricher()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tracer == nil {
-		t.Fatal("Returned tracer was nil")
-	}
+	tracer, err := NewSocketEnricher(Config{})
+	require.NoError(t, err)
+	require.NotNil(t, tracer, "Returned tracer was nil")
 }
 
 func TestSocketEnricherStopIdempotent(t *testing.T) {
 	t.Parallel()
 
-	utilstest.RequireRoot(t)
-	utilstest.HostInit(t)
+	utils.RequireRoot(t)
+	utils.HostInit(t)
 
-	tracer, _ := NewSocketEnricher()
+	tracer, err := NewSocketEnricher(Config{})
+	require.NoError(t, err)
 
 	// Check that a double stop doesn't cause issues
 	tracer.Close()
 	tracer.Close()
+}
+
+func TestSocketEnricherBadConfig(t *testing.T) {
+	t.Parallel()
+
+	utils.RequireRoot(t)
+	utils.HostInit(t)
+
+	type testDefinition struct {
+		config Config
+	}
+
+	for name, test := range map[string]testDefinition{
+		"invalid_cwd_size": {
+			config: Config{
+				Cwd: FieldConfig{
+					Enabled: true,
+					Size:    3, // Invalid size, must be power of 2
+				},
+			},
+		},
+		"cwd_zero_size": {
+			config: Config{
+				Cwd: FieldConfig{
+					Enabled: true,
+					Size:    0, // Invalid size, must be power of 2 and greater than 0
+				},
+			},
+		},
+		"invalid_exepath_size": {
+			config: Config{
+				Exepath: FieldConfig{
+					Enabled: true,
+					Size:    3, // Invalid size, must be power of 2
+				},
+			},
+		},
+		"too_big_cwd_size": {
+			config: Config{
+				Cwd: FieldConfig{
+					Enabled: true,
+					Size:    4096 * 2, // Too big, max is 4096
+				},
+			},
+		},
+		"too_big_exepath_size": {
+			config: Config{
+				Exepath: FieldConfig{
+					Enabled: true,
+					Size:    4096 * 2, // Too big, max is 4096
+				},
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := NewSocketEnricher(test.config)
+			require.Error(t, err)
+		})
+	}
 }
 
 type sockOpt struct {
@@ -64,24 +124,41 @@ type sockOpt struct {
 }
 
 type socketEnricherMapEntry struct {
-	Key   socketenricherSocketsKey
-	Value socketenricherSocketsValue
+	Key   socketenricherGadgetSocketKey
+	Value socketenricherGadgetSocketValue
 }
 
 func TestSocketEnricherBind(t *testing.T) {
 	t.Parallel()
 
-	utilstest.RequireRoot(t)
-	utilstest.HostInit(t)
+	utils.RequireRoot(t)
+	utils.HostInit(t)
+
+	cwd, err := os.Getwd()
+	require.NoError(t, err, "Cannot get current working directory")
+	exepath, err := os.Readlink("/proc/self/exe")
+	require.NoError(t, err, "Cannot get current executable path")
+	ptask := host.GetProcComm(os.Getppid())
 
 	type testDefinition struct {
-		runnerConfig  *utilstest.RunnerConfig
+		runnerConfig  *utils.RunnerConfig
 		generateEvent func() (uint16, int, error)
-		expectedEvent func(info *utilstest.RunnerInfo, port uint16) *socketEnricherMapEntry
+		expectedEvent func(info *utils.RunnerInfo, port uint16) *socketEnricherMapEntry
 	}
 
+	// Golang generics cannot parameterize array sizes
+	// https://github.com/golang/go/issues/44253
 	stringToSlice := func(s string) (ret [16]int8) {
 		for i := 0; i < 16; i++ {
+			if i >= len(s) {
+				break
+			}
+			ret[i] = int8(s[i])
+		}
+		return
+	}
+	stringToSlice4096 := func(s string) (ret [4096]int8) {
+		for i := 0; i < 4096; i++ {
 			if i >= len(s) {
 				break
 			}
@@ -93,36 +170,46 @@ func TestSocketEnricherBind(t *testing.T) {
 	for name, test := range map[string]testDefinition{
 		"udp": {
 			generateEvent: bindSocketFn("127.0.0.1", unix.AF_INET, unix.SOCK_DGRAM, 0),
-			expectedEvent: func(info *utilstest.RunnerInfo, port uint16) *socketEnricherMapEntry {
+			expectedEvent: func(info *utils.RunnerInfo, port uint16) *socketEnricherMapEntry {
 				return &socketEnricherMapEntry{
-					Key: socketenricherSocketsKey{
+					Key: socketenricherGadgetSocketKey{
 						Netns:  uint32(info.NetworkNsID),
 						Family: unix.AF_INET,
 						Proto:  unix.IPPROTO_UDP,
 						Port:   port,
 					},
-					Value: socketenricherSocketsValue{
+					Value: socketenricherGadgetSocketValue{
 						Mntns:   info.MountNsID,
 						PidTgid: uint64(uint32(info.Pid))<<32 + uint64(info.Tid),
+						Ppid:    uint32(os.Getppid()),
+						Ptid:    uint32(os.Getppid()),
 						Task:    stringToSlice("socketenricher."),
+						Ptask:   stringToSlice(ptask),
+						Cwd:     stringToSlice4096(cwd),
+						Exepath: stringToSlice4096(exepath),
 					},
 				}
 			},
 		},
 		"udp6": {
 			generateEvent: bindSocketFn("::", unix.AF_INET6, unix.SOCK_DGRAM, 0),
-			expectedEvent: func(info *utilstest.RunnerInfo, port uint16) *socketEnricherMapEntry {
+			expectedEvent: func(info *utils.RunnerInfo, port uint16) *socketEnricherMapEntry {
 				return &socketEnricherMapEntry{
-					Key: socketenricherSocketsKey{
+					Key: socketenricherGadgetSocketKey{
 						Netns:  uint32(info.NetworkNsID),
 						Family: unix.AF_INET6,
 						Proto:  unix.IPPROTO_UDP,
 						Port:   port,
 					},
-					Value: socketenricherSocketsValue{
+					Value: socketenricherGadgetSocketValue{
 						Mntns:   info.MountNsID,
 						PidTgid: uint64(uint32(info.Pid))<<32 + uint64(info.Tid),
+						Ppid:    uint32(os.Getppid()),
+						Ptid:    uint32(os.Getppid()),
 						Task:    stringToSlice("socketenricher."),
+						Ptask:   stringToSlice(ptask),
+						Cwd:     stringToSlice4096(cwd),
+						Exepath: stringToSlice4096(exepath),
 					},
 				}
 			},
@@ -134,55 +221,70 @@ func TestSocketEnricherBind(t *testing.T) {
 				}
 				return bindSocketWithOpts("::", unix.AF_INET6, unix.SOCK_DGRAM, 0, opts)
 			},
-			expectedEvent: func(info *utilstest.RunnerInfo, port uint16) *socketEnricherMapEntry {
+			expectedEvent: func(info *utils.RunnerInfo, port uint16) *socketEnricherMapEntry {
 				return &socketEnricherMapEntry{
-					Key: socketenricherSocketsKey{
+					Key: socketenricherGadgetSocketKey{
 						Netns:  uint32(info.NetworkNsID),
 						Family: unix.AF_INET6,
 						Proto:  unix.IPPROTO_UDP,
 						Port:   port,
 					},
-					Value: socketenricherSocketsValue{
+					Value: socketenricherGadgetSocketValue{
 						Mntns:    info.MountNsID,
 						PidTgid:  uint64(uint32(info.Pid))<<32 + uint64(info.Tid),
+						Ppid:     uint32(os.Getppid()),
+						Ptid:     uint32(os.Getppid()),
 						Task:     stringToSlice("socketenricher."),
+						Ptask:    stringToSlice(ptask),
 						Ipv6only: int8(1),
+						Cwd:      stringToSlice4096(cwd),
+						Exepath:  stringToSlice4096(exepath),
 					},
 				}
 			},
 		},
 		"tcp": {
 			generateEvent: bindSocketFn("127.0.0.1", unix.AF_INET, unix.SOCK_STREAM, 0),
-			expectedEvent: func(info *utilstest.RunnerInfo, port uint16) *socketEnricherMapEntry {
+			expectedEvent: func(info *utils.RunnerInfo, port uint16) *socketEnricherMapEntry {
 				return &socketEnricherMapEntry{
-					Key: socketenricherSocketsKey{
+					Key: socketenricherGadgetSocketKey{
 						Netns:  uint32(info.NetworkNsID),
 						Family: unix.AF_INET,
 						Proto:  unix.IPPROTO_TCP,
 						Port:   port,
 					},
-					Value: socketenricherSocketsValue{
+					Value: socketenricherGadgetSocketValue{
 						Mntns:   info.MountNsID,
 						PidTgid: uint64(uint32(info.Pid))<<32 + uint64(info.Tid),
+						Ppid:    uint32(os.Getppid()),
+						Ptid:    uint32(os.Getppid()),
 						Task:    stringToSlice("socketenricher."),
+						Ptask:   stringToSlice(ptask),
+						Cwd:     stringToSlice4096(cwd),
+						Exepath: stringToSlice4096(exepath),
 					},
 				}
 			},
 		},
 		"tcp6": {
 			generateEvent: bindSocketFn("::", unix.AF_INET6, unix.SOCK_STREAM, 0),
-			expectedEvent: func(info *utilstest.RunnerInfo, port uint16) *socketEnricherMapEntry {
+			expectedEvent: func(info *utils.RunnerInfo, port uint16) *socketEnricherMapEntry {
 				return &socketEnricherMapEntry{
-					Key: socketenricherSocketsKey{
+					Key: socketenricherGadgetSocketKey{
 						Netns:  uint32(info.NetworkNsID),
 						Family: unix.AF_INET6,
 						Proto:  unix.IPPROTO_TCP,
 						Port:   port,
 					},
-					Value: socketenricherSocketsValue{
+					Value: socketenricherGadgetSocketValue{
 						Mntns:   info.MountNsID,
 						PidTgid: uint64(uint32(info.Pid))<<32 + uint64(info.Tid),
+						Ppid:    uint32(os.Getppid()),
+						Ptid:    uint32(os.Getppid()),
 						Task:    stringToSlice("socketenricher."),
+						Ptask:   stringToSlice(ptask),
+						Cwd:     stringToSlice4096(cwd),
+						Exepath: stringToSlice4096(exepath),
 					},
 				}
 			},
@@ -194,39 +296,49 @@ func TestSocketEnricherBind(t *testing.T) {
 				}
 				return bindSocketWithOpts("::", unix.AF_INET6, unix.SOCK_STREAM, 0, opts)
 			},
-			expectedEvent: func(info *utilstest.RunnerInfo, port uint16) *socketEnricherMapEntry {
+			expectedEvent: func(info *utils.RunnerInfo, port uint16) *socketEnricherMapEntry {
 				return &socketEnricherMapEntry{
-					Key: socketenricherSocketsKey{
+					Key: socketenricherGadgetSocketKey{
 						Netns:  uint32(info.NetworkNsID),
 						Family: unix.AF_INET6,
 						Proto:  unix.IPPROTO_TCP,
 						Port:   port,
 					},
-					Value: socketenricherSocketsValue{
+					Value: socketenricherGadgetSocketValue{
 						Mntns:    info.MountNsID,
 						PidTgid:  uint64(uint32(info.Pid))<<32 + uint64(info.Tid),
+						Ppid:     uint32(os.Getppid()),
+						Ptid:     uint32(os.Getppid()),
 						Task:     stringToSlice("socketenricher."),
+						Ptask:    stringToSlice(ptask),
 						Ipv6only: int8(1),
+						Cwd:      stringToSlice4096(cwd),
+						Exepath:  stringToSlice4096(exepath),
 					},
 				}
 			},
 		},
 		"tcp_uid_gid": {
-			runnerConfig:  &utilstest.RunnerConfig{Uid: 1000, Gid: 1111},
+			runnerConfig:  &utils.RunnerConfig{Uid: 1000, Gid: 1111},
 			generateEvent: bindSocketFn("127.0.0.1", unix.AF_INET, unix.SOCK_STREAM, 0),
-			expectedEvent: func(info *utilstest.RunnerInfo, port uint16) *socketEnricherMapEntry {
+			expectedEvent: func(info *utils.RunnerInfo, port uint16) *socketEnricherMapEntry {
 				return &socketEnricherMapEntry{
-					Key: socketenricherSocketsKey{
+					Key: socketenricherGadgetSocketKey{
 						Netns:  uint32(info.NetworkNsID),
 						Family: unix.AF_INET,
 						Proto:  unix.IPPROTO_TCP,
 						Port:   port,
 					},
-					Value: socketenricherSocketsValue{
+					Value: socketenricherGadgetSocketValue{
 						Mntns:   info.MountNsID,
 						PidTgid: uint64(uint32(info.Pid))<<32 + uint64(info.Tid),
+						Ppid:    uint32(os.Getppid()),
+						Ptid:    uint32(os.Getppid()),
 						UidGid:  uint64(1111)<<32 + uint64(1000),
 						Task:    stringToSlice("socketenricher."),
+						Ptask:   stringToSlice(ptask),
+						Cwd:     stringToSlice4096(cwd),
+						Exepath: stringToSlice4096(exepath),
 					},
 				}
 			},
@@ -237,39 +349,43 @@ func TestSocketEnricherBind(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			runner := utilstest.NewRunnerWithTest(t, test.runnerConfig)
+			seConfig := Config{
+				Cwd: FieldConfig{
+					Enabled: true,
+					Size:    4096,
+				},
+				Exepath: FieldConfig{
+					Enabled: true,
+					Size:    4096,
+				},
+			}
+			runner := utils.NewRunnerWithTest(t, test.runnerConfig)
 
 			// We will test 2 scenarios with 2 different tracers:
 			// 1. earlyTracer will be started before the event is generated
 			// 2. lateTracer will be started after the event is generated
-			earlyTracer, err := NewSocketEnricher()
-			if err != nil {
-				t.Fatal(err)
-			}
+			earlyTracer, err := NewSocketEnricher(seConfig)
+			require.NoError(t, err)
 			t.Cleanup(earlyTracer.Close)
 
 			// Generate the event in the fake container
 			var port uint16
 			var fd int
-			utilstest.RunWithRunner(t, runner, func() error {
+			utils.RunWithRunner(t, runner, func() error {
 				var err error
 				port, fd, err = test.generateEvent()
-
 				t.Cleanup(func() {
 					// cleanup only if it has not been already closed
 					if fd != -1 {
 						unix.Close(fd)
 					}
 				})
-
 				return err
 			})
 
 			// Start the late tracer after the event has been generated
-			lateTracer, err := NewSocketEnricher()
-			if err != nil {
-				t.Fatal(err)
-			}
+			lateTracer, err := NewSocketEnricher(seConfig)
+			require.NoError(t, err)
 			t.Cleanup(lateTracer.Close)
 
 			earlyNormalize := func(entry *socketEnricherMapEntry) {
@@ -295,16 +411,16 @@ func TestSocketEnricherBind(t *testing.T) {
 
 			t.Logf("Testing if early tracer noticed the event")
 			entries := socketsMapEntries(t, earlyTracer, earlyNormalize, nil)
-			utilstest.ExpectAtLeastOneEvent(test.expectedEvent)(t, runner.Info, port, entries)
+			utils.ExpectAtLeastOneEvent(test.expectedEvent)(t, runner.Info, port, entries)
 
 			t.Logf("Testing if late tracer noticed the event")
 			entries2 := socketsMapEntries(t, lateTracer, lateNormalize, nil)
-			expectedEvent2 := func(info *utilstest.RunnerInfo, port uint16) *socketEnricherMapEntry {
+			expectedEvent2 := func(info *utils.RunnerInfo, port uint16) *socketEnricherMapEntry {
 				e := test.expectedEvent(info, port)
 				lateNormalize(e)
 				return e
 			}
-			utilstest.ExpectAtLeastOneEvent(expectedEvent2)(t, runner.Info, port, entries2)
+			utils.ExpectAtLeastOneEvent(expectedEvent2)(t, runner.Info, port, entries2)
 
 			t.Logf("Close socket in order to check for cleanup")
 			if fd != -1 {
@@ -320,15 +436,11 @@ func TestSocketEnricherBind(t *testing.T) {
 
 			t.Logf("Testing if entry is cleaned properly in early tracer")
 			entries = socketsMapEntries(t, earlyTracer, earlyNormalize, filter)
-			if len(entries) != 0 {
-				t.Fatalf("Entry not cleaned properly: %+v", entries)
-			}
+			require.Len(t, entries, 0, "Entry not cleaned properly: %+v", entries)
 
 			t.Logf("Testing if entry is cleaned properly in late tracer")
 			entries2 = socketsMapEntries(t, lateTracer, lateNormalize, filter)
-			if len(entries2) != 0 {
-				t.Fatalf("Entry for late tracer not cleaned properly: %+v", entries2)
-			}
+			require.Len(t, entries2, 0, "Entry for late tracer not cleaned properly: %+v", entries2)
 		})
 	}
 }
@@ -340,8 +452,8 @@ func socketsMapEntries(
 	filter func(*socketEnricherMapEntry) bool,
 ) (entries []socketEnricherMapEntry) {
 	iter := tracer.SocketsMap().Iterate()
-	var key socketenricherSocketsKey
-	var value socketenricherSocketsValue
+	var key socketenricherGadgetSocketKey
+	var value socketenricherGadgetSocketValue
 	for iter.Next(&key, &value) {
 		entry := socketEnricherMapEntry{
 			Key:   key,
@@ -355,9 +467,7 @@ func socketsMapEntries(
 		}
 		entries = append(entries, entry)
 	}
-	if err := iter.Err(); err != nil {
-		t.Fatal("Cannot iterate over socket enricher map:", err)
-	}
+	require.NoError(t, iter.Err(), "Cannot iterate over socket enricher map")
 	return entries
 }
 

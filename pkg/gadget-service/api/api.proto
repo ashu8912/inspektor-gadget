@@ -18,38 +18,6 @@ option go_package = "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-ser
 
 package api;
 
-message BuiltInGadgetRunRequest {
-  // name of the gadget as returned by gadgetDesc.Name()
-  string gadgetName = 1;
-
-  // category of the gadget as returned by gadgetDesc.Category()
-  string gadgetCategory = 2;
-
-  // params is a combined map of all params a gadget could need (including those
-  // of runtime and operators, which need specific prefixes, see implementation in
-  // pkg/runtime/grpc)
-  map<string, string> params = 3;
-
-  // args are all parameters which were not specified with a flag
-  repeated string args = 4;
-
-  // a list of nodes the gadget should run on; if not specified, it should run
-  // on all nodes
-  repeated string nodes = 10;
-
-  // if set to true, the gadget service should forward the request to each node
-  // from the nodes list (or each node it knows, if the list is empty) and combine
-  // their output
-  bool fanOut = 11;
-
-  // sets the requested log level (see pkg/logger/logger.go)
-  uint32 logLevel = 12;
-
-  // time that a gadget should run; use 0, if the gadget should run until it's being
-  // stopped or done; time is in nanoseconds and directly converted to time.Duration
-  int64 timeout = 13;
-}
-
 message GadgetRunRequest {
   string imageName = 1;
 
@@ -72,7 +40,12 @@ message GadgetRunRequest {
   int64 timeout = 13;
 }
 
-message BuiltInGadgetStopRequest {
+message GadgetAttachRequest {
+  // id of the gadget to attach to
+  string id = 1;
+
+  // used to inform the server about the expected protocol version
+  uint32 version = 2;
 }
 
 message GadgetEvent {
@@ -83,12 +56,7 @@ message GadgetEvent {
   uint32 dataSourceID = 4;
 }
 
-message BuiltInGadgetControlRequest {
-  oneof Event {
-    BuiltInGadgetRunRequest runRequest = 1;
-    BuiltInGadgetStopRequest stopRequest = 2;
-  }
-}
+
 
 message GadgetStopRequest {
 }
@@ -97,6 +65,7 @@ message GadgetControlRequest {
   oneof Event {
     GadgetRunRequest runRequest = 1;
     GadgetStopRequest stopRequest = 2;
+    GadgetAttachRequest attachRequest = 3;
   }
 }
 
@@ -106,9 +75,27 @@ message InfoRequest {
 
 message InfoResponse {
   string version = 1;
-  bytes catalog = 2;
   bool experimental = 3;
   string serverVersion = 4;
+
+  // serverIsHostPidNs tells whether the process serving this request runs in
+  // the PID namespace of PID 1, as seen through the procfs of the host. It is
+  // unset when it could not be determined, which is also the case when talking
+  // to a server that is too old to report it.
+  optional bool serverIsHostPidNs = 5;
+
+  // serverIsInitPidNs tells whether the process serving this request runs in
+  // the PID namespace the kernel created at boot time. It is unset when it
+  // could not be determined, which is also the case when talking to a server
+  // that is too old to report it.
+  //
+  // This is stricter than serverIsHostPidNs: when Inspektor Gadget runs on a
+  // node that is itself containerized, for instance a minikube node started
+  // with the docker driver, serverIsHostPidNs can be true while this is false.
+  // Features handling PIDs reported by eBPF programs, such as the OTel eBPF
+  // profiler symbolizer, need this one, since those PIDs are always relative
+  // to the initial PID namespace.
+  optional bool serverIsInitPidNs = 6;
 }
 
 message DataElement {
@@ -139,6 +126,7 @@ message Param {
   repeated string possibleValues = 9;
   bool isMandatory = 10;
   string prefix = 11;
+  string alternativeKey = 12;
 }
 
 message GadgetInfo {
@@ -148,6 +136,19 @@ message GadgetInfo {
   map<string, string> annotations = 5;
   bytes metadata = 6;
   repeated Param params = 7;
+  string id = 8;
+  ExtraInfo extraInfo = 9;
+}
+
+message ExtraInfo {
+  // key can be "wasm.upcalls", "ebpf.sections", etc
+  map<string, GadgetInspectAddendum> data = 1;
+}
+
+message GadgetInspectAddendum {
+  // contentType could be application/json, text/plain, text/mermaid, text/markdown...
+  string contentType = 1;
+  bytes content = 2;
 }
 
 message DataSource {
@@ -237,18 +238,87 @@ message GetGadgetInfoRequest {
 
   // can be used to inform about the expected version of GadgetInfo
   uint32 version = 3;
+
+  uint32 flags = 4;
+
+  // can be used to include more info for debugging (e.g., in ig image inspect)
+  bool requestExtraInfo = 5;
 }
 
 message GetGadgetInfoResponse {
   GadgetInfo gadgetInfo = 1;
 }
 
+message CreateGadgetInstanceRequest {
+  GadgetInstance gadgetInstance = 1;
+  int32 eventBufferLength = 2;
+}
+
+message CreateGadgetInstanceResponse {
+  int32 result = 1;
+  GadgetInstance gadgetInstance = 2;
+}
+
+message ListGadgetInstancesRequest {}
+
+message GadgetInstance {
+  // id is the unique ID of the instance; this can be set by the client but overridden from the server, depending on the
+  // environment; must contain only hex characters in lowercase
+  string id = 1;
+  GadgetRunRequest gadgetConfig = 2;
+
+  // tags can hold multiple opaque strings so that users can more easily find their gadget instances
+  repeated string tags = 3;
+
+  // timeCreated holds the time the instance was created as a UNIX timestamp
+  int64 timeCreated = 4;
+
+  // name is a (non-unique) string assigned to a gadget, set by the client
+  string name = 6;
+
+  // nodes is a list of nodes the gadget should run on; if empty, all nodes will run the gadget
+  repeated string nodes = 5;
+
+  // state can be used to reflect the current state of the gadget instance
+  GadgetInstanceState state = 7;
+}
+
+enum GadgetInstanceStatus {
+  StatusInvalid = 0;
+  StatusRunning = 1;
+  StatusError = 2;
+}
+
+message GadgetInstanceState {
+  GadgetInstanceStatus status = 1;
+  string message = 2;
+}
+
+message ListGadgetInstanceResponse {
+  repeated GadgetInstance gadgetInstances = 1;
+}
+
+message GadgetInstanceId {
+  string id = 1;
+}
+
+message StatusResponse {
+  int32 result = 1;
+  string message = 2;
+}
+
 service BuiltInGadgetManager {
   rpc GetInfo(InfoRequest) returns (InfoResponse) {}
-  rpc RunBuiltInGadget(stream BuiltInGadgetControlRequest) returns (stream GadgetEvent) {}
 }
 
 service GadgetManager {
   rpc GetGadgetInfo(GetGadgetInfoRequest) returns (GetGadgetInfoResponse) {}
   rpc RunGadget(stream GadgetControlRequest) returns (stream GadgetEvent) {}
+}
+
+service GadgetInstanceManager {
+  rpc CreateGadgetInstance(CreateGadgetInstanceRequest) returns (CreateGadgetInstanceResponse) {}
+  rpc ListGadgetInstances(ListGadgetInstancesRequest) returns (ListGadgetInstanceResponse) {}
+  rpc GetGadgetInstance(GadgetInstanceId) returns (GadgetInstance) {}
+  rpc RemoveGadgetInstance(GadgetInstanceId) returns (StatusResponse) {}
 }

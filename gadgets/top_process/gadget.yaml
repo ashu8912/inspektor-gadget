@@ -1,0 +1,80 @@
+name: top process
+description: Periodically report process statistics
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/top_process
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/top_process
+operator:
+  process:
+    emitstats: true
+    interval: 3s
+    first-interval: 250ms
+datasources:
+  processes:
+    annotations:
+      cli.clear-screen-before: "true"
+    fields:
+      startTimeStr:
+        annotations:
+          columns.alias: 'STARTTIME'
+      priority:
+        annotations:
+          columns.alias: 'PR'
+      nice:
+        annotations:
+          columns.alias: 'NI'
+      cpuTimeStr:
+        annotations:
+          columns.alias: 'TIME+'
+      cpu:
+        annotations:
+          columns.alias: '%CPU'
+      cpuRelative:
+        annotations:
+          columns.alias: '%RELCPU'
+      memRelative:
+        annotations:
+          columns.alias: '%MEM'
+      memRSS:
+        annotations:
+          columns.alias: 'RES'
+          columns.maxWidth: 12
+      memShared:
+        annotations:
+          columns.alias: 'SHR'
+          columns.maxWidth: 12
+      memVirtual:
+        annotations:
+          columns.alias: 'VIRT'
+          columns.maxWidth: 12
+      comm:
+        annotations:
+          columns.alias: 'COMMAND'
+          columns.with: 32
+          columns.maxwidth: 80
+          columns.ellipsis: end
+      threadCount:
+        annotations:
+          columns.alias: 'THR'
+          columns.maxWidth: 3
+      state:
+        annotations:
+          columns.alias: 'S'
+          columns.maxWidth: 1
+params:
+  custom:
+    interval:
+      description: "interval to re-read statistics"
+      defaultValue: 3s
+      patch:
+        operator:
+          process:
+            interval: >-
+              {{call .getParamValue "custom.interval"}}
+    count:
+      description: "number of reports"
+      defaultValue: 0
+      patch:
+        operator:
+          process:
+            count: >-
+              {{call .getParamValue "custom.count"}}

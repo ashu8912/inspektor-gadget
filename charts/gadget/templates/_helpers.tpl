@@ -34,6 +34,7 @@ app.kubernetes.io/component: controller
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: inspektor-gadget
 {{- if .Values.additionalLabels.enabled }}
 {{- if .Values.additionalLabels }}
 {{ toYaml .Values.additionalLabels }}
@@ -59,4 +60,77 @@ Image tag
 {{- else }}
 {{- .Chart.AppVersion }}
 {{- end }}
+{{- end }}
+
+{{/*
+Operator configuration
+*/}}
+{{- define "gadget.operatorConfig" -}}
+{{- $operator := deepCopy .Values.config.operator | default (dict) -}}
+{{- if hasKey .Values.config "hookMode" }}
+  {{- $merged := mergeOverwrite
+      (get $operator "kubemanager" | default dict)
+      (dict "hook-mode" .Values.config.hookMode)
+    }}
+  {{- $operator = set $operator "kubemanager" $merged }}
+{{- end }}
+{{- if hasKey .Values.config "fallbackPodInformer" }}
+  {{- $merged := mergeOverwrite
+      (get $operator "kubemanager" | default dict)
+      (dict "fallback-podinformer" .Values.config.fallbackPodInformer)
+    }}
+  {{- $operator = set $operator "kubemanager" $merged }}
+{{- end }}
+{{- if hasKey .Values.config "verifyGadgets" }}
+  {{- $merged := mergeOverwrite
+      (get $operator "oci" | default dict)
+      (dict "verify-image" .Values.config.verifyGadgets)
+    }}
+  {{- $operator = set $operator "oci" $merged }}
+{{- end }}
+{{- if hasKey .Values.config "gadgetsPublicKeys" }}
+  {{- $merged := mergeOverwrite
+      (get $operator "oci" | default dict)
+      (dict "public-keys" .Values.config.gadgetsPublicKeys)
+    }}
+  {{- $operator = set $operator "oci" $merged }}
+{{- end }}
+{{- if hasKey .Values.config "allowedGadgets" }}
+  {{- $merged := mergeOverwrite
+      (get $operator "oci" | default dict)
+      (dict "allowed-gadgets" .Values.config.allowedGadgets)
+    }}
+  {{- $operator = set $operator "oci" $merged }}
+{{- end }}
+{{- if hasKey .Values.config "disallowGadgetsPulling" }}
+  {{- $merged := mergeOverwrite
+      (get $operator "oci" | default dict)
+      (dict "disallow-pulling" .Values.config.disallowGadgetsPulling)
+    }}
+  {{- $operator = set $operator "oci" $merged }}
+{{- end }}
+{{- if hasKey .Values.config "otelMetricsListen" }}
+  {{- $merged := mergeOverwrite
+      (get $operator "otel-metrics" | default dict)
+      (dict "otel-metrics-listen" .Values.config.otelMetricsListen)
+    }}
+  {{- $operator = set $operator "otel-metrics" $merged }}
+{{- end }}
+{{- if hasKey .Values.config "otelMetricsAddress" }}
+  {{- $merged := mergeOverwrite
+      (get $operator "otel-metrics" | default dict)
+      (dict "otel-metrics-listen-address" .Values.config.otelMetricsAddress)
+    }}
+  {{- $operator = set $operator "otel-metrics" $merged }}
+{{- end }}
+{{- toYaml $operator }}
+{{- end }}
+
+{{/*
+Prometheus scrape port
+*/}}
+{{- define "gadget.otelMetricsPort" -}}
+{{- $operator := include "gadget.operatorConfig" . | fromYaml -}}
+{{- $listenAddress := dig "otel-metrics" "otel-metrics-listen-address" "" $operator -}}
+{{- regexFind ":[0-9]+$" (toString $listenAddress) | trimPrefix ":" | default "2224" -}}
 {{- end }}

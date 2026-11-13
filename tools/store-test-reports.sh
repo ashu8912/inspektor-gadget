@@ -35,12 +35,17 @@ function store-reports {
     mkdir -p data
     echo '{}' > data/workflows.json
   fi
-  for i in ../test-report_*_*.json; do
+  for i in ../test-reports-*-*/test-report_*_*.json; do
       job_key=$(basename $i .json | sed 's/test-report_//')
       jq --slurpfile obj $i \
       --arg job_key ${job_key} \
       '.[$job_key] = (.[$job_key][-99:] + $obj)' \
       data/workflows.json > workflows.json.tmp
+      if [ ! -s workflows.json.tmp ]; then
+        echo "Skipping empty file: $i" >&2
+        rm workflows.json.tmp
+        continue
+      fi
       mv workflows.json.tmp data/workflows.json
   done
 

@@ -1,4 +1,4 @@
-// Copyright 2024 The Inspektor Gadget authors
+// Copyright 2024-2025 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,15 +16,27 @@ package clioperator
 
 import (
 	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"runtime"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcapgo"
+	"golang.org/x/term"
 	"sigs.k8s.io/yaml"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource/formatters/json"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
 	apihelpers "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api-helpers"
+	metadatav1 "github.com/inspektor-gadget/inspektor-gadget/pkg/metadata/v1"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/params"
 )
@@ -41,6 +53,44 @@ const (
 	ModeJSONPretty = "jsonpretty"
 	ModeColumns    = "columns"
 	ModeYAML       = "yaml"
+	ModeNone       = "none"
+	ModeRaw        = "raw"
+	ModePCAPNG     = "pcap-ng"
+
+	DefaultOutputMode = ModeColumns
+
+	// AnnotationClearScreenBefore can be used to clear the screen before printing a new event; usually used for
+	// array events
+	AnnotationClearScreenBefore = "cli.clear-screen-before"
+
+	// AnnotationSupportedOutputModes can be used to specify the supported
+	// output modes for a DataSource in a comma-separated list.
+	AnnotationSupportedOutputModes = "cli.supported-output-modes"
+
+	// AnnotationDefaultOutputMode can be used to specify the default output mode for a DataSource.
+	AnnotationDefaultOutputMode = "cli.default-output-mode"
+
+	// AnnotationPCAPPayload must point to the field carrying the binary payload of a packet
+	AnnotationPCAPPayload = "pcap.payload"
+
+	// AnnotationPCAPTimestamp must point to the field containing the capture timestamp of a packet
+	AnnotationPCAPTimestamp = "pcap.timestamp"
+
+	// AnnotationPCAPPacketLen must point to the field containing the original length of the packet
+	AnnotationPCAPPacketLen = "pcap.packet-length"
+
+	// AnnotationPCAPInterfaceKey (if set to true) defines for a field to become part of the interface key
+	// (a composite of host info and interface info that makes it unique)
+	AnnotationPCAPInterfaceKey = "pcap.interface-key"
+
+	// AnnotationPCAPInterfaceVar registers a field to become part of the interface comment variables
+	// with the given name
+	AnnotationPCAPInterfaceVar = "pcap.interface-var"
+)
+
+var (
+	DefaultSupportedOutputModes = []string{ModeColumns, ModeJSON, ModeJSONPretty, ModeNone, ModeYAML}
+	cliWriteMutex               = sync.Mutex{}
 )
 
 type cliOperator struct{}
@@ -63,8 +113,9 @@ func (o *cliOperator) InstanceParams() api.Params {
 
 func (o *cliOperator) InstantiateDataOperator(gadgetCtx operators.GadgetContext, paramValues api.ParamValues) (operators.DataOperatorInstance, error) {
 	op := &cliOperatorInstance{
-		mode:        ModeColumns,
-		paramValues: paramValues,
+		paramValues:          paramValues,
+		supportedOutputModes: make(map[string][]string),
+		defaultOutputMode:    make(map[string]string),
 	}
 
 	return op, nil
@@ -75,8 +126,11 @@ func (o *cliOperator) Priority() int {
 }
 
 type cliOperatorInstance struct {
-	mode        string
 	paramValues api.ParamValues
+	// key: datasource name, value: supported output modes
+	supportedOutputModes map[string][]string
+	// key: datasource name, value: default output mode
+	defaultOutputMode map[string]string
 }
 
 func (o *cliOperatorInstance) Name() string {
@@ -98,17 +152,20 @@ func getNamesFromFields(fields []*api.Field) []string {
 func (o *cliOperatorInstance) ExtraParams(gadgetCtx operators.GadgetContext) api.Params {
 	dataSources := gadgetCtx.GetDataSources()
 
-	nameDS := false
+	nameDS := len(dataSources) > 1
 
 	// if we have multiple DataSources, we need to prefix the list of fields with the DataSource's name
-	if len(dataSources) > 1 {
-		nameDS = true
-	}
 
 	fieldsDefaultValues := make([]string, 0, len(dataSources))
 	fieldsDescriptions := make([]string, 0, len(dataSources)+1)
 	fieldsDescriptions = append(fieldsDescriptions, "Available data sources / fields")
+	outputDescriptions := make([]string, 0, len(dataSources))
+	outputDescriptions = append(outputDescriptions,
+		`Specifies output mode for all ("mode1") or per data source ("datasource:mode1,datasource2:mode2")
+  Supported data sources / output modes:`)
+	outputDefaultValues := make([]string, 0, len(dataSources))
 	for _, ds := range dataSources {
+		// Fields
 		fields := ds.Fields()
 		availableFields := make([]*api.Field, 0, len(fields))
 		defaultFields := make([]*api.Field, 0)
@@ -146,11 +203,48 @@ func (o *cliOperatorInstance) ExtraParams(gadgetCtx operators.GadgetContext) api
 		fmt.Fprintf(&sb, "  %q (data source):\n", ds.Name())
 		for _, f := range availableFields {
 			fmt.Fprintf(&sb, "    %s\n", f.FullName)
-			if desc, ok := f.Annotations["description"]; ok { // TODO: const to API?
+			if desc, ok := f.Annotations[metadatav1.DescriptionAnnotation]; ok {
 				fmt.Fprintf(&sb, "      %s\n", desc)
+			}
+			if oneOf, ok := f.Annotations[metadatav1.ValueOneOfAnnotation]; ok {
+				fmt.Fprintf(&sb, "      One of: %s\n", oneOf)
 			}
 		}
 		fieldsDescriptions = append(fieldsDescriptions, sb.String())
+
+		// Supported output modes
+		supportedOutputs := DefaultSupportedOutputModes
+		if supportedOutputsAnnotated, ok := ds.Annotations()[AnnotationSupportedOutputModes]; ok {
+			supportedOutputs = strings.Split(supportedOutputsAnnotated, ",")
+		}
+		sort.Strings(supportedOutputs)
+		o.supportedOutputModes[ds.Name()] = supportedOutputs
+
+		sb.Reset()
+		fmt.Fprintf(&sb, "    %q (data source):\n", ds.Name())
+		for _, mode := range supportedOutputs {
+			fmt.Fprintf(&sb, "      %s\n", mode)
+		}
+		outputDescriptions = append(outputDescriptions, sb.String())
+
+		// Default output mode
+		defaultOutput := DefaultOutputMode
+		if defaultOutputAnnotated, ok := ds.Annotations()[AnnotationDefaultOutputMode]; ok {
+			if !slices.Contains(supportedOutputs, defaultOutputAnnotated) {
+				// This shouldn't happen, it should be caught by the validation at compile time
+				gadgetCtx.Logger().Warnf("default output mode %q for data source %q is not supported",
+					defaultOutputAnnotated, ds.Name())
+				continue
+			}
+			defaultOutput = defaultOutputAnnotated
+		} else if !slices.Contains(supportedOutputs, DefaultOutputMode) {
+			defaultOutput = supportedOutputs[0]
+		}
+		o.defaultOutputMode[ds.Name()] = defaultOutput
+		if nameDS {
+			defaultOutput = ds.Name() + ":" + defaultOutput
+		}
+		outputDefaultValues = append(outputDefaultValues, defaultOutput)
 	}
 
 	// --fields datasource:comma,separated,fields;datasource2:comma,separated,fields
@@ -161,14 +255,54 @@ func (o *cliOperatorInstance) ExtraParams(gadgetCtx operators.GadgetContext) api
 	}
 
 	mode := &api.Param{
-		Key:            ParamMode,
-		DefaultValue:   ModeColumns,
-		Description:    "output mode",
-		Alias:          "o",
-		PossibleValues: []string{ModeJSON, ModeJSONPretty, ModeColumns, ModeYAML},
+		Key:          ParamMode,
+		DefaultValue: strings.Join(outputDefaultValues, ","),
+		Description:  strings.Join(outputDescriptions, "\n"),
+		Alias:        "o",
 	}
 
 	return api.Params{fields, mode}
+}
+
+func parseFields(fieldsString string, defaultFields []string) []string {
+	fields := strings.Split(fieldsString, ",")
+
+	addedFields := make([]string, 0, len(fields))
+	deletedFields := make([]string, 0, len(fields))
+	explicitFields := make([]string, 0, len(fields))
+
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		switch field[0] {
+		case '+':
+			addedFields = append(addedFields, field[1:])
+		case '-':
+			deletedFields = append(deletedFields, field[1:])
+		default:
+			if !slices.Contains(explicitFields, field) {
+				explicitFields = append(explicitFields, field)
+			}
+		}
+	}
+
+	result := defaultFields
+	if len(explicitFields) > 0 {
+		result = explicitFields
+	}
+
+	for _, field := range addedFields {
+		if !slices.Contains(result, field) {
+			result = append(result, field)
+		}
+	}
+
+	for _, field := range deletedFields {
+		result = slices.DeleteFunc(result, func(s string) bool { return s == field })
+	}
+	return result
 }
 
 func (o *cliOperatorInstance) PreStart(gadgetCtx operators.GadgetContext) error {
@@ -188,7 +322,10 @@ func (o *cliOperatorInstance) PreStart(gadgetCtx operators.GadgetContext) error 
 		fieldLookup[dsName] = dsFields
 	}
 
-	o.mode = params.Get(ParamMode).AsString()
+	modes, err := apihelpers.GetStringValuesPerDataSource(params.Get(ParamMode).AsString())
+	if err != nil {
+		return fmt.Errorf("parsing default output modes: %w", err)
+	}
 
 	for _, ds := range gadgetCtx.GetDataSources() {
 		gadgetCtx.Logger().Debugf("subscribing to %s", ds.Name())
@@ -198,11 +335,43 @@ func (o *cliOperatorInstance) PreStart(gadgetCtx operators.GadgetContext) error 
 			fields, hasFields = fieldLookup[""] // fall back to default
 		}
 
-		switch o.mode {
+		mode, ok := modes[ds.Name()]
+		if !ok {
+			mode, ok = modes[""]
+			if !ok {
+				// Users may specify the mode for one data source and not for
+				// another. In this case, we fall back to the default output
+				// mode for the ones that are not specified.
+				mode = o.defaultOutputMode[ds.Name()]
+			}
+		}
+
+		if !slices.Contains(o.supportedOutputModes[ds.Name()], mode) {
+			gadgetCtx.Logger().Warnf("output mode %q for data source %q is not supported; skipping data source",
+				mode, ds.Name())
+			continue
+		}
+
+		clearScreenBefore := ds.Annotations()[AnnotationClearScreenBefore] == "true"
+		isTerminal := term.IsTerminal(int(os.Stdout.Fd()))
+
+		switch mode {
+		default:
+			before := func() {}
+			if clearScreenBefore && isTerminal {
+				before = clearScreen
+			}
+			ds.Subscribe(func(ds datasource.DataSource, data datasource.Data) error {
+				before()
+				defaultDataFn(ds, data, os.Stdout)
+				return nil
+			}, Priority)
+		case ModeNone:
+			// Do nothing.
 		case ModeColumns:
 			p, err := ds.Parser()
 			if err != nil {
-				gadgetCtx.Logger().Debugf("failed to get parser: %v", err)
+				gadgetCtx.Logger().Warnf("failed to get parser: %v; skipping data source %q", err, ds.Name())
 				continue
 			}
 
@@ -211,31 +380,72 @@ func (o *cliOperatorInstance) PreStart(gadgetCtx operators.GadgetContext) error 
 			formatter := p.GetTextColumnsFormatter()
 
 			if hasFields {
-				err := formatter.SetShowColumns(strings.Split(fields, ","))
+				parsedFields := parseFields(fields, defCols)
+				err = formatter.SetShowColumns(parsedFields)
 				if err != nil {
-					return fmt.Errorf("setting fields: %w", err)
+					gadgetCtx.Logger().Warnf("failed to set fields: %v; skipping data source %q", err, ds.Name())
+					continue
 				}
 			}
 
 			formatter.SetEventCallback(func(s string) {
-				fmt.Print(s)
-				fmt.Print("\n")
+				fmt.Println(s)
 			})
 
-			p.SetEventCallback(formatter.EventHandlerFunc())
-			handler, ok := p.EventHandlerFunc().(func(data *datasource.DataTuple))
-			if !ok {
-				gadgetCtx.Logger().Warnf("invalid data format: expected func(data *datasource.DataTuple), got %T",
-					p.EventHandlerFunc())
-				continue
+			printHeader := func() {
+				fmt.Println(formatter.FormatHeader())
 			}
 
-			fmt.Println(formatter.FormatHeader())
+			headerFuncs := []func(){}
+			if clearScreenBefore && isTerminal {
+				headerFuncs = append(headerFuncs, clearScreen)
+			}
+			headerFuncs = append(headerFuncs, printHeader)
 
-			ds.Subscribe(func(ds datasource.DataSource, data datasource.Data) error {
-				handler(datasource.NewDataTuple(ds, data))
-				return nil
-			}, Priority)
+			switch ds.Type() {
+			case datasource.TypeSingle:
+				printHeader()
+				p.SetEventCallback(formatter.EventHandlerFunc())
+				handler, ok := p.EventHandlerFunc().(func(data *datasource.DataTuple))
+				if !ok {
+					gadgetCtx.Logger().Warnf("invalid data format: expected func(data *datasource.DataTuple), got %T; skipping data source %q",
+						p.EventHandlerFunc(), ds.Name())
+					continue
+				}
+				ds.Subscribe(func(ds datasource.DataSource, data datasource.Data) error {
+					handler(datasource.NewDataTuple(ds, data))
+					return nil
+				}, Priority)
+
+			case datasource.TypeArray:
+				// print the header before only for gadgets that will clean the
+				// screen later on, otherwise it could be printed multiple
+				// times.
+				if clearScreenBefore {
+					clearScreen()
+					printHeader()
+				}
+				p.SetEventCallback(formatter.EventHandlerFuncArray(headerFuncs...))
+				handler, ok := p.EventHandlerFuncArray().(func(data []*datasource.DataTuple))
+				if !ok {
+					gadgetCtx.Logger().Warnf("invalid data format: expected func(data []*datasource.DataTuple), got %T; skipping data source %q",
+						p.EventHandlerFunc(), ds.Name())
+					continue
+				}
+
+				ds.SubscribeArray(func(ds datasource.DataSource, dataArray datasource.DataArray) error {
+					l := dataArray.Len()
+					tuples := make([]*datasource.DataTuple, 0, l)
+
+					for i := 0; i < l; i++ {
+						data := dataArray.Get(i)
+						tuples = append(tuples, datasource.NewDataTuple(ds, data))
+					}
+
+					handler(tuples)
+					return nil
+				}, Priority)
+			}
 		case ModeJSON, ModeJSONPretty, ModeYAML:
 			// var opts []json.Option
 			// if hasFields {
@@ -243,45 +453,195 @@ func (o *cliOperatorInstance) PreStart(gadgetCtx operators.GadgetContext) error 
 			// }
 
 			jsonFormatter, err := json.New(ds,
-				// TODO: compatiblity for now: add all; remove me later on and use the commented version above
+				// TODO: compatibility for now: add all; remove me later on and use the commented version above
 				json.WithShowAll(true),
-				json.WithPretty(o.mode == ModeJSONPretty, "  "),
+				json.WithPretty(mode == ModeJSONPretty, "  "),
 				json.WithArray(ds.Type() == datasource.TypeArray),
 			)
 			if err != nil {
-				return fmt.Errorf("initializing JSON formatter: %w", err)
+				gadgetCtx.Logger().Warnf("failed to initialize JSON formatter: %v; skipping data source %q", err, ds.Name())
+				continue
 			}
 
-			if o.mode == ModeYAML {
+			if mode == ModeYAML {
 				// For the time being, this uses a slow approach to marshal to YAML, by first
 				// converting to JSON and then to YAML. This should get a dedicated formatter sooner or later.
 				ds.Subscribe(func(ds datasource.DataSource, data datasource.Data) error {
-					yml, err := yaml.JSONToYAML(jsonFormatter.Marshal(data))
-					if err != nil {
-						return fmt.Errorf("serializing yaml: %w", err)
-					}
-					fmt.Println("---")
-					fmt.Print(string(yml))
-					return nil
+					return yamlDataFn(data, jsonFormatter, os.Stdout)
 				}, Priority)
-				return nil
+				continue
 			}
 
 			switch ds.Type() {
 			case datasource.TypeSingle:
 				ds.Subscribe(func(ds datasource.DataSource, data datasource.Data) error {
-					fmt.Println(string(jsonFormatter.Marshal(data)))
+					jsonSingleDataFn(data, jsonFormatter, os.Stdout)
 					return nil
 				}, Priority)
 			case datasource.TypeArray:
 				ds.SubscribeArray(func(ds datasource.DataSource, dataArray datasource.DataArray) error {
-					fmt.Println(string(jsonFormatter.MarshalArray(dataArray)))
+					jsonArrayDataFn(dataArray, jsonFormatter, os.Stdout)
 					return nil
 				}, Priority)
 			}
+		case ModePCAPNG:
+			// Check ds for compatiblity
+			payloadField := ds.GetField(ds.Annotations()[AnnotationPCAPPayload])
+			if payloadField == nil {
+				return fmt.Errorf("%s annotation not found", AnnotationPCAPPayload)
+			}
+			timestampField := ds.GetField(ds.Annotations()[AnnotationPCAPTimestamp])
+			if timestampField == nil {
+				return fmt.Errorf("timestamp field not found")
+			}
+			lengthField := ds.GetField(ds.Annotations()[AnnotationPCAPPacketLen])
+			if lengthField == nil {
+				return fmt.Errorf("length field not found")
+			}
+
+			// TODO:
+			// Currently, each data packet carries all interface/enriched information with the payload;
+			// optimally, we would create a special datasource for it and cache the sent information both
+			// on sender and receiver to save bandwidth.
+
+			// Find fields to be used for the interface key
+			var interfaceKeyFields []datasource.FieldAccessor
+			for _, f := range ds.Fields() {
+				if v, ok := f.Annotations[AnnotationPCAPInterfaceKey]; ok && v == "true" {
+					acc := ds.GetField(f.FullName)
+					if acc == nil {
+						return fmt.Errorf("field %q not found", f.FullName)
+					}
+					interfaceKeyFields = append(interfaceKeyFields, acc)
+				}
+			}
+
+			// Find fields to be used for the interface variables; these variables will become
+			// part of the interface description and can be decoded using scripts in WireShark, for
+			// example. TODO: also add this functionality on a packet level.
+			var interfaceVarFns []func(datasource.Data, *strings.Builder)
+			for _, f := range ds.Fields() {
+				if v, ok := f.Annotations[AnnotationPCAPInterfaceVar]; ok {
+					acc := ds.GetField(f.FullName)
+					if acc == nil {
+						return fmt.Errorf("field %q not found", f.FullName)
+					}
+					if acc.Type() != api.Kind_String && acc.Type() != api.Kind_CString {
+						return fmt.Errorf("field %q cannot be used as interface variable; currently, only string fields are supported", f.FullName)
+					}
+					interfaceVarFns = append(interfaceVarFns, func(data datasource.Data, sb *strings.Builder) {
+						str, err := acc.String(data)
+						if err != nil {
+							return
+						}
+						sb.WriteString(v)
+						sb.WriteByte('=')
+						sb.WriteString(url.QueryEscape(str))
+					})
+					interfaceKeyFields = append(interfaceKeyFields, acc)
+				}
+			}
+
+			var mu sync.Mutex
+
+			wr, err := pcapgo.NewNgWriter(os.Stdout, layers.LinkTypeEthernet)
+			if err != nil {
+				return fmt.Errorf("creating pcapgo.NgWriter: %w", err)
+			}
+
+			interfaces := make(map[string]int)
+
+			ds.Subscribe(func(ds datasource.DataSource, data datasource.Data) error {
+				mu.Lock()
+				defer mu.Unlock()
+
+				var key strings.Builder
+				for _, f := range interfaceKeyFields {
+					key.Write(f.Get(data))
+					key.WriteByte(':') // Delimiter
+				}
+				ifIndex := key.String()
+
+				ts, _ := timestampField.Uint64(data)
+				payload, _ := payloadField.Bytes(data)
+				length, _ := lengthField.Uint32(data)
+
+				pcapInterface, ok := interfaces[ifIndex]
+				if !ok {
+					// Build description for interface
+					var description strings.Builder
+					for i, f := range interfaceVarFns {
+						if i > 0 {
+							description.WriteByte(';')
+						}
+						f(data, &description)
+					}
+
+					newInterface := pcapgo.NgInterface{
+						Name:        "virtual", // TODO: get from host
+						Description: description.String(),
+						OS:          runtime.GOOS, // TODO: get from host
+						LinkType:    layers.LinkTypeEthernet,
+					}
+					newIndex, err := wr.AddInterface(newInterface)
+					if err != nil {
+						return err
+					}
+					interfaces[ifIndex] = newIndex
+					pcapInterface = newIndex
+				}
+
+				err = wr.WritePacket(gopacket.CaptureInfo{
+					Timestamp:      time.Unix(0, int64(time.Duration(ts)*time.Microsecond)),
+					InterfaceIndex: pcapInterface,
+					CaptureLength:  len(payload),
+					Length:         int(length),
+				}, payload)
+				if err != nil {
+					gadgetCtx.Logger().Warnf("failed to write packet: %v", err)
+					return nil
+				}
+
+				// need to make sure this gets written before returning buffers
+				wr.Flush()
+				return nil
+			}, Priority)
 		}
+
 	}
 	return nil
+}
+
+func defaultDataFn(ds datasource.DataSource, data datasource.Data, w io.Writer) {
+	for _, f := range ds.Accessors(false) {
+		if s, err := f.String(data); err == nil {
+			fmt.Fprint(w, s)
+		}
+	}
+}
+
+func yamlDataFn(data datasource.Data, jsonFormatter *json.Formatter, w io.Writer) error {
+	yml, err := yaml.JSONToYAML(jsonFormatter.Marshal(data))
+	if err != nil {
+		return fmt.Errorf("serializing yaml: %w", err)
+	}
+	cliWriteMutex.Lock()
+	defer cliWriteMutex.Unlock()
+	fmt.Fprintln(w, "---")
+	fmt.Fprint(w, string(yml))
+	return nil
+}
+
+func jsonSingleDataFn(data datasource.Data, jsonFormatter *json.Formatter, w io.Writer) {
+	cliWriteMutex.Lock()
+	defer cliWriteMutex.Unlock()
+	fmt.Fprintln(w, string(jsonFormatter.Marshal(data)))
+}
+
+func jsonArrayDataFn(dataArray datasource.DataArray, jsonFormatter *json.Formatter, w io.Writer) {
+	cliWriteMutex.Lock()
+	defer cliWriteMutex.Unlock()
+	fmt.Fprintln(w, string(jsonFormatter.MarshalArray(dataArray)))
 }
 
 func (o *cliOperatorInstance) Start(gadgetCtx operators.GadgetContext) error {
@@ -289,6 +649,10 @@ func (o *cliOperatorInstance) Start(gadgetCtx operators.GadgetContext) error {
 }
 
 func (o *cliOperatorInstance) Stop(gadgetCtx operators.GadgetContext) error {
+	return nil
+}
+
+func (o *cliOperatorInstance) Close(gadgetCtx operators.GadgetContext) error {
 	return nil
 }
 

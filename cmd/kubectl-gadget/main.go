@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -26,14 +27,14 @@ import (
 	paramsPkg "github.com/inspektor-gadget/inspektor-gadget/pkg/params"
 
 	"github.com/inspektor-gadget/inspektor-gadget/cmd/common"
+	img "github.com/inspektor-gadget/inspektor-gadget/cmd/common/image"
 	commonutils "github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
-	"github.com/inspektor-gadget/inspektor-gadget/cmd/kubectl-gadget/advise"
+	kgauth "github.com/inspektor-gadget/inspektor-gadget/cmd/kubectl-gadget/auth"
 	"github.com/inspektor-gadget/inspektor-gadget/cmd/kubectl-gadget/utils"
+	igconfig "github.com/inspektor-gadget/inspektor-gadget/pkg/config"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
 	grpcruntime "github.com/inspektor-gadget/inspektor-gadget/pkg/runtime/grpc"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/experimental"
-
-	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/all-gadgets"
 )
 
 // common params for all gadgets
@@ -57,16 +58,13 @@ func main() {
 		log.Info("Experimental features enabled")
 	}
 
+	common.AddConfigFlag(rootCmd)
 	common.AddVerboseFlag(rootCmd)
 
 	// Some commands don't need the gadget namespace. Run then before to avoid
 	// printing warnings about gadget namespace not found.
 	needGadgetNamespace := true
-	isHelp := false
-
-	if len(os.Args) == 1 {
-		isHelp = true
-	}
+	isHelp := len(os.Args) == 1
 
 	// Need to loop through all arguments to skip flags...
 	for _, arg := range os.Args[1:] {
@@ -78,25 +76,42 @@ func main() {
 		}
 	}
 
+	// save the root flags for later use before we modify them (e.g. add runtime flags)
+	rootFlags := commonutils.CopyFlagSet(rootCmd.PersistentFlags())
+
 	grpcRuntime = grpcruntime.New(grpcruntime.WithConnectUsingK8SProxy)
 	runtimeGlobalParams = grpcRuntime.GlobalParamDescs().ToParams()
 	common.AddFlags(rootCmd, runtimeGlobalParams, nil, grpcRuntime)
+	mintOptions := kgauth.AddFlags(rootCmd)
 	grpcRuntime.Init(runtimeGlobalParams)
+
+	// evaluate flags early for runtimeGlobalParams; this will make
+	// sure that all flags relevant for the grpc connection are ready
+	// to be used
+
+	err := commonutils.ParseEarlyFlags(rootCmd, os.Args[1:])
+	if err != nil {
+		// Analogous to cobra error message
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// ensure that the runtime flags are set from the config file
+	if err = common.InitConfig(rootFlags); err != nil {
+		log.Fatalf("initializing config: %v", err)
+	}
+	if err = common.SetFlagsForParams(rootCmd, runtimeGlobalParams, igconfig.RuntimeKey); err != nil {
+		log.Fatalf("setting runtime flags from config: %v", err)
+	}
+
 	config, err := utils.KubernetesConfigFlags.ToRESTConfig()
 	if err != nil {
 		log.Fatalf("Creating RESTConfig: %s", err)
 	}
 	grpcRuntime.SetRestConfig(config)
 
-	// evaluate flags early for runtimeGlobalParams; this will make
-	// sure that all flags relevant for the grpc connection are ready
-	// to be used
-
-	err = commonutils.ParseEarlyFlags(rootCmd, os.Args[1:])
-	if err != nil {
-		// Analogous to cobra error message
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	if err := kgauth.MaybeMintAndApply(context.Background(), config, grpcRuntime, mintOptions); err != nil {
+		log.Fatalf("minting audience-scoped token: %v", err)
 	}
 
 	namespace, _ := utils.GetNamespace()
@@ -132,23 +147,26 @@ func main() {
 		}
 	}
 
-	info, err := grpcRuntime.InitDeployInfo()
+	info, err := grpcRuntime.GetInfo()
 	if err != nil {
 		log.Warnf("Failed to load deploy info: %s", err)
 	} else if err := commonutils.CheckServerVersionSkew(info.ServerVersion); err != nil {
-		log.Warnf(err.Error())
+		log.Warn(err.Error())
 	}
 
-	gadgetNamespace := runtimeGlobalParams.Get(grpcruntime.ParamGadgetNamespace).AsString()
+	// add image subcommands to be added, for now only inspect is supported
+	imgCommands := []*cobra.Command{
+		img.NewInspectCmd(grpcRuntime),
+	}
 
 	hiddenColumnTags := []string{"runtime"}
-	common.AddCommandsFromRegistry(rootCmd, grpcRuntime, hiddenColumnTags)
 
-	// Advise and traceloop category is still being handled by CRs for now
-	rootCmd.AddCommand(advise.NewAdviseCmd(gadgetNamespace))
-	rootCmd.AddCommand(NewTraceloopCmd(gadgetNamespace))
-	rootCmd.AddCommand(common.NewSyncCommand(grpcRuntime))
-	rootCmd.AddCommand(common.NewRunCommand(rootCmd, grpcRuntime, hiddenColumnTags))
+	common.AddInstanceCommands(rootCmd, grpcRuntime)
+
+	rootCmd.AddCommand(common.NewRunCommand(rootCmd, grpcRuntime, hiddenColumnTags, common.CommandModeRun))
+	rootCmd.AddCommand(common.NewRunCommand(rootCmd, grpcRuntime, hiddenColumnTags, common.CommandModeAttach))
+	rootCmd.AddCommand(common.NewConfigCmd(grpcRuntime, rootFlags))
+	rootCmd.AddCommand(img.NewImageCmd(grpcRuntime, imgCommands))
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

@@ -1,0 +1,41 @@
+---
+title: trace_malloc
+sidebar_position: 0
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# trace malloc
+
+use uprobe to trace malloc and free in libc.so
+
+## Getting started
+
+Running the gadget:
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl gadget run ghcr.io/inspektor-gadget/gadget/trace_malloc:%IG_TAG% [flags]
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ sudo ig run ghcr.io/inspektor-gadget/gadget/trace_malloc:%IG_TAG% [flags]
+        ```
+    </TabItem>
+</Tabs>
+
+## Flags
+
+### `--collect-ustack`
+
+Show user stack traces
+
+Default value: "false"
+
+## Guide
+
+TODO

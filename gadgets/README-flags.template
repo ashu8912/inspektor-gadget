@@ -1,0 +1,11 @@
+{{ if has (ds "gadget") "params" -}}
+{{ range $i, $operator := index (ds "gadget") "params" }}{{ range $j, $param := $operator }}
+### `--{{ index $param "key" }}`
+
+{{ index $param "description" }}
+
+Default value: "{{ index $param "defaultValue" }}"
+{{ end -}}{{ end -}}
+{{- else }}
+No flags.
+{{ end }}

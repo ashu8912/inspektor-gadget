@@ -9,15 +9,62 @@ metadata:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
+  labels:
+    k8s-app: gadget
   name: gadget
   namespace: gadget
+---
+# Source: gadget/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    k8s-app: gadget
+  name: gadget
+  namespace: gadget
+data:
+    config.yaml: |-
+      events-buffer-length: 16384
+      containerd-socketpath: /run/containerd/containerd.sock
+      crio-socketpath: /run/crio/crio.sock
+      docker-socketpath: /run/docker.sock
+      podman-socketpath: /run/podman/podman.sock
+      gadget-namespace: gadget
+      daemon-log-level: info
+      multi-tenancy: false
+      multi-tenancy-scope-api-group: ""
+      multi-tenancy-scope-resource: pods
+      multi-tenancy-scope-verb: create
+      operator:
+        kubemanager:
+          fallback-podinformer: true
+          hook-mode: auto
+        oci:
+          allowed-gadgets: []
+          disallow-pulling: false
+          insecure-registries: []
+          public-keys:
+          - |
+            -----BEGIN PUBLIC KEY-----
+            MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEoDOC0gYSxZTopenGmX3ZFvQ1DSfh
+            Ir4EKRt5jC+mXaJ7c7J+oREskYMn/SfZdRHNSOjLTZUMDm60zpXGhkFecg==
+            -----END PUBLIC KEY-----
+          verify-image: true
+        otel-metrics:
+          otel-metrics-listen: false
+          otel-metrics-listen-address: 0.0.0.0:2224
 ---
 # Source: gadget/templates/clusterrole.yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: gadget-cluster-role
+  labels:
+    k8s-app: gadget
 rules:
+  - apiGroups: [""]
+    resources: ["nodes/configz"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources: ["namespaces", "nodes", "pods"]
     verbs: ["get", "watch", "list"]
@@ -52,6 +99,8 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: gadget-cluster-role-binding
+  labels:
+    k8s-app: gadget
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -65,6 +114,8 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
+  labels:
+    k8s-app: gadget
   name: gadget-role
   namespace: gadget
 rules:
@@ -72,11 +123,16 @@ rules:
     resources: [ "secrets" ]
     # get secrets is needed for retrieving pull secret.
     verbs: [ "get" ]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "watch", "list", "create", "delete", "patch", "update"]
 ---
 # Source: gadget/templates/rolebinding.yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
+  labels:
+    k8s-app: gadget
   name: gadget-role-binding
   namespace: gadget
 roleRef:
@@ -110,10 +166,8 @@ spec:
         # "failed to create server failed to create folder for pinning bpf maps: mkdir /sys/fs/bpf/gadget: permission denied"
         # (For reference, see: https://github.com/inspektor-gadget/inspektor-gadget/runs/3966318270?check_suite_focus=true#step:20:221)
         container.apparmor.security.beta.kubernetes.io/gadget: "unconfined"
-        inspektor-gadget.kinvolk.io/option-hook-mode: "auto"
-        # keep aligned with values in pkg/operators/prometheus/prometheus.go
         prometheus.io/scrape: "true"
-        prometheus.io/port: "2223"
+        prometheus.io/port: "2224"
         prometheus.io/path: "/metrics"
     spec:
       serviceAccount: gadget
@@ -124,7 +178,7 @@ spec:
           terminationMessagePolicy: FallbackToLogsOnError
           image: ghcr.io/inspektor-gadget/inspektor-gadget:latest
           imagePullPolicy: Always
-          command: [ "/entrypoint" ]
+          command: [ "/bin/gadgettracermanager", "-serve" ]
           lifecycle:
             preStop:
               exec:
@@ -144,6 +198,13 @@ spec:
                 - -liveness
             periodSeconds: 5
             timeoutSeconds: 2
+          startupProbe:
+            exec:
+              command:
+                - /bin/gadgettracermanager
+                - -liveness
+            failureThreshold: 12
+            periodSeconds: 5
           env:
             - name: NODE_NAME
               valueFrom:
@@ -155,28 +216,12 @@ spec:
                   fieldPath: metadata.uid
             - name: GADGET_IMAGE
               value: "ghcr.io/inspektor-gadget/inspektor-gadget"
-            - name: INSPEKTOR_GADGET_VERSION
-              value: "latest"
-            - name: INSPEKTOR_GADGET_OPTION_HOOK_MODE
-              value: "auto"
-            - name: INSPEKTOR_GADGET_OPTION_FALLBACK_POD_INFORMER
-              value: "true"
-            # Make sure to keep these settings in sync with pkg/container-utils/runtime-client/interface.go
-            - name: INSPEKTOR_GADGET_CONTAINERD_SOCKETPATH
-              value: "/run/containerd/containerd.sock"
-            - name: INSPEKTOR_GADGET_CRIO_SOCKETPATH
-              value: "/run/crio/crio.sock"
-            - name: INSPEKTOR_GADGET_DOCKER_SOCKETPATH
-              value: "/run/docker.sock"
             - name: HOST_ROOT
               value: "/host"
             - name: IG_EXPERIMENTAL
               value: "false"
-            - name: EVENTS_BUFFER_LENGTH
-              value: "16384"
-            - name: GADGET_TRACER_MANAGER_LOG_LEVEL
-              value: "info"
           securityContext:
+            readOnlyRootFilesystem: true
             # With hostPID/hostNetwork/privileged [1] set to false, we need to set appropriate
             # SELinux context [2] to be able to mount host directories with correct permissions.
             # This option is ignored if hostPID/hostNetwork/privileged is set to true or SELinux isn't enabled.
@@ -242,6 +287,15 @@ spec:
                 # Needed to attach qdiscs and filters to network interfaces. See createClsActQdisc()
                 # and addTCFilter() in pkg/gadgets/internal/tcnetworktracer/tc.go
                 - NET_ADMIN
+
+                # Needed by the OTel eBPF profiler (ustack symbolization) to read
+                # the ELF files of profiled processes via /proc/$pid/map_files/*.
+                # These opens go through a ptrace-mode fs-creds check against the
+                # target process, so without this capability the profiler cannot
+                # read libraries of processes running as a different (non-root)
+                # user (e.g. Ray workers running as uid 1000), which leaves their
+                # stack deltas unloaded and breaks symbolization.
+                - DAC_READ_SEARCH
           volumeMounts:
             - mountPath: /host/bin
               name: bin
@@ -284,6 +338,19 @@ spec:
               readOnly: true
             - mountPath: /sys/fs/bpf
               name: bpffs
+            # We need to add a dedicated volume to store OCI image otherwise it
+            # will fail as the container root filesystem is read only.
+            # For this, we use an emptyDir without size limit.
+            - mountPath: /var/lib/ig
+              name: oci
+            - mountPath: /etc/ig
+              name: config
+              readOnly: true
+            # We need a dedicated volume to store the wasm cache
+            # otherwise it will fail as the container root filesystem is read only.
+            - mountPath: /var/run/ig/wasm-cache
+              name: wasm-cache
+              readOnly: false
       nodeSelector:
         kubernetes.io/os: linux
       affinity:
@@ -335,3 +402,11 @@ spec:
         - name: debugfs
           hostPath:
             path: /sys/kernel/debug
+        - name: oci
+          emptyDir:
+        - name: config
+          configMap:
+            name: gadget
+            defaultMode: 0o400
+        - name: wasm-cache
+          emptyDir: {}

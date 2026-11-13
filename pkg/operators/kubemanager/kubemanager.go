@@ -1,4 +1,4 @@
-// Copyright 2023-2024 The Inspektor Gadget authors
+// Copyright 2023-2025 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,32 +17,53 @@ package kubemanager
 import (
 	"errors"
 	"fmt"
+	"net"
+	"os"
 	"strings"
+	"sync"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/rlimit"
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
+	"github.com/spf13/viper"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 
 	containercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/container-collection"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource/compat"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
 	apihelpers "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api-helpers"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/auth"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgettracermanager"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators/common"
+	hookservice "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/kubemanager/hook-service"
+	hookserviceapi "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/kubemanager/hook-service/api"
+	kubemanagerpolicy "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/kubemanager/policy"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators/kubemanager/types"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/params"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
+	tracercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/tracer-collection"
 )
 
 const (
-	OperatorName       = "KubeManager"
-	ParamContainerName = "containername"
-	ParamSelector      = "selector"
-	ParamAllNamespaces = "all-namespaces"
-	ParamPodName       = "podname"
-	ParamNamespace     = "namespace"
+	OperatorName = "KubeManager"
+
+	// Global parameter keys
+	ParamHookMode               = "hook-mode"
+	ParamFallbackPodInformer    = "fallback-podinformer"
+	ParamHookLivenessSocketFile = "hook-liveness-socketfile"
+
+	// Instance parameter keys
+	ParamAllNamespaces = kubemanagerpolicy.ParamAllNamespaces
 )
+
+const paramPolicyScope = kubemanagerpolicy.ParamPolicyScope
 
 type MountNsMapSetter interface {
 	SetMountNsMap(*ebpf.Map)
@@ -54,12 +75,20 @@ type Attacher interface {
 }
 
 type KubeManager struct {
-	gadgetTracerManager *gadgettracermanager.GadgetTracerManager
+	containerCollection *containercollection.ContainerCollection
+	tracerCollection    *tracercollection.TracerCollection
+	externalCollections bool
 }
 
-func (k *KubeManager) SetGadgetTracerMgr(g *gadgettracermanager.GadgetTracerManager) {
-	log.Infof("gadget tracermgr set in kubemanager")
-	k.gadgetTracerManager = g
+// NewKubeManager creates a new KubeManager operator skipping the Init() method.
+// This can be used when the operator is used as a library and the caller wants to manage the lifecycle of the collections.
+// It also means that all initialization steps in Init() are skipped, so the caller is responsible for initializing the collections.
+func NewKubeManager(containerCollection *containercollection.ContainerCollection, tracerCollection *tracercollection.TracerCollection) *KubeManager {
+	return &KubeManager{
+		containerCollection: containerCollection,
+		tracerCollection:    tracerCollection,
+		externalCollections: true,
+	}
 }
 
 func (k *KubeManager) Name() string {
@@ -67,121 +96,133 @@ func (k *KubeManager) Name() string {
 }
 
 func (k *KubeManager) Description() string {
-	return "KubeManager handles container/pod/namespace information using Container-Collection and GadgetTracerMgr"
+	return "KubeManager handles container/pod/namespace information using Container-Collection and Tracer-Collection."
 }
 
 func (k *KubeManager) GlobalParamDescs() params.ParamDescs {
-	return nil
+	return params.ParamDescs{
+		{
+			Key:          ParamFallbackPodInformer,
+			DefaultValue: "true",
+			Description:  "Use pod informer as a fallback for the main hook",
+			TypeHint:     params.TypeBool,
+		},
+		{
+			Key:            ParamHookMode,
+			DefaultValue:   hookModeAuto,
+			Description:    "Mechanism to collect container information",
+			TypeHint:       params.TypeString,
+			PossibleValues: supportedHookModes,
+		},
+		{
+			Key:          ParamHookLivenessSocketFile,
+			DefaultValue: types.DefaultHookAndLivenessSocketFile,
+			Description:  "Path to the socket file for serving hook's requests for adding/removing containers and for liveness checks",
+			TypeHint:     params.TypeString,
+		},
+	}
 }
 
 func (k *KubeManager) ParamDescs() params.ParamDescs {
-	return params.ParamDescs{
-		{
-			Key:         ParamContainerName,
-			Alias:       "c",
-			Description: "Show only data from containers with that name",
-			ValueHint:   gadgets.K8SContainerName,
-		},
-		{
-			Key:         ParamSelector,
-			Alias:       "l",
-			Description: "Labels selector to filter on. Only '=' is supported (e.g. key1=value1,key2=value2).",
-			ValueHint:   gadgets.K8SLabels,
-			Validator: func(value string) error {
-				if value == "" {
-					return nil
-				}
-
-				pairs := strings.Split(value, ",")
-				for _, pair := range pairs {
-					kv := strings.Split(pair, "=")
-					if len(kv) != 2 {
-						return fmt.Errorf("should be a comma-separated list of key-value pairs (key=value[,key=value,...])")
-					}
-				}
-
-				return nil
-			},
-		},
-		{
-			Key:         ParamPodName,
-			Alias:       "p",
-			Description: "Show only data from pods with that name",
-			ValueHint:   gadgets.K8SPodName,
-		},
-		{
+	return append(common.GetContainerSelectorParams(true),
+		&params.ParamDesc{
 			Key:          ParamAllNamespaces,
 			Alias:        "A",
 			Description:  "Show data from pods in all namespaces",
 			TypeHint:     params.TypeBool,
 			DefaultValue: "false",
-		},
-		{
-			Key:         ParamNamespace,
-			Alias:       "n",
-			Description: "Show only data from pods in a given namespace",
-			ValueHint:   gadgets.K8SNamespace,
-		},
-	}
-}
-
-func (k *KubeManager) Dependencies() []string {
-	return nil
-}
-
-func (k *KubeManager) CanOperateOn(gadget gadgets.GadgetDesc) bool {
-	// We need to be able to get MountNSID or NetNSID, and set ContainerInfo, so
-	// check for that first
-	_, canEnrichEventFromMountNs := gadget.EventPrototype().(operators.ContainerInfoFromMountNSID)
-	_, canEnrichEventFromNetNs := gadget.EventPrototype().(operators.ContainerInfoFromNetNSID)
-	canEnrichEvent := canEnrichEventFromMountNs || canEnrichEventFromNetNs
-
-	// Secondly, we need to be able to inject the ebpf map onto the tracer
-	gi, ok := gadget.(gadgets.GadgetInstantiate)
-	if !ok {
-		return false
-	}
-
-	instance, err := gi.NewInstance()
-	if err != nil {
-		log.Warnf("failed to create dummy %s instance: %s", OperatorName, err)
-		return false
-	}
-	_, isMountNsMapSetter := instance.(MountNsMapSetter)
-	_, isAttacher := instance.(Attacher)
-
-	log.Debugf("> canEnrichEvent: %v", canEnrichEvent)
-	log.Debugf(" > canEnrichEventFromMountNs: %v", canEnrichEventFromMountNs)
-	log.Debugf(" > canEnrichEventFromNetNs: %v", canEnrichEventFromNetNs)
-	log.Debugf("> isMountNsMapSetter: %v", isMountNsMapSetter)
-	log.Debugf("> isAttacher: %v", isAttacher)
-
-	return isMountNsMapSetter || canEnrichEvent || isAttacher
+		})
 }
 
 func (k *KubeManager) Init(params *params.Params) error {
+	if k.externalCollections {
+		return nil
+	}
+
+	hookMode := params.Get(ParamHookMode).AsString()
+	fallbackPodInformer := params.Get(ParamFallbackPodInformer).AsBool()
+	socketPath := params.Get(ParamHookLivenessSocketFile).AsString()
+
+	var err error
+	hookMode, err = parseHookMode(hookMode)
+	if err != nil {
+		return fmt.Errorf("parsing hook mode: %w", err)
+	}
+
+	if err := k.initCollections(hookMode, fallbackPodInformer); err != nil {
+		return fmt.Errorf("initializing collections: %w", err)
+	}
+
+	// Start the gRPC server for the hook service and health checks
+	grpcServer := grpc.NewServer()
+	os.Remove(socketPath)
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return fmt.Errorf("listening on %s: %w", socketPath, err)
+	}
+
+	// Register the hook service to handle container add/remove requests
+	hookServer := hookservice.NewServer(k.containerCollection)
+	hookserviceapi.RegisterHookServiceServer(grpcServer, hookServer)
+
+	// Register the health server to handle health checks
+	healthServer := health.NewServer()
+	healthpb.RegisterHealthServer(grpcServer, healthServer)
+
+	log.Printf("Serving hook-service and health-checks on %s", socketPath)
+	go grpcServer.Serve(listener)
+
+	return nil
+}
+
+// initCollections initializes the container collection and tracer collection.
+func (k *KubeManager) initCollections(hookMode string, fallbackPodInformer bool) error {
+	var cc containercollection.ContainerCollection
+
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return fmt.Errorf("removing memlock rlimit: %w", err)
+	}
+
+	node := os.Getenv("NODE_NAME")
+	if node == "" {
+		return fmt.Errorf("environment variable NODE_NAME not set")
+	}
+
+	var err error
+	k.tracerCollection, err = tracercollection.NewTracerCollection(&cc)
+	if err != nil {
+		return fmt.Errorf("creating tracer collection: %w", err)
+	}
+
+	// Initialize ContainerCollection with the options
+	ccOpts := []containercollection.ContainerCollectionOption{
+		containercollection.WithOCIConfigEnrichment(),
+		containercollection.WithCgroupEnrichment(),
+		containercollection.WithLinuxNamespaceEnrichment(),
+		containercollection.WithNodeName(node),
+		containercollection.WithKubernetesEnrichment(node),
+		containercollection.WithTracerCollection(k.tracerCollection),
+		containercollection.WithProcEnrichment(),
+	}
+
+	hookModeOpts, err := hookMode2ccOpts(node, hookMode, fallbackPodInformer)
+	if err != nil {
+		return fmt.Errorf("getting extra container collection options: %w", err)
+	}
+	ccOpts = append(ccOpts, hookModeOpts...)
+
+	err = cc.Initialize(ccOpts...)
+	if err != nil {
+		return fmt.Errorf("initializing container collection: %w", err)
+	}
+
+	k.containerCollection = &cc
+
 	return nil
 }
 
 func (k *KubeManager) Close() error {
 	return nil
-}
-
-func (k *KubeManager) Instantiate(gadgetContext operators.GadgetContext, gadgetInstance any, params *params.Params) (operators.OperatorInstance, error) {
-	_, canEnrichEventFromMountNs := gadgetContext.GadgetDesc().EventPrototype().(operators.ContainerInfoFromMountNSID)
-	_, canEnrichEventFromNetNs := gadgetContext.GadgetDesc().EventPrototype().(operators.ContainerInfoFromNetNSID)
-	canEnrichEvent := canEnrichEventFromMountNs || canEnrichEventFromNetNs
-
-	traceInstance := &KubeManagerInstance{
-		id:             uuid.New().String(),
-		manager:        k,
-		enrichEvents:   canEnrichEvent,
-		params:         params,
-		gadgetInstance: gadgetInstance,
-		gadgetCtx:      gadgetContext,
-	}
-
-	return traceInstance, nil
 }
 
 type KubeManagerInstance struct {
@@ -191,6 +232,7 @@ type KubeManagerInstance struct {
 	mountnsmap   *ebpf.Map
 	subscribed   bool
 
+	containerMutex     sync.Mutex
 	attachedContainers map[string]*containercollection.Container
 	attacher           Attacher
 	params             *params.Params
@@ -198,6 +240,8 @@ type KubeManagerInstance struct {
 	gadgetCtx          operators.GadgetContext
 
 	eventWrappers map[datasource.DataSource]*compat.EventWrapperBase
+
+	containersPublisher *common.ContainersPublisher
 }
 
 func (m *KubeManagerInstance) Name() string {
@@ -207,38 +251,29 @@ func (m *KubeManagerInstance) Name() string {
 func (m *KubeManagerInstance) PreGadgetRun() error {
 	log := m.gadgetCtx.Logger()
 
-	labels := make(map[string]string)
-	selectorSlice := m.params.Get(ParamSelector).AsStringSlice()
-	for _, pair := range selectorSlice {
-		kv := strings.Split(pair, "=")
-		labels[kv[0]] = kv[1]
+	if m.gadgetInstance != nil {
+		err := m.handleGadgetInstance(log)
+		if err != nil {
+			return err
+		}
 	}
 
-	containerSelector := containercollection.ContainerSelector{
-		K8s: containercollection.K8sSelector{
-			BasicK8sMetadata: types.BasicK8sMetadata{
-				Namespace:     m.params.Get(ParamNamespace).AsString(),
-				PodName:       m.params.Get(ParamPodName).AsString(),
-				ContainerName: m.params.Get(ParamContainerName).AsString(),
-				PodLabels:     labels,
-			},
-		},
-	}
+	return nil
+}
 
-	if m.params.Get(ParamAllNamespaces).AsBool() {
-		containerSelector.K8s.Namespace = ""
-	}
+func (m *KubeManagerInstance) handleGadgetInstance(log logger.Logger) error {
+	containerSelector := newContainerSelector(m.params)
 
 	if setter, ok := m.gadgetInstance.(MountNsMapSetter); ok {
-		err := m.manager.gadgetTracerManager.AddTracer(m.id, containerSelector)
+		err := m.manager.tracerCollection.AddTracer(m.id, containerSelector)
 		if err != nil {
 			return fmt.Errorf("adding tracer: %w", err)
 		}
 
 		// Create mount namespace map to filter by containers
-		mountnsmap, err := m.manager.gadgetTracerManager.TracerMountNsMap(m.id)
+		mountnsmap, err := m.manager.tracerCollection.TracerMountNsMap(m.id)
 		if err != nil {
-			m.manager.gadgetTracerManager.RemoveTracer(m.id)
+			m.manager.tracerCollection.RemoveTracer(m.id)
 			return fmt.Errorf("creating mountns map: %w", err)
 		}
 
@@ -265,15 +300,19 @@ func (m *KubeManagerInstance) PreGadgetRun() error {
 				return
 			}
 
+			m.containerMutex.Lock()
 			m.attachedContainers[container.Runtime.ContainerID] = container
+			m.containerMutex.Unlock()
 
 			log.Debugf("tracer attached: container %q pid %d mntns %d netns %d",
-				container.K8s.ContainerName, container.Pid, container.Mntns, container.Netns)
+				container.K8s.ContainerName, container.ContainerPid(), container.Mntns, container.Netns)
 		}
 
 		detachContainerFunc := func(container *containercollection.Container) {
 			log.Debugf("calling gadget.Detach()")
+			m.containerMutex.Lock()
 			delete(m.attachedContainers, container.Runtime.ContainerID)
+			m.containerMutex.Unlock()
 
 			err := attacher.DetachContainer(container)
 			if err != nil {
@@ -281,13 +320,13 @@ func (m *KubeManagerInstance) PreGadgetRun() error {
 				return
 			}
 			log.Debugf("tracer detached: container %q pid %d mntns %d netns %d",
-				container.K8s.ContainerName, container.Pid, container.Mntns, container.Netns)
+				container.K8s.ContainerName, container.ContainerPid(), container.Mntns, container.Netns)
 		}
 
 		m.subscribed = true
 
-		log.Debugf("add subscription to gadgetTracerManager")
-		containers := m.manager.gadgetTracerManager.Subscribe(
+		log.Debugf("add subscription to containerCollection")
+		containers := m.manager.containerCollection.Subscribe(
 			m.id,
 			containerSelector,
 			func(event containercollection.PubSubEvent) {
@@ -297,6 +336,14 @@ func (m *KubeManagerInstance) PreGadgetRun() error {
 					attachContainerFunc(event.Container)
 				case containercollection.EventTypeRemoveContainer:
 					detachContainerFunc(event.Container)
+				case containercollection.EventTypePreCreateContainer:
+					// nothing to do
+				default:
+					log.Errorf("unknown event type, expected either %s, %s or %s, got %s",
+						containercollection.EventTypePreCreateContainer,
+						containercollection.EventTypeAddContainer,
+						containercollection.EventTypeRemoveContainer,
+						event.Type)
 				}
 			},
 		)
@@ -305,41 +352,42 @@ func (m *KubeManagerInstance) PreGadgetRun() error {
 			attachContainerFunc(container)
 		}
 	}
-
 	return nil
+}
+
+func newContainerSelector(params *params.Params) containercollection.ContainerSelector {
+	containerSelector := common.NewContainerSelector(params)
+	if params.Get(ParamAllNamespaces).AsBool() {
+		containerSelector.K8s.Namespace = ""
+	}
+	return containerSelector
 }
 
 func (m *KubeManagerInstance) PostGadgetRun() error {
 	if m.mountnsmap != nil {
 		m.gadgetCtx.Logger().Debugf("calling RemoveTracer()")
-		m.manager.gadgetTracerManager.RemoveTracer(m.id)
+		m.manager.tracerCollection.RemoveTracer(m.id)
 	}
+
 	if m.subscribed {
 		m.gadgetCtx.Logger().Debugf("calling Unsubscribe()")
-		m.manager.gadgetTracerManager.Unsubscribe(m.id)
+		m.manager.containerCollection.Unsubscribe(m.id)
 
-		// emit detach for all remaining containers
+		// emit detach for all remaining containers. Snapshot the map under
+		// the lock so we don't hold it while calling DetachContainer and so we
+		// don't race with callbacks that might still be running.
+		m.containerMutex.Lock()
+		remaining := make([]*containercollection.Container, 0, len(m.attachedContainers))
 		for _, container := range m.attachedContainers {
+			remaining = append(remaining, container)
+		}
+		m.containerMutex.Unlock()
+
+		for _, container := range remaining {
 			m.attacher.DetachContainer(container)
 		}
 	}
-	return nil
-}
 
-func (m *KubeManagerInstance) enrich(ev any) {
-	if event, canEnrichEventFromMountNs := ev.(operators.ContainerInfoFromMountNSID); canEnrichEventFromMountNs {
-		m.manager.gadgetTracerManager.ContainerCollection.EnrichEventByMntNs(event)
-	}
-	if event, canEnrichEventFromNetNs := ev.(operators.ContainerInfoFromNetNSID); canEnrichEventFromNetNs {
-		m.manager.gadgetTracerManager.ContainerCollection.EnrichEventByNetNs(event)
-	}
-}
-
-func (m *KubeManagerInstance) EnrichEvent(ev any) error {
-	if !m.enrichEvents {
-		return nil
-	}
-	m.enrich(ev)
 	return nil
 }
 
@@ -360,6 +408,25 @@ func (k *KubeManager) InstantiateDataOperator(gadgetCtx operators.GadgetContext,
 		return nil, err
 	}
 
+	cfg, ok := gadgetCtx.GetVar("config")
+	if !ok {
+		return nil, fmt.Errorf("missing configuration")
+	}
+	v, ok := cfg.(*viper.Viper)
+	if !ok {
+		return nil, fmt.Errorf("invalid configuration format")
+	}
+
+	enableContainersDs := v.GetBool("annotations.enable-containers-datasource")
+
+	var containersPublisher *common.ContainersPublisher
+	if enableContainersDs {
+		containersPublisher, err = common.NewContainersPublisher(gadgetCtx, k.containerCollection)
+		if err != nil {
+			return nil, fmt.Errorf("creating containers publisher: %w", err)
+		}
+	}
+
 	traceInstance := &KubeManagerInstance{
 		manager:            k,
 		enrichEvents:       false,
@@ -369,13 +436,8 @@ func (k *KubeManager) InstantiateDataOperator(gadgetCtx operators.GadgetContext,
 		id:                 uuid.New().String(),
 
 		eventWrappers: make(map[datasource.DataSource]*compat.EventWrapperBase),
-	}
 
-	// hack - this makes it possible to use the Attacher interface
-	var ok bool
-	traceInstance.gadgetInstance, ok = gadgetCtx.GetVar("ebpfInstance")
-	if !ok {
-		return nil, fmt.Errorf("getting ebpfInstance")
+		containersPublisher: containersPublisher,
 	}
 
 	activate := false
@@ -405,8 +467,21 @@ func (k *KubeManager) InstantiateDataOperator(gadgetCtx operators.GadgetContext,
 		activate = true
 	}
 
+	_, hasPolicyScope := auth.PolicyScopeFromContext(gadgetCtx.Context())
+	policyRequired := hasPolicyScope || strings.EqualFold(paramValues[paramPolicyScope], "true")
 	if !activate {
+		if policyRequired {
+			return nil, status.Error(codes.PermissionDenied, "gadget does not support Kubernetes namespace isolation")
+		}
 		return nil, nil
+	}
+
+	if err := kubemanagerpolicy.EnforcePolicyScopeFromContext(gadgetCtx.Context(), paramValues); err != nil {
+		return nil, err
+	}
+	delete(paramValues, paramPolicyScope)
+	if err := params.CopyFromMap(paramValues, ""); err != nil {
+		return nil, err
 	}
 
 	return traceInstance, nil
@@ -416,49 +491,31 @@ func (k *KubeManager) Priority() int {
 	return -1
 }
 
-func (m *KubeManagerInstance) ParamDescs(gadgetCtx operators.GadgetContext) params.ParamDescs {
-	return m.manager.ParamDescs()
-}
-
 func (m *KubeManagerInstance) PreStart(gadgetCtx operators.GadgetContext) error {
+	m.gadgetInstance, _ = gadgetCtx.GetVar("ebpfInstance")
+
 	compat.Subscribe(
 		m.eventWrappers,
-		m.manager.gadgetTracerManager.ContainerCollection.EnrichEventByMntNs,
-		m.manager.gadgetTracerManager.ContainerCollection.EnrichEventByNetNs,
+		m.manager.containerCollection.EnrichEventByMntNs,
+		m.manager.containerCollection.EnrichEventByNetNs,
 		0,
 	)
 
-	labels := make(map[string]string)
-	selectorSlice := m.params.Get(ParamSelector).AsStringSlice()
-	for _, pair := range selectorSlice {
-		kv := strings.Split(pair, "=")
-		labels[kv[0]] = kv[1]
-	}
+	containerSelector := newContainerSelector(m.params)
 
-	containerSelector := containercollection.ContainerSelector{
-		K8s: containercollection.K8sSelector{
-			BasicK8sMetadata: types.BasicK8sMetadata{
-				Namespace:     m.params.Get(ParamNamespace).AsString(),
-				PodName:       m.params.Get(ParamPodName).AsString(),
-				ContainerName: m.params.Get(ParamContainerName).AsString(),
-				PodLabels:     labels,
-			},
-		},
-	}
-
-	if m.manager.gadgetTracerManager == nil {
+	if m.manager.containerCollection == nil {
 		return fmt.Errorf("container-collection isn't available")
 	}
 
 	// Create mount namespace map to filter by containers
-	err := m.manager.gadgetTracerManager.AddTracer(m.id, containerSelector)
+	err := m.manager.tracerCollection.AddTracer(m.id, containerSelector)
 	if err != nil {
 		return fmt.Errorf("adding tracer: %w", err)
 	}
 
-	mountnsmap, err := m.manager.gadgetTracerManager.TracerMountNsMap(m.id)
+	mountnsmap, err := m.manager.tracerCollection.TracerMountNsMap(m.id)
 	if err != nil {
-		m.manager.gadgetTracerManager.RemoveTracer(m.id)
+		m.manager.tracerCollection.RemoveTracer(m.id)
 		return fmt.Errorf("creating mountnsmap: %w", err)
 	}
 
@@ -472,16 +529,32 @@ func (m *KubeManagerInstance) PreStart(gadgetCtx operators.GadgetContext) error 
 }
 
 func (m *KubeManagerInstance) Start(gadgetCtx operators.GadgetContext) error {
-	return nil
+	if m.containersPublisher == nil {
+		return nil
+	}
+
+	containerSelector := newContainerSelector(m.params)
+
+	return m.containersPublisher.PublishContainers(true, []*containercollection.Container{}, containerSelector)
 }
 
 func (m *KubeManagerInstance) Stop(gadgetCtx operators.GadgetContext) error {
-	m.manager.gadgetTracerManager.RemoveTracer(m.id)
 	return nil
 }
 
+func (m *KubeManagerInstance) Close(gadgetCtx operators.GadgetContext) error {
+	m.manager.tracerCollection.RemoveTracer(m.id)
+
+	if m.containersPublisher != nil {
+		m.containersPublisher.Unsubscribe()
+	}
+
+	return nil
+}
+
+var KubeManagerOperator *KubeManager
+
 func init() {
-	km := &KubeManager{}
-	operators.Register(km)
-	operators.RegisterDataOperator(km)
+	KubeManagerOperator = &KubeManager{}
+	operators.RegisterDataOperator(KubeManagerOperator)
 }

@@ -1,0 +1,35 @@
+name: trace ssl
+description: Captures data on read/recv or write/send functions of OpenSSL, GnuTLS,
+  NSS and Libcrypto
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/trace_ssl
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/trace_ssl
+datasources:
+  ssl:
+    fields:
+      latency_ns_raw:
+        annotations:
+          columns.width: 10
+      len:
+        annotations:
+          columns.hidden: true
+      buf:
+        annotations:
+          description: unencrypted buffer
+          columns.width: 32
+      error:
+        annotations:
+          description: error value
+          columns.width: 20
+      operation_raw:
+        annotations:
+          columns.hidden: true
+      operation:
+        annotations:
+          description: type of SSL operations
+params:
+  ebpf:
+    record_data:
+      key: record-data
+      defaultValue: "true"
+      description: controls whether the gadget will send data to userspace

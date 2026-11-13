@@ -1,4 +1,4 @@
-// Copyright 2022-2024 The Inspektor Gadget authors
+// Copyright 2022-2025 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,40 +18,47 @@ import (
 	"context"
 	"time"
 
+	"oras.land/oras-go/v2"
+
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/params"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/parser"
+)
+
+const (
+	// NumRunTargets is the number of targets that the gadget will run on
+	NumRunTargets = "n-run-targets"
 )
 
 type GadgetContext interface {
 	ID() string
-	Parser() parser.Parser
-	GadgetDesc() gadgets.GadgetDesc
+	Name() string
 	Context() context.Context
-	Operators() operators.Operators
 	Logger() logger.Logger
 	RuntimeParams() *params.Params
-	GadgetParams() *params.Params
 	Args() []string
-	OperatorsParamCollection() params.Collection
 	Timeout() time.Duration
+	UseInstance() bool
+	ExtraInfo() bool
 
 	Cancel()
 	ImageName() string
 	RegisterDataSource(datasource.Type, string) (datasource.DataSource, error)
 	GetDataSources() map[string]datasource.DataSource
+	GetAllDataSources() map[string]datasource.DataSource
 	SetVar(string, any)
 	GetVar(string) (any, bool)
-	SerializeGadgetInfo() (*api.GadgetInfo, error)
-	LoadGadgetInfo(info *api.GadgetInfo, paramValues api.ParamValues, run bool) error
+	SerializeGadgetInfo(requestExtraInfo bool) (*api.GadgetInfo, error)
+	LoadGadgetInfo(info *api.GadgetInfo, paramValues api.ParamValues, run bool, extraInfo *api.ExtraInfo) error
+	StopLocalOperators()
 	Params() []*api.Param
-	SetMetadata([]byte)
+	SetMetadata([]byte) error
 	SetParams([]*api.Param)
 	DataOperators() []operators.DataOperator
+	OrasTarget() oras.ReadOnlyTarget
+	IsRemoteCall() bool
 
 	Run(paramValues api.ParamValues) error
 	PrepareGadgetInfo(paramValues api.ParamValues) error
@@ -109,9 +116,9 @@ type Runtime interface {
 	// from a cache
 	GetGadgetInfo(gadgetCtx GadgetContext, runtimeParams *params.Params, paramValueMap api.ParamValues) (*api.GadgetInfo, error)
 
-	RunBuiltInGadget(gadgetCtx GadgetContext) (CombinedGadgetResult, error)
 	RunGadget(gadgetCtx GadgetContext, runtimeParams *params.Params, paramValueMap api.ParamValues) error
-	GetCatalog() (*Catalog, error)
 	SetDefaultValue(params.ValueHint, string)
 	GetDefaultValue(params.ValueHint) (string, bool)
+
+	IsClient() bool
 }

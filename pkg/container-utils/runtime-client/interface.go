@@ -41,7 +41,15 @@ type K8sContainerData struct {
 }
 
 type RuntimeContainerData struct {
-	types.BasicRuntimeMetadata
+	// Almost like types.BasicRuntimeMetadata but don't use it because we
+	// don't need ContainerPID
+	RuntimeName          types.RuntimeName
+	ContainerID          string
+	ContainerName        string
+	ContainerImageName   string
+	ContainerImageID     string
+	ContainerImageDigest string
+	ContainerStartedAt   types.Time
 
 	// Current state of the container.
 	State string
@@ -132,10 +140,13 @@ func ParseContainerID(expectedRuntime types.RuntimeName, containerID string) (st
 			return "", fmt.Errorf("invalid container runtime %q, it should be %q",
 				containerID, expectedRuntime)
 		}
-		return split[1], nil
+		containerID = split[1]
 	}
 
-	return split[0], nil
+	if err := types.ValidateContainerID(containerID); err != nil {
+		return "", err
+	}
+	return containerID, nil
 }
 
 func EnrichWithK8sMetadata(container *ContainerData, labels map[string]string) {

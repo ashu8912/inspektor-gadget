@@ -15,11 +15,22 @@
 package gadgetcontext
 
 import (
+	"context"
 	"slices"
 	"time"
 
+	"oras.land/oras-go/v2"
+
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
+)
+
+type contextKey string
+
+const (
+	remoteKey contextKey = "gadgetRemote"
+	clientKey contextKey = "gadgetClient"
+	attachKey contextKey = "gadgetAttach"
 )
 
 type Option func(gadgetCtx *GadgetContext)
@@ -39,5 +50,51 @@ func WithDataOperators(ops ...operators.DataOperator) Option {
 func WithTimeout(timeout time.Duration) Option {
 	return func(gadgetCtx *GadgetContext) {
 		gadgetCtx.timeout = timeout
+	}
+}
+
+// WithOrasReadonlyTarget sets the oras target used by image operators to read
+// OCI layers during gadget loading. The target is released once all data
+// operators have been instantiated, so GadgetContext.OrasTarget() only returns
+// a usable value up to that point.
+func WithOrasReadonlyTarget(ociStore oras.ReadOnlyTarget) Option {
+	return func(c *GadgetContext) {
+		c.orasTarget = ociStore
+	}
+}
+
+func WithAsRemoteCall(val bool) Option {
+	return func(gadgetCtx *GadgetContext) {
+		gadgetCtx.ctx = context.WithValue(gadgetCtx.ctx, remoteKey, val)
+	}
+}
+
+func WithIsClient(val bool) Option {
+	return func(gadgetCtx *GadgetContext) {
+		gadgetCtx.ctx = context.WithValue(gadgetCtx.ctx, clientKey, val)
+	}
+}
+
+func WithUseInstance(val bool) Option {
+	return func(gadgetCtx *GadgetContext) {
+		gadgetCtx.useInstance = val
+	}
+}
+
+func IncludeExtraInfo(val bool) Option {
+	return func(gadgetCtx *GadgetContext) {
+		gadgetCtx.requestExtraInfo = val
+	}
+}
+
+func WithID(id string) Option {
+	return func(gadgetCtx *GadgetContext) {
+		gadgetCtx.id = id
+	}
+}
+
+func WithName(name string) Option {
+	return func(gadgetCtx *GadgetContext) {
+		gadgetCtx.name = name
 	}
 }

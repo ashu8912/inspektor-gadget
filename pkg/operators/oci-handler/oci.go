@@ -1,4 +1,4 @@
-// Copyright 2024 The Inspektor Gadget authors
+// Copyright 2024-2025 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,51 +15,149 @@
 package ocihandler
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"slices"
+	"strings"
 
+	"github.com/blang/semver"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/spf13/viper"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 
+	"github.com/inspektor-gadget/inspektor-gadget/internal/version"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/environment"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
 	apihelpers "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api-helpers"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/k8sutil"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/oci"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/params"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/resources"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/signature/verifier"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/signature/verifier/cosign"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/signature/verifier/notation"
 )
 
 const (
-	validateMetadataParam = "validate-metadata"
-	authfileParam         = "authfile"
-	insecureParam         = "insecure"
-	pullParam             = "pull"
-	pullSecret            = "pull-secret"
-	verifyImage           = "verify-image"
-	publicKey             = "public-key"
+	validateMetadataParam   = "validate-metadata"
+	authfileParam           = "authfile"
+	insecureRegistriesParam = "insecure-registries"
+	disallowPulling         = "disallow-pulling"
+	pullParam               = "pull"
+	pullSecret              = "pull-secret"
+	annotate                = "annotate"
+	verifyImage             = "verify-image"
+	publicKeys              = "public-keys"
+	certificates            = "notation-certificates"
+	policyDocument          = "notation-policy-document"
+	allowedGadgets          = "allowed-gadgets"
+
+	TagGroupOCI = "group:OCI"
 )
 
-type ociHandler struct{}
+const (
+	builderVersionAnnotation = "io.inspektor-gadget.builder.version"
+)
+
+type ociHandler struct {
+	globalParams *params.Params
+	verifyOpts   oci.VerifyOptions
+}
+
+func New() *ociHandler {
+	return &ociHandler{}
+}
 
 func (o *ociHandler) Name() string {
 	return "oci"
 }
 
-func (o *ociHandler) Init(*params.Params) error {
+func (o *ociHandler) Init(params *params.Params) error {
+	if o.globalParams != nil {
+		return fmt.Errorf("ociHandler already initialized")
+	}
+	o.globalParams = params
+
+	verifyOptions := oci.VerifyOptions{
+		VerifySignature: o.globalParams.Get(verifyImage).AsBool(),
+	}
+
+	if verifyOptions.VerifySignature {
+		verifier, err := verifier.NewSignatureVerifier(
+			verifier.VerifierOptions{
+				CosignVerifierOpts: cosign.VerifierOptions{
+					PublicKeys: o.globalParams.Get(publicKeys).AsStringSlice(),
+				},
+				NotationVerifierOpts: notation.VerifierOptions{
+					Certificates:   o.globalParams.Get(certificates).AsStringSlice(),
+					PolicyDocument: o.globalParams.Get(policyDocument).AsString(),
+				},
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("creating signature verifier: %w", err)
+		}
+		verifyOptions.Verifier = verifier
+	}
+
+	o.verifyOpts = verifyOptions
+
 	return nil
 }
 
 func (o *ociHandler) GlobalParams() api.Params {
-	return nil
-}
-
-func (o *ociHandler) InstanceParams() api.Params {
-	return api.Params{
-		// Hardcoded for now
+	p := api.Params{
+		{
+			Key:          verifyImage,
+			Title:        "Verify image",
+			Description:  "Verify image using the provided public key",
+			DefaultValue: "true",
+			TypeHint:     api.TypeBool,
+		},
+		{
+			Key:          publicKeys,
+			Title:        "Public keys",
+			Description:  "Public keys used to verify the gadgets with cosign",
+			DefaultValue: resources.InspektorGadgetPublicKey,
+			TypeHint:     api.TypeStringSlice,
+		},
+		{
+			Key:         certificates,
+			Title:       "Notation certificates",
+			Description: "Certificates used to verify the gadgets with notation",
+			TypeHint:    api.TypeStringSlice,
+		},
+		{
+			Key:         policyDocument,
+			Title:       "Notation policy Document",
+			Description: "Policy Document used to verify the gadgets with notation",
+			TypeHint:    api.TypeString,
+		},
+		{
+			Key:         allowedGadgets,
+			Title:       "Allowed Gadgets",
+			Description: "List of allowed gadgets, if gadget is not part of it, execution will be denied. By default, all digests are allowed",
+			TypeHint:    api.TypeStringSlice,
+		},
+		{
+			Key:         insecureRegistriesParam,
+			Title:       "Insecure registries",
+			Description: "List of registries to access over plain HTTP",
+			TypeHint:    api.TypeStringSlice,
+		},
+		{
+			Key:          disallowPulling,
+			Title:        "Disallow pulling",
+			Description:  "Disallow pulling gadgets from registries",
+			DefaultValue: "false",
+			TypeHint:     api.TypeBool,
+		},
 		{
 			Key:          authfileParam,
 			Title:        "Auth file",
@@ -67,19 +165,30 @@ func (o *ociHandler) InstanceParams() api.Params {
 			DefaultValue: oci.DefaultAuthFile,
 			TypeHint:     api.TypeString,
 		},
+	}
+
+	if environment.Environment == environment.Kubernetes {
+		p = append(p, &api.Param{
+			Key:         pullSecret,
+			Title:       "Pull secret",
+			Description: "Kubernetes secret to use when pulling the gadget image",
+			TypeHint:    api.TypeString,
+		})
+	}
+
+	return p
+}
+
+func (o *ociHandler) InstanceParams() api.Params {
+	return api.Params{
+		// Hardcoded for now
 		{
 			Key:          validateMetadataParam,
 			Title:        "Validate metadata",
 			Description:  "Validate the gadget metadata before running the gadget",
 			DefaultValue: "true",
 			TypeHint:     api.TypeBool,
-		},
-		{
-			Key:          insecureParam,
-			Title:        "Insecure connection",
-			Description:  "Allow connections to HTTP only registries",
-			DefaultValue: "false",
-			TypeHint:     api.TypeBool,
+			Tags:         []string{api.TagAdvanced, TagGroupOCI},
 		},
 		{
 			Key:          pullParam,
@@ -92,35 +201,21 @@ func (o *ociHandler) InstanceParams() api.Params {
 				oci.PullImageNever,
 			},
 			TypeHint: api.TypeString,
+			Tags:     []string{api.TagAdvanced, TagGroupOCI},
 		},
 		{
-			Key:         pullSecret,
-			Title:       "Pull secret",
-			Description: "Secret to use when pulling the gadget image",
-			TypeHint:    api.TypeString,
-		},
-		{
-			Key:          verifyImage,
-			Title:        "Verify image",
-			Description:  "Verify image using the provided public key",
-			DefaultValue: "true",
-			TypeHint:     api.TypeBool,
-		},
-		{
-			Key:          publicKey,
-			Title:        "Public key",
-			Description:  "Public key used to verify the image based gadget",
-			DefaultValue: resources.InspektorGadgetPublicKey,
-			TypeHint:     api.TypeString,
+			Key:   annotate,
+			Title: "Add annotations",
+			Description: "Add annotations to datasources or fields. Use a comma-separated list in the formats:\n" +
+				"  'datasource:annotation=value' to add an annotation to a datasource.\n" +
+				"  'datasource.field:annotation=value' to add an annotation to the field of a datasource\n",
+			TypeHint: api.TypeStringSlice,
+			Tags:     []string{api.TagAdvanced, TagGroupOCI},
 		},
 	}
 }
 
-func getPullSecret(pullSecretString string, gadgetNamespace string) ([]byte, error) {
-	k8sClient, err := k8sutil.NewClientset("")
-	if err != nil {
-		return nil, fmt.Errorf("creating new k8s clientset: %w", err)
-	}
+func getPullSecret(pullSecretString string, gadgetNamespace string, k8sClient kubernetes.Interface) ([]byte, error) {
 	gps, err := k8sClient.CoreV1().Secrets(gadgetNamespace).Get(context.TODO(), pullSecretString, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("getting secret %q: %w", pullSecretString, err)
@@ -134,22 +229,33 @@ func getPullSecret(pullSecretString string, gadgetNamespace string) ([]byte, err
 func (o *ociHandler) InstantiateDataOperator(gadgetCtx operators.GadgetContext, instanceParamValues api.ParamValues) (
 	operators.DataOperatorInstance, error,
 ) {
-	ociParams := apihelpers.ToParamDescs(o.InstanceParams()).ToParams()
-	err := ociParams.CopyFromMap(instanceParamValues, "")
+	// TODO: This should be moved to Init(), but we're relying on Init() not
+	// being called in many places, specially tests and examples.
+	if o.globalParams == nil {
+		o.globalParams = apihelpers.ToParamDescs(o.GlobalParams()).ToParams()
+	}
+
+	instanceParams := apihelpers.ToParamDescs(o.InstanceParams()).ToParams()
+	err := instanceParams.CopyFromMap(instanceParamValues, "")
 	if err != nil {
 		return nil, err
 	}
 
 	instance := &OciHandlerInstance{
-		ociHandler:  o,
-		gadgetCtx:   gadgetCtx,
-		ociParams:   ociParams,
-		paramValues: instanceParamValues,
+		ociHandler:     o,
+		gadgetCtx:      gadgetCtx,
+		globalParams:   o.globalParams,
+		instanceParams: instanceParams,
+		paramValues:    instanceParamValues,
 	}
 
 	err = instance.init(gadgetCtx)
 	if err != nil {
 		return nil, err
+	}
+
+	if len(instance.imageOperatorInstances) == 0 {
+		return nil, nil
 	}
 
 	return instance, nil
@@ -159,50 +265,165 @@ func (o *OciHandlerInstance) ExtraParams(gadgetCtx operators.GadgetContext) api.
 	return o.extraParams
 }
 
+func checkBuilderVersion(manifest *v1.Manifest, logger logger.Logger, currentVersion semver.Version) {
+	// Do not print any warning if this is a prerelease to avoid annoying developers
+	if len(currentVersion.Pre) > 0 {
+		return
+	}
+
+	builderVersionAnn := manifest.Annotations[builderVersionAnnotation]
+	if builderVersionAnn == "" {
+		logger.Warnf("Builder version not found in the gadget image. Gadget could be incompatible")
+		return
+	}
+
+	builderVersion, err := semver.ParseTolerant(builderVersionAnn)
+	if err != nil {
+		// it could happen on development versions
+		logger.Debugf("parsing builder version: %s", err)
+		return
+	}
+
+	if !builderVersion.EQ(currentVersion) {
+		logger.Warnf("This gadget was built with ig %s and it's being run with v%s. Gadget could be incompatible",
+			builderVersionAnn, currentVersion)
+	}
+}
+
+func constructTempConfig(ann string) (map[string]any, int, error) {
+	annInfo := strings.Split(ann, ":")
+	if len(annInfo) > 2 && strings.Contains(annInfo[1], "=") {
+		// the case when the annotation value contains a colon
+		annInfo[1] = strings.Join(annInfo[1:], ":")
+	} else if len(annInfo) != 2 {
+		return nil, 0, fmt.Errorf("annotation %q must be in subject:assignment format", ann)
+	}
+
+	if slices.Contains(annInfo, "") {
+		return nil, 0, fmt.Errorf("annotation %q has empty subject or assignment", ann)
+	}
+
+	annotation := strings.SplitN(annInfo[1], "=", 2)
+	if len(annotation) != 2 {
+		return nil, 0, fmt.Errorf("annotation %q must contain a key=value pair", ann)
+	}
+	if annotation[0] == "" {
+		return nil, 0, fmt.Errorf("annotation %q has empty key", ann)
+	}
+
+	subject := strings.Split(annInfo[0], ".")
+
+	if slices.Contains(subject, "") {
+		return nil, 0, fmt.Errorf("annotation %q has empty field or subfield name", ann)
+	}
+
+	if len(subject) > 2 {
+		subject[1] = strings.Join(subject[1:], ".")
+		subject = subject[:2]
+	}
+
+	switch len(subject) {
+	case 1:
+		// data source
+		tmpConfig := map[string]any{
+			"datasources": map[string]any{
+				annInfo[0]: map[string]any{
+					"annotations": map[string]any{
+						annotation[0]: annotation[1],
+					},
+				},
+			},
+		}
+		return tmpConfig, 1, nil
+
+	case 2:
+		// field
+		tmpConfig := map[string]any{
+			"datasources": map[string]any{
+				subject[0]: map[string]any{
+					"fields": map[string]any{
+						subject[1]: map[string]any{
+							"annotations": map[string]any{
+								annotation[0]: annotation[1],
+							},
+						},
+					},
+				},
+			},
+		}
+		return tmpConfig, 2, nil
+	}
+	return nil, 0, fmt.Errorf("invalid annotation %q", ann)
+}
+
 func (o *OciHandlerInstance) init(gadgetCtx operators.GadgetContext) error {
 	if len(gadgetCtx.ImageName()) == 0 {
 		return fmt.Errorf("imageName empty")
 	}
 
+	var secretBytes []byte
+
 	// TODO: move to a place without dependency on k8s
-	pullSecretString := o.ociParams.Get(pullSecret).AsString()
-	var secretBytes []byte = nil
-	if pullSecretString != "" {
-		var err error
-		// TODO: Namespace is still hardcoded
-		secretBytes, err = getPullSecret(pullSecretString, "gadget")
-		if err != nil {
-			return err
+	if pullSecretParam := o.globalParams.Get(pullSecret); pullSecretParam != nil {
+		pullSecretString := o.globalParams.Get(pullSecret).AsString()
+
+		if pullSecretString != "" {
+			var err error
+			k8sClient, err := k8sutil.NewClientset("", "pull-secret")
+			if err != nil {
+				return fmt.Errorf("creating new k8s clientset: %w", err)
+			}
+			// TODO: Namespace is still hardcoded
+			secretBytes, err = getPullSecret(pullSecretString, "gadget", k8sClient)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
 	imgOpts := &oci.ImageOptions{
 		AuthOptions: oci.AuthOptions{
-			AuthFile:    o.ociParams.Get(authfileParam).AsString(),
-			SecretBytes: secretBytes,
-			Insecure:    o.ociParams.Get(insecureParam).AsBool(),
+			AuthFile:           o.globalParams.Get(authfileParam).AsString(),
+			SecretBytes:        secretBytes,
+			InsecureRegistries: o.globalParams.Get(insecureRegistriesParam).AsStringSlice(),
+			DisallowPulling:    o.globalParams.Get(disallowPulling).AsBool(),
 		},
-		VerifyOptions: oci.VerifyOptions{
-			VerifyPublicKey: o.ociParams.Get(verifyImage).AsBool(),
-			PublicKey:       o.ociParams.Get(publicKey).AsString(),
+		VerifyOptions: o.ociHandler.verifyOpts,
+		AllowedGadgetsOptions: oci.AllowedGadgetsOptions{
+			AllowedGadgets: o.globalParams.Get(allowedGadgets).AsStringSlice(),
 		},
+		Logger: gadgetCtx.Logger(),
 	}
 
-	// Make sure the image is available, either through pulling or by just accessing a local copy
-	// TODO: add security constraints (e.g. don't allow pulling - add GlobalParams for that)
-	err := oci.EnsureImage(gadgetCtx.Context(), gadgetCtx.ImageName(), imgOpts, o.ociParams.Get(pullParam).AsString())
-	if err != nil {
-		return fmt.Errorf("ensuring image: %w", err)
+	gadgetCtx.Logger().Debugf("image options: %+v", imgOpts)
+
+	target := gadgetCtx.OrasTarget()
+	// If the target wasn't explicitly set, use the local store. In this case we
+	// need to be sure the image is available.
+	if target == nil {
+		// Make sure the image is available, either through pulling or by just accessing a local copy
+		// TODO: add security constraints (e.g. don't allow pulling - add GlobalParams for that)
+		err := oci.EnsureImage(gadgetCtx.Context(), gadgetCtx.ImageName(),
+			imgOpts, o.instanceParams.Get(pullParam).AsString())
+		if err != nil {
+			return fmt.Errorf("ensuring image: %w", err)
+		}
+
+		err = oci.VerifyGadgetImage(gadgetCtx.Context(), gadgetCtx.ImageName(), imgOpts)
+		if err != nil {
+			return fmt.Errorf("verifying image: %w", err)
+		}
 	}
 
-	manifest, err := oci.GetManifestForHost(gadgetCtx.Context(), gadgetCtx.ImageName())
+	manifest, err := oci.GetManifestForHost(gadgetCtx.Context(), target, gadgetCtx.ImageName())
 	if err != nil {
 		return fmt.Errorf("getting manifest: %w", err)
 	}
 
 	log := gadgetCtx.Logger()
+	checkBuilderVersion(manifest, log, version.Version())
 
-	r, err := oci.GetContentFromDescriptor(gadgetCtx.Context(), manifest.Config)
+	r, err := oci.GetContentFromDescriptor(gadgetCtx.Context(), target, manifest.Config)
 	if err != nil {
 		return fmt.Errorf("getting metadata: %w", err)
 	}
@@ -213,15 +434,41 @@ func (o *OciHandlerInstance) init(gadgetCtx operators.GadgetContext) error {
 	}
 	r.Close()
 
-	// Store metadata for serialization
-	gadgetCtx.SetMetadata(metadata)
-
-	viper := viper.New()
-	viper.SetConfigType("yaml")
-	err = viper.ReadConfig(bytes.NewReader(metadata))
-
+	// Store metadata
+	err = gadgetCtx.SetMetadata(metadata)
 	if err != nil {
-		return fmt.Errorf("unmarshalling metadata: %w", err)
+		return fmt.Errorf("setting metadata: %w", err)
+	}
+
+	cfg, ok := gadgetCtx.GetVar("config")
+	if !ok {
+		return fmt.Errorf("missing configuration")
+	}
+	viper, ok := cfg.(*viper.Viper)
+	if !ok {
+		return fmt.Errorf("invalid configuration format")
+	}
+
+	for _, ann := range o.instanceParams.Get(annotate).AsStringSlice() {
+		if len(ann) == 0 {
+			continue
+		}
+		tmpConfig, lenSubject, err := constructTempConfig(ann)
+		if err != nil {
+			return err
+		}
+
+		err = viper.MergeConfigMap(tmpConfig)
+		if err != nil {
+			return fmt.Errorf("adding annotation %q: %w", ann, err)
+		}
+
+		switch lenSubject {
+		case 1:
+			log.Debugf("ds annotation %q added", ann)
+		case 2:
+			log.Debugf("field annotation %q added", ann)
+		}
 	}
 
 	gadgetCtx.SetVar("config", viper)
@@ -230,13 +477,14 @@ func (o *OciHandlerInstance) init(gadgetCtx operators.GadgetContext) error {
 		log.Debugf("layer > %+v", layer)
 		op, ok := operators.GetImageOperatorForMediaType(layer.MediaType)
 		if !ok {
+			log.Warnf("no operator found for media type %q, skipping layer", layer.MediaType)
 			continue
 		}
 
 		log.Debugf("found image op %q", op.Name())
-		opInst, err := op.InstantiateImageOperator(gadgetCtx, layer, o.paramValues.ExtractPrefixedValues(op.Name()))
+		opInst, err := op.InstantiateImageOperator(gadgetCtx, target, layer, o.paramValues.ExtractPrefixedValues(op.Name()))
 		if err != nil {
-			log.Errorf("instantiating operator %q: %v", op.Name(), err)
+			return fmt.Errorf("instantiating operator %q: %w", op.Name(), err)
 		}
 		if opInst == nil {
 			log.Debugf("> skipped %s", op.Name())
@@ -246,22 +494,38 @@ func (o *OciHandlerInstance) init(gadgetCtx operators.GadgetContext) error {
 	}
 
 	if len(o.imageOperatorInstances) == 0 {
-		return fmt.Errorf("image doesn't contain valid gadget layers")
+		return nil
+	}
+
+	// add extra info if requested
+	if gadgetCtx.ExtraInfo() {
+		err := addExtraInfo(gadgetCtx, metadata, manifest)
+		if err != nil {
+			return fmt.Errorf("adding extra info: %w", err)
+		}
 	}
 
 	extraParams := make([]*api.Param, 0)
 	for _, opInst := range o.imageOperatorInstances {
-		err := opInst.Prepare(o.gadgetCtx)
-		if err != nil {
-			o.gadgetCtx.Logger().Errorf("preparing operator %q: %v", opInst.Name(), err)
-			continue
+		if extra, ok := opInst.(operators.ExtraParams); ok {
+			params := extra.ExtraParams(gadgetCtx)
+			extraParams = append(extraParams, params.AddPrefix(opInst.Name())...)
 		}
-
-		// Add gadget params prefixed with operators' name
-		extraParams = append(extraParams, opInst.ExtraParams(gadgetCtx).AddPrefix(opInst.Name())...)
 	}
 
 	o.extraParams = extraParams
+	return nil
+}
+
+func (o *OciHandlerInstance) PreStart(gadgetCtx operators.GadgetContext) error {
+	for _, opInst := range o.imageOperatorInstances {
+		if preStart, ok := opInst.(operators.PreStart); ok {
+			err := preStart.PreStart(gadgetCtx)
+			if err != nil {
+				return fmt.Errorf("pre-starting operator %q: %w", opInst.Name(), err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -271,38 +535,82 @@ func (o *OciHandlerInstance) Start(gadgetCtx operators.GadgetContext) error {
 	for _, opInst := range o.imageOperatorInstances {
 		err := opInst.Start(o.gadgetCtx)
 		if err != nil {
-			// Stop all started operators
+			// Stop all operators that were started to be sure they're able to
+			// release resources there
 			for _, startedOp := range started {
 				startedOp.Stop(o.gadgetCtx)
+				if postStop, ok := startedOp.(operators.PostStop); ok {
+					postStop.PostStop(o.gadgetCtx)
+				}
 			}
-
 			return fmt.Errorf("starting operator %q: %w", opInst.Name(), err)
 		}
-
 		started = append(started, opInst)
+	}
+
+	return nil
+}
+
+func (o *OciHandlerInstance) PreStop(gadgetCtx operators.GadgetContext) error {
+	for _, opInst := range o.imageOperatorInstances {
+		preStop, ok := opInst.(operators.PreStop)
+		if !ok {
+			continue
+		}
+		err := preStop.PreStop(gadgetCtx)
+		if err != nil {
+			o.gadgetCtx.Logger().Errorf("pre-stopping operator %q: %v", opInst.Name(), err)
+		}
 	}
 	return nil
 }
 
 func (o *OciHandlerInstance) Stop(gadgetCtx operators.GadgetContext) error {
+	var errs []error
+
 	for _, opInst := range o.imageOperatorInstances {
 		err := opInst.Stop(o.gadgetCtx)
 		if err != nil {
-			o.gadgetCtx.Logger().Errorf("stopping operator %q: %v", opInst.Name(), err)
+			errs = append(errs, fmt.Errorf("stopping operator %q: %w", opInst.Name(), err))
 		}
 	}
-	return nil
+
+	return errors.Join(errs...)
+}
+
+func (o *OciHandlerInstance) PostStop(gadgetCtx operators.GadgetContext) error {
+	var errs []error
+
+	for _, opInst := range o.imageOperatorInstances {
+		if preStart, ok := opInst.(operators.PostStop); ok {
+			err := preStart.PostStop(gadgetCtx)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("post-stopping operator %q: %w", opInst.Name(), err))
+			}
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+func (o *OciHandlerInstance) Close(gadgetCtx operators.GadgetContext) error {
+	var errs []error
+
+	for _, opInst := range o.imageOperatorInstances {
+		errs = append(errs, opInst.Close(o.gadgetCtx))
+	}
+
+	return errors.Join(errs...)
 }
 
 type OciHandlerInstance struct {
 	ociHandler             *ociHandler
 	gadgetCtx              operators.GadgetContext
 	imageOperatorInstances []operators.ImageOperatorInstance
-	dataOperatorInstances  []operators.DataOperatorInstance
 	extraParams            api.Params
 	paramValues            api.ParamValues
-	ociParams              *params.Params
-	paramValueMap          map[string]string
+	globalParams           *params.Params
+	instanceParams         *params.Params
 }
 
 func (o *OciHandlerInstance) Name() string {
@@ -314,4 +622,4 @@ func (o *ociHandler) Priority() int {
 }
 
 // OciHandler is a singleton of ociHandler
-var OciHandler = &ociHandler{}
+var OciHandler = New()

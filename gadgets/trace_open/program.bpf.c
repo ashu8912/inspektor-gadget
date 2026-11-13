@@ -7,13 +7,15 @@
 #include <bpf/bpf_core_read.h>
 
 #include <gadget/buffer.h>
+#include <gadget/common.h>
+#include <gadget/filter.h>
 #include <gadget/macros.h>
-#include <gadget/mntns_filter.h>
 #include <gadget/types.h>
+#include <gadget/user_stack_map.h>
+#include <gadget/filesystem.h>
 
 #define TASK_RUNNING 0
 #define NAME_MAX 255
-#define INVALID_UID ((uid_t)-1)
 
 struct args_t {
 	const char *fname;
@@ -22,28 +24,23 @@ struct args_t {
 };
 
 struct event {
-	gadget_timestamp timestamp;
-	/* user terminology for pid: */
-	__u32 pid;
-	__u32 uid;
-	__u32 gid;
-	gadget_mntns_id mntns_id;
-	__s32 err;
+	gadget_timestamp timestamp_raw;
+	struct gadget_process proc;
+
+	gadget_errno error_raw;
 	__u32 fd;
-	int flags;
-	__u16 mode;
-	char comm[TASK_COMM_LEN];
+	gadget_file_flags flags_raw;
+	gadget_file_mode mode_raw;
+	struct gadget_user_stack ustack;
 	char fname[NAME_MAX];
+	char fpath[GADGET_PATH_MAX];
 };
 
-const volatile pid_t targ_pid = 0;
-const volatile pid_t targ_tgid = 0;
-const volatile uid_t targ_uid = INVALID_UID;
 const volatile bool targ_failed = false;
+const volatile bool paths = false;
 
-GADGET_PARAM(targ_tgid);
-GADGET_PARAM(targ_uid);
 GADGET_PARAM(targ_failed);
+GADGET_PARAM(paths);
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -56,52 +53,20 @@ GADGET_TRACER_MAP(events, 1024 * 256);
 
 GADGET_TRACER(open, events, event);
 
-static __always_inline bool valid_uid(uid_t uid)
-{
-	return uid != INVALID_UID;
-}
-
-static __always_inline bool trace_allowed(u32 tgid, u32 pid)
-{
-	u64 mntns_id;
-	u32 uid;
-
-	/* filters */
-	if (targ_tgid && targ_tgid != tgid)
-		return false;
-	if (targ_pid && targ_pid != pid)
-		return false;
-	if (valid_uid(targ_uid)) {
-		uid = (u32)bpf_get_current_uid_gid();
-		if (targ_uid != uid) {
-			return false;
-		}
-	}
-
-	mntns_id = gadget_get_mntns_id();
-
-	if (gadget_should_discard_mntns_id(mntns_id))
-		return false;
-
-	return true;
-}
-
 static __always_inline int trace_enter(const char *filename, int flags,
 				       __u16 mode)
 {
-	u64 id = bpf_get_current_pid_tgid();
-	/* use kernel terminology here for tgid/pid: */
-	u32 tgid = id >> 32;
-	u32 pid = id;
+	__u64 pid = bpf_get_current_pid_tgid();
 
-	/* store arg info for later lookup */
-	if (trace_allowed(tgid, pid)) {
-		struct args_t args = {};
-		args.fname = filename;
-		args.flags = flags;
-		args.mode = mode;
-		bpf_map_update_elem(&start, &pid, &args, 0);
-	}
+	if (gadget_should_discard_data_current())
+		return 0;
+
+	struct args_t args = {};
+	args.fname = filename;
+	args.flags = flags;
+	args.mode = mode;
+	bpf_map_update_elem(&start, &pid, &args, 0);
+
 	return 0;
 }
 
@@ -128,8 +93,10 @@ static __always_inline int trace_exit(struct syscall_trace_exit *ctx)
 	long int ret;
 	__u32 fd;
 	__s32 errval;
-	u32 pid = bpf_get_current_pid_tgid();
-	u64 uid_gid = bpf_get_current_uid_gid();
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+
+	// pid from kernel po
+	u32 pid = (u32)pid_tgid;
 
 	ap = bpf_map_lookup_elem(&start, &pid);
 	if (!ap)
@@ -146,22 +113,31 @@ static __always_inline int trace_exit(struct syscall_trace_exit *ctx)
 	errval = 0;
 	if (ret >= 0) {
 		fd = ret;
+
+		if (paths) {
+			long r = read_full_path_of_open_file_fd(
+				fd, (char *)event->fpath, sizeof(event->fpath));
+			if (r <= 0)
+				event->fpath[0] = '\0';
+		}
 	} else {
 		errval = -ret;
 	}
 
 	/* event data */
-	event->pid = bpf_get_current_pid_tgid() >> 32;
-	event->uid = (u32)uid_gid;
-	event->gid = (u32)(uid_gid >> 32);
-	bpf_get_current_comm(&event->comm, sizeof(event->comm));
+	gadget_process_populate(&event->proc);
+	/* trace_open is a tracepoint gadget: OTel symbolization is not available
+	 * for tracepoint programs, but the plain user stack is still collected
+	 * and symbolized by the symbol-table symbolizer.
+	 */
+	gadget_get_user_stack_from_tracepoint(ctx, &event->ustack);
+
 	bpf_probe_read_user_str(&event->fname, sizeof(event->fname), ap->fname);
-	event->flags = ap->flags;
-	event->mode = ap->mode;
-	event->err = errval;
+	event->flags_raw = ap->flags;
+	event->mode_raw = ap->mode;
+	event->error_raw = errval;
 	event->fd = fd;
-	event->mntns_id = gadget_get_mntns_id();
-	event->timestamp = bpf_ktime_get_boot_ns();
+	event->timestamp_raw = bpf_ktime_get_boot_ns();
 
 	/* emit event */
 	gadget_submit_buf(ctx, &events, event, sizeof(*event));

@@ -8,11 +8,18 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
 
-type socketsiterSocketsKey struct {
+type socketsiterBufT struct {
+	_   structs.HostLayout
+	Buf [32768]uint8
+}
+
+type socketsiterGadgetSocketKey struct {
+	_      structs.HostLayout
 	Netns  uint32
 	Family uint16
 	Proto  uint8
@@ -21,16 +28,34 @@ type socketsiterSocketsKey struct {
 	_      [2]byte
 }
 
-type socketsiterSocketsValue struct {
-	Mntns             uint64
-	PidTgid           uint64
-	UidGid            uint64
-	Task              [16]int8
-	Sock              uint64
-	DeletionTimestamp uint64
-	Ipv6only          int8
-	_                 [7]byte
+type socketsiterGadgetSocketValue struct {
+	_                   structs.HostLayout
+	Mntns               uint64
+	PidTgid             uint64
+	UidGid              uint64
+	Task                [16]int8
+	Ptask               [16]int8
+	Sock                uint64
+	DeletionTimestamp   uint64
+	Ppid                uint32
+	Ptid                uint32
+	Ipv6only            int8
+	_                   [7]byte
+	OptionalFieldsStart [0]int8
+	Cwd                 [4096]int8
+	Exepath             [4096]int8
 }
+
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	socketsiterMapBufs              = "bufs"
+	socketsiterMapGadgetSockets     = "gadget_sockets"
+	socketsiterProgIgSkCleanup      = "ig_sk_cleanup"
+	socketsiterProgIgSocketsIt      = "ig_sockets_it"
+	socketsiterVarSocketFileOpsAddr = "socket_file_ops_addr"
+)
 
 // loadSocketsiter returns the embedded CollectionSpec for socketsiter.
 func loadSocketsiter() (*ebpf.CollectionSpec, error) {
@@ -52,7 +77,7 @@ func loadSocketsiter() (*ebpf.CollectionSpec, error) {
 //	*socketsiterMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadSocketsiterObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadSocketsiterObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadSocketsiter()
 	if err != nil {
 		return err
@@ -67,9 +92,10 @@ func loadSocketsiterObjects(obj interface{}, opts *ebpf.CollectionOptions) error
 type socketsiterSpecs struct {
 	socketsiterProgramSpecs
 	socketsiterMapSpecs
+	socketsiterVariableSpecs
 }
 
-// socketsiterSpecs contains programs before they are loaded into the kernel.
+// socketsiterProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type socketsiterProgramSpecs struct {
@@ -81,7 +107,15 @@ type socketsiterProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type socketsiterMapSpecs struct {
+	Bufs          *ebpf.MapSpec `ebpf:"bufs"`
 	GadgetSockets *ebpf.MapSpec `ebpf:"gadget_sockets"`
+}
+
+// socketsiterVariableSpecs contains global variables before they are loaded into the kernel.
+//
+// It can be passed ebpf.CollectionSpec.Assign.
+type socketsiterVariableSpecs struct {
+	SocketFileOpsAddr *ebpf.VariableSpec `ebpf:"socket_file_ops_addr"`
 }
 
 // socketsiterObjects contains all objects after they have been loaded into the kernel.
@@ -90,6 +124,7 @@ type socketsiterMapSpecs struct {
 type socketsiterObjects struct {
 	socketsiterPrograms
 	socketsiterMaps
+	socketsiterVariables
 }
 
 func (o *socketsiterObjects) Close() error {
@@ -103,13 +138,22 @@ func (o *socketsiterObjects) Close() error {
 //
 // It can be passed to loadSocketsiterObjects or ebpf.CollectionSpec.LoadAndAssign.
 type socketsiterMaps struct {
+	Bufs          *ebpf.Map `ebpf:"bufs"`
 	GadgetSockets *ebpf.Map `ebpf:"gadget_sockets"`
 }
 
 func (m *socketsiterMaps) Close() error {
 	return _SocketsiterClose(
+		m.Bufs,
 		m.GadgetSockets,
 	)
+}
+
+// socketsiterVariables contains all global variables after they have been loaded into the kernel.
+//
+// It can be passed to loadSocketsiterObjects or ebpf.CollectionSpec.LoadAndAssign.
+type socketsiterVariables struct {
+	SocketFileOpsAddr *ebpf.Variable `ebpf:"socket_file_ops_addr"`
 }
 
 // socketsiterPrograms contains all programs after they have been loaded into the kernel.

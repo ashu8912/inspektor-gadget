@@ -7,14 +7,13 @@
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
 
-#include <gadget/mntns_filter.h>
+#include <gadget/common.h>
+#include <gadget/filter.h>
+#include <gadget/filesystem.h>
 #include <gadget/types.h>
 #include <gadget/macros.h>
 
 #include "stat.h"
-
-#define PATH_MAX 4096
-#define TASK_COMM_LEN 16
 
 enum op {
 	READ,
@@ -30,27 +29,20 @@ enum type {
 struct file_id {
 	__u64 inode;
 	__u32 dev;
-	__u32 pid;
-	__u32 tid;
+	__u64 __pid_tgid;
 };
 
 struct file_stat {
-	gadget_mntns_id mntns_id;
+	struct gadget_process proc;
 	__u64 reads;
-	__u64 rbytes;
+	gadget_bytes rbytes_raw;
 	__u64 writes;
-	__u64 wbytes;
-	__u32 pid;
-	__u32 tid;
-	char file[PATH_MAX];
-	char comm[TASK_COMM_LEN];
-	enum type t;
+	gadget_bytes wbytes_raw;
+	char file[GADGET_PATH_MAX];
+	enum type t_raw;
 };
 
 #define MAX_ENTRIES 10240
-
-const volatile pid_t target_pid = 0;
-GADGET_PARAM(target_pid);
 
 // By default, only regular files are traced
 const volatile bool all_files = false;
@@ -65,33 +57,25 @@ struct {
 	__type(value, struct file_stat);
 } stats SEC(".maps");
 
-GADGET_TOPPER(file, stats);
+GADGET_MAPITER(file, stats);
 
-static void get_file_path(struct file *file, __u8 *buf, size_t size)
+static void get_file_path(struct file *file, char *buf, size_t size)
 {
-	struct qstr dname;
-
-	dname = BPF_CORE_READ(file, f_path.dentry, d_name);
-	bpf_probe_read_kernel(buf, size, dname.name);
+	struct path f_path = BPF_CORE_READ(file, f_path);
+	// Extract the full path string
+	char *c_path = get_path_str(&f_path);
+	bpf_probe_read_kernel_str(buf, GADGET_PATH_MAX, c_path);
 }
 
 static int probe_entry(struct pt_regs *ctx, struct file *file, size_t count,
 		       enum op op)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	__u32 pid = pid_tgid >> 32;
-	__u32 tid = (__u32)pid_tgid;
 	int mode;
 	struct file_id key = {};
 	struct file_stat *valuep;
-	u64 mntns_id;
 
-	if (target_pid && target_pid != pid)
-		return 0;
-
-	mntns_id = gadget_get_mntns_id();
-
-	if (gadget_should_discard_mntns_id(mntns_id))
+	if (gadget_should_discard_data_current())
 		return 0;
 
 	mode = BPF_CORE_READ(file, f_inode, i_mode);
@@ -100,33 +84,30 @@ static int probe_entry(struct pt_regs *ctx, struct file *file, size_t count,
 
 	key.dev = BPF_CORE_READ(file, f_inode, i_rdev);
 	key.inode = BPF_CORE_READ(file, f_inode, i_ino);
-	key.pid = pid;
-	key.tid = tid;
+	key.__pid_tgid = pid_tgid;
 	valuep = bpf_map_lookup_elem(&stats, &key);
 	if (!valuep) {
 		bpf_map_update_elem(&stats, &key, &zero_value, BPF_ANY);
 		valuep = bpf_map_lookup_elem(&stats, &key);
 		if (!valuep)
 			return 0;
-		valuep->pid = pid;
-		valuep->tid = tid;
-		valuep->mntns_id = mntns_id;
-		bpf_get_current_comm(&valuep->comm, sizeof(valuep->comm));
+
+		gadget_process_populate(&valuep->proc);
 		get_file_path(file, valuep->file, sizeof(valuep->file));
 		if (S_ISREG(mode)) {
-			valuep->t = R;
+			valuep->t_raw = R;
 		} else if (S_ISSOCK(mode)) {
-			valuep->t = S;
+			valuep->t_raw = S;
 		} else {
-			valuep->t = O;
+			valuep->t_raw = O;
 		}
 	}
 	if (op == READ) {
-		valuep->reads++;
-		valuep->rbytes += count;
+		__sync_fetch_and_add(&valuep->reads, 1);
+		__sync_fetch_and_add(&valuep->rbytes_raw, count);
 	} else { /* op == WRITE */
-		valuep->writes++;
-		valuep->wbytes += count;
+		__sync_fetch_and_add(&valuep->writes, 1);
+		__sync_fetch_and_add(&valuep->wbytes_raw, count);
 	}
 	return 0;
 };

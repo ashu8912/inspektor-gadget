@@ -1,10 +1,10 @@
 # Dockerfile for Inspektor Gadget.
 
-ARG BUILDER_IMAGE=golang:1.22-bullseye
-ARG BASE_IMAGE=gcr.io/distroless/static-debian12
+ARG BUILDER_IMAGE=golang:1.26.10-trixie@sha256:909771fef53e3dcb0950255f0c9a8b4728c3b841e61509c7b29b098de7ee02d4
+ARG BASE_IMAGE=gcr.io/distroless/static-debian12@sha256:ce46866b3a5170db3b49364900fb3168dc0833dfb46c26da5c77f22abb01d8c3
 
 # Prepare and build gadget artifacts in a container
-FROM --platform=${BUILDPLATFORM} ${BUILDER_IMAGE} as builder
+FROM --platform=${BUILDPLATFORM} ${BUILDER_IMAGE} AS builder
 
 ARG TARGETARCH
 ARG BUILDARCH
@@ -20,7 +20,10 @@ RUN cd /gadget && go mod download
 
 # This COPY is limited by .dockerignore
 COPY ./ /gadget
-RUN cd /gadget/gadget-container && \
+RUN \
+    --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg \
+    cd /gadget/gadget-container && \
 	make -j$(nproc) TARGET_ARCH=${TARGETARCH} gadget-container-deps
 
 # Main gadget image
@@ -32,7 +35,6 @@ LABEL org.opencontainers.image.description="Inspektor Gadget is a collection of 
 LABEL org.opencontainers.image.documentation="https://inspektor-gadget.io/docs"
 LABEL org.opencontainers.image.licenses=Apache-2.0
 
-COPY --from=builder /gadget/gadget-container/bin/entrypoint /
 COPY --from=builder /gadget/gadget-container/bin/cleanup /
 
 COPY --from=builder /gadget/gadget-container/bin/gadgettracermanager /bin/

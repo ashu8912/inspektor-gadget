@@ -1,4 +1,4 @@
-// Copyright 2023-2024 The Inspektor Gadget authors
+// Copyright 2023-2025 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,29 +16,33 @@ package gadgetservice
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
-	"sync"
+	"strings"
 	"syscall"
-	"time"
 
-	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/inspektor-gadget/inspektor-gadget/internal/version"
-	gadgetcontext "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-context"
-	gadgetregistry "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-registry"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/config"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
+	apihelpers "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api-helpers"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/auth"
+	instancemanager "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/instance-manager"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/store"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/metrics"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/params"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/runtime"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/runtime/local"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/experimental"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
 )
 
 type RunConfig struct {
@@ -52,210 +56,100 @@ type RunConfig struct {
 	// If SocketGID != 0 and a unix socket is used, the ownership of that socket
 	// will be changed to the given SocketGID
 	SocketGID int
+
+	// MultiTenancy enables Kubernetes authentication and namespace isolation.
+	MultiTenancy bool
+
+	// KubernetesClient is used for TokenReview and SubjectAccessReview.
+	KubernetesClient kubernetes.Interface
+
+	// MultiTenancyScope defines the namespace permission checked by Kubernetes.
+	MultiTenancyScope auth.ScopeConfig
 }
 
 type Service struct {
 	api.UnimplementedBuiltInGadgetManagerServer
 	api.UnimplementedGadgetManagerServer
+	api.UnimplementedGadgetInstanceManagerServer
+	instanceMgr       *instancemanager.Manager
+	store             store.Store
 	listener          net.Listener
 	runtime           runtime.Runtime
 	logger            logger.Logger
 	servers           map[*grpc.Server]struct{}
 	eventBufferLength uint64
+
+	// operators stores all global parameters for DataOperators (non-legacy)
+	operators map[operators.DataOperator]*params.Params
+
+	// metrics (only covering image-based gadgets)
+	ctrGetGadgetInfo metric.Int64Counter
+	ctrRunGadget     metric.Int64Counter
+	ctrAttachGadget  metric.Int64Counter
 }
 
-func NewService(defaultLogger logger.Logger, length uint64) *Service {
-	return &Service{
-		servers:           map[*grpc.Server]struct{}{},
-		logger:            defaultLogger,
-		eventBufferLength: length,
+func NewService(defaultLogger logger.Logger) *Service {
+	ops := make(map[operators.DataOperator]*params.Params)
+	for _, op := range operators.GetDataOperators() {
+		ops[op] = apihelpers.ToParamDescs(op.GlobalParams()).ToParams()
 	}
+
+	svc := &Service{
+		servers:   map[*grpc.Server]struct{}{},
+		logger:    defaultLogger,
+		operators: ops,
+	}
+
+	svc.ctrGetGadgetInfo, _ = metrics.Int64Counter("ig_grpc_get_gadget_info",
+		metric.WithUnit("{instance}"),
+		metric.WithDescription("Number of GetGadgetInfo() gRPC requests"),
+	)
+	svc.ctrRunGadget, _ = metrics.Int64Counter("ig_grpc_run_gadget",
+		metric.WithUnit("{request}"),
+		metric.WithDescription("Number of RunGadget()/Run gRPC requests"),
+	)
+	svc.ctrAttachGadget, _ = metrics.Int64Counter("ig_grpc_attach_gadget",
+		metric.WithUnit("{request}"),
+		metric.WithDescription("Number of RunGadget()/Attach gRPC requests"),
+	)
+
+	return svc
+}
+
+func (s *Service) SetEventBufferLength(val uint64) {
+	s.eventBufferLength = val
+}
+
+func (s *Service) SetInstanceManager(mgr *instancemanager.Manager) {
+	s.instanceMgr = mgr
+	mgr.Service = s
+}
+
+func (s *Service) SetStore(store store.Store) {
+	s.store = store
 }
 
 func (s *Service) GetInfo(ctx context.Context, request *api.InfoRequest) (*api.InfoResponse, error) {
-	catalog, err := s.runtime.GetCatalog()
-	if err != nil {
-		return nil, fmt.Errorf("get catalog: %w", err)
-	}
-
-	catalogJSON, err := json.Marshal(catalog)
-	if err != nil {
-		return nil, fmt.Errorf("marshal catalog: %w", err)
-	}
 	return &api.InfoResponse{
 		Version:       "1.0", // TODO
-		Catalog:       catalogJSON,
 		Experimental:  experimental.Enabled(),
 		ServerVersion: version.Version().String(),
+
+		ServerIsHostPidNs: s.optionalCheck("the host PID namespace", host.IsHostPidNs),
+		ServerIsInitPidNs: s.optionalCheck("the initial PID namespace", host.IsInitPidNs),
 	}, nil
 }
 
-func (s *Service) RunBuiltInGadget(runGadget api.BuiltInGadgetManager_RunBuiltInGadgetServer) error {
-	ctrl, err := runGadget.Recv()
+// optionalCheck runs an informative check about the process running this
+// service. A check that fails is reported as unset instead of making GetInfo()
+// fail, so that clients can tell "no" apart from "could not be determined".
+func (s *Service) optionalCheck(what string, check func() (bool, error)) *bool {
+	value, err := check()
 	if err != nil {
-		return err
-	}
-
-	request := ctrl.GetRunRequest()
-	if request == nil {
-		return fmt.Errorf("expected first control message to be gadget run request")
-	}
-
-	// Create a new logger that logs to gRPC and falls back to the standard logger when it failed to send the message
-	logger := logger.NewFromGenericLogger(&Logger{
-		send:           runGadget.Send,
-		level:          logger.Level(request.LogLevel),
-		fallbackLogger: s.logger,
-	})
-
-	runtime := s.runtime
-
-	gadgetDesc := gadgetregistry.Get(request.GadgetCategory, request.GadgetName)
-	if gadgetDesc == nil {
-		return fmt.Errorf("gadget not found: %s/%s", request.GadgetCategory, request.GadgetName)
-	}
-
-	// Initialize Operators
-	err = operators.GetAll().Init(operators.GlobalParamsCollection())
-	if err != nil {
-		return fmt.Errorf("initialize operators: %w", err)
-	}
-
-	ops := operators.GetOperatorsForGadget(gadgetDesc)
-
-	operatorParams := ops.ParamCollection()
-
-	parser := gadgetDesc.Parser()
-
-	runtimeParams := runtime.ParamDescs().ToParams()
-	gType := gadgetDesc.Type()
-
-	gadgetParamDescs := gadgetDesc.ParamDescs()
-	// TODO: do we need to update gType before calling this?
-	gadgetParamDescs.Add(gadgets.GadgetParams(gadgetDesc, gType, parser)...)
-	gadgetParams := gadgetParamDescs.ToParams()
-	err = gadgets.ParamsFromMap(request.Params, gadgetParams, runtimeParams, operatorParams)
-	if err != nil {
-		return fmt.Errorf("setting parameters: %w", err)
-	}
-
-	// Create payload buffer
-	outputBuffer := make(chan *api.GadgetEvent, s.eventBufferLength)
-
-	seq := uint32(0)
-	var seqLock sync.Mutex
-
-	if parser != nil {
-		outputDone := make(chan bool)
-		defer func() {
-			outputDone <- true
-		}()
-
-		parser.SetLogCallback(logger.Logf)
-		parser.SetEventCallback(func(ev any) {
-			// Marshal messages to JSON
-			// Normally, it would be better to have this in the pump below rather than marshaling events that
-			// would be dropped anyway. However, we're optimistic that this occurs rarely and instead prevent using
-			// ev in another thread.
-			data, _ := json.Marshal(ev)
-			event := &api.GadgetEvent{
-				Type:    api.EventTypeGadgetPayload,
-				Payload: data,
-			}
-
-			seqLock.Lock()
-			seq++
-			event.Seq = seq
-
-			// Try to send event; if outputBuffer is full, it will be dropped by taking
-			// the default path.
-			select {
-			case outputBuffer <- event:
-			default:
-			}
-			seqLock.Unlock()
-		})
-
-		go func() {
-			// Message pump to handle slow readers
-			for {
-				select {
-				case ev := <-outputBuffer:
-					runGadget.Send(ev)
-				case <-outputDone:
-					return
-				}
-			}
-		}()
-	}
-
-	// Assign a unique ID - this will be used in the future
-	runID := uuid.New().String()
-
-	// Send Job ID to client
-	err = runGadget.Send(&api.GadgetEvent{
-		Type:    api.EventTypeGadgetJobID,
-		Payload: []byte(runID),
-	})
-	if err != nil {
-		logger.Warnf("sending JobID: %v", err)
+		s.logger.Debugf("checking if running in %s: %v", what, err)
 		return nil
 	}
-
-	// Create new Gadget Context
-	gadgetCtx := gadgetcontext.NewBuiltIn(
-		runGadget.Context(),
-		runID,
-		runtime,
-		runtimeParams,
-		gadgetDesc,
-		gadgetParams,
-		request.Args,
-		operatorParams,
-		parser,
-		logger,
-		time.Duration(request.Timeout),
-	)
-	defer gadgetCtx.Cancel()
-
-	// Handle commands sent by the client
-	go func() {
-		defer func() {
-			logger.Debugf("runner exited")
-		}()
-		for {
-			msg, err := runGadget.Recv()
-			if err != nil {
-				gadgetCtx.Cancel()
-				return
-			}
-			switch msg.Event.(type) {
-			case *api.BuiltInGadgetControlRequest_StopRequest:
-				gadgetCtx.Cancel()
-				return
-			default:
-				logger.Warn("unexpected request")
-			}
-		}
-	}()
-
-	// Hand over to runtime
-	results, err := runtime.RunBuiltInGadget(gadgetCtx)
-	if err != nil {
-		return fmt.Errorf("running gadget: %w", err)
-	}
-
-	// Send result, if any
-	for _, result := range results {
-		// TODO: when used with fan-out, we need to add the node in here
-		event := &api.GadgetEvent{
-			Type:    api.EventTypeGadgetResult,
-			Payload: result.Payload,
-		}
-		runGadget.Send(event)
-	}
-
-	return nil
+	return &value
 }
 
 func newUnixListener(address string, gid int) (net.Listener, error) {
@@ -298,6 +192,30 @@ func (s *Service) Run(runConfig RunConfig, serverOptions ...grpc.ServerOption) e
 	s.runtime = local.New()
 	defer s.runtime.Close()
 
+	// Set the global parameters for all operators using config file
+	for op, p := range s.operators {
+		for pk := range p.ParamMap() {
+			ck := config.OperatorKey + "." + op.Name() + "." + pk
+			if config.Config.IsSet(ck) {
+				var value string
+
+				v := config.Config.Get(ck)
+				switch v.(type) {
+				default:
+					value = config.Config.GetString(ck)
+				case []interface{}:
+					slice := config.Config.GetStringSlice(ck)
+					value = strings.Join(slice, ",")
+				}
+
+				err := p.Set(pk, value)
+				if err != nil {
+					return fmt.Errorf("setting operator parameter %s: %w", ck, err)
+				}
+			}
+		}
+	}
+
 	// Use defaults for now - this will become more important when we fan-out requests also to other
 	//  gRPC runtimes
 	err := s.runtime.Init(s.runtime.GlobalParamDescs().ToParams())
@@ -322,11 +240,45 @@ func (s *Service) Run(runConfig RunConfig, serverOptions ...grpc.ServerOption) e
 		return fmt.Errorf("invalid socket type: %s", runConfig.SocketType)
 	}
 
+	if runConfig.MultiTenancy {
+		if runConfig.KubernetesClient == nil {
+			return fmt.Errorf("multi-tenancy enabled but no Kubernetes client provided")
+		}
+		scope := runConfig.MultiTenancyScope
+		if scope.Resource == "" {
+			scope = auth.DefaultScopeConfig()
+		}
+		if scope.Verb == "" {
+			return fmt.Errorf("multi-tenancy scope verb cannot be empty")
+		}
+		s.logger.Infof("multi-tenancy enabled (audience=%q, scope=%s/%s/%s)", auth.Audience, scope.APIGroup, scope.Resource, scope.Verb)
+		serverOptions = append(serverOptions,
+			grpc.UnaryInterceptor(auth.UnaryInterceptor(runConfig.KubernetesClient, s.logger, scope)),
+			grpc.StreamInterceptor(auth.StreamInterceptor(runConfig.KubernetesClient, s.logger, scope)),
+		)
+	}
+
 	server := grpc.NewServer(serverOptions...)
 	api.RegisterBuiltInGadgetManagerServer(server, s)
 	api.RegisterGadgetManagerServer(server, s)
 
+	if s.store != nil {
+		api.RegisterGadgetInstanceManagerServer(server, s)
+	}
+
 	s.servers[server] = struct{}{}
+
+	err = s.initOperators()
+	if err != nil {
+		return fmt.Errorf("initializing operators: %w", err)
+	}
+
+	if s.store != nil {
+		err = s.store.ResumeStoredGadgets()
+		if err != nil {
+			return fmt.Errorf("loading stored gadgets: %w", err)
+		}
+	}
 
 	return server.Serve(s.listener)
 }

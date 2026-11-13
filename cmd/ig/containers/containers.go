@@ -21,14 +21,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/moby/moby/pkg/stringid"
+	"github.com/moby/moby/client/pkg/stringid"
 	"github.com/spf13/cobra"
 
 	commonutils "github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
 	"github.com/inspektor-gadget/inspektor-gadget/cmd/ig/utils"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/columns"
 	containercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/container-collection"
-	igmanager "github.com/inspektor-gadget/inspektor-gadget/pkg/ig-manager"
+	containerutilsTypes "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/types"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
 )
 
@@ -49,15 +50,24 @@ func NewListContainersCmd() *cobra.Command {
 				return err
 			}
 
-			igmanager, err := igmanager.NewManager(commonFlags.RuntimeConfigs)
+			cc, err := initContainerCollection(commonFlags.RuntimeConfigs)
 			if err != nil {
-				return commonutils.WrapInErrManagerInit(err)
+				return fmt.Errorf("initializing container collection: %w", err)
 			}
-			defer igmanager.Close()
+			defer cc.Close()
 
 			selector := containercollection.ContainerSelector{
 				Runtime: containercollection.RuntimeSelector{
-					ContainerName: commonFlags.Containername,
+					ContainerName:        commonFlags.Containername,
+					ContainerImageID:     commonFlags.ContainerImageID,
+					ContainerImageDigest: commonFlags.ContainerImageDigest,
+				},
+				K8s: containercollection.K8sSelector{
+					BasicK8sMetadata: types.BasicK8sMetadata{
+						PodName:       commonFlags.K8sPodName,
+						Namespace:     commonFlags.K8sNamespace,
+						ContainerName: commonFlags.K8sContainerName,
+					},
 				},
 			}
 
@@ -66,7 +76,7 @@ func NewListContainersCmd() *cobra.Command {
 				if err != nil {
 					return commonutils.WrapInErrParserCreate(err)
 				}
-				containers := igmanager.GetContainersBySelector(&selector)
+				containers := cc.GetContainersBySelector(&selector)
 
 				parser.Sort(containers, []string{"runtime.runtimeName", "runtime.containerName"})
 				if err = printContainers(parser, commonFlags, containers); err != nil {
@@ -93,7 +103,7 @@ func NewListContainersCmd() *cobra.Command {
 			if err != nil {
 				return commonutils.WrapInErrParserCreate(err)
 			}
-			containers := igmanager.ContainerCollection.Subscribe(
+			containers := cc.Subscribe(
 				igSubKey,
 				selector,
 				func(event containercollection.PubSubEvent) {
@@ -102,7 +112,7 @@ func NewListContainersCmd() *cobra.Command {
 					}
 				},
 			)
-			defer igmanager.ContainerCollection.Unsubscribe(igSubKey)
+			defer cc.Unsubscribe(igSubKey)
 
 			if commonFlags.OutputMode != commonutils.OutputModeJSON {
 				fmt.Println(parser.BuildColumnsHeader())
@@ -174,4 +184,25 @@ func columnsWithAdjustedVisibility[T containercollection.Container | containerco
 		c.Visible = true
 	}
 	return cols
+}
+
+func initContainerCollection(runtimes []*containerutilsTypes.RuntimeConfig) (*containercollection.ContainerCollection, error) {
+	var containerCollection containercollection.ContainerCollection
+
+	opts := []containercollection.ContainerCollectionOption{
+		containercollection.WithPubSub([]containercollection.FuncNotify{}...),
+		containercollection.WithOCIConfigEnrichment(),
+		containercollection.WithCgroupEnrichment(),
+		containercollection.WithLinuxNamespaceEnrichment(),
+		containercollection.WithMultipleContainerRuntimesEnrichment(runtimes),
+		containercollection.WithOCIConfigForInitialContainer(),
+		containercollection.WithContainerFanotifyEbpf(),
+		containercollection.WithProcEnrichment(),
+	}
+
+	if err := containerCollection.Initialize(opts...); err != nil {
+		return nil, fmt.Errorf("initializing container collection: %w", err)
+	}
+
+	return &containerCollection, nil
 }

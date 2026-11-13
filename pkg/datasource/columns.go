@@ -1,4 +1,4 @@
-// Copyright 2024 The Inspektor Gadget authors
+// Copyright 2024-2025 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,6 +27,12 @@ import (
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/parser"
 )
 
+const (
+	// ColumnsReplaceAnnotation is used to indicate that this field should be
+	// replaced by the one indicated in the annotation when printing it.
+	ColumnsReplaceAnnotation = "columns.replace"
+)
+
 type DataTuple struct {
 	ds   DataSource
 	data Data
@@ -45,6 +51,28 @@ func (ds *dataSource) Parser() (parser.Parser, error) {
 		return nil, err
 	}
 	return parser.NewParser(cols), nil
+}
+
+func getWidth(refType reflect.Type, value string) (int, error) {
+	if value == "type" {
+		if refType == nil {
+			return 0, fmt.Errorf("special value %q is only available for fields with a reflect type", value)
+		}
+
+		// Special case, we get the maximum length this field can have by its type
+		w := columns.GetWidthFromType(refType.Kind())
+		if w > 0 {
+			return w, nil
+		}
+		return 0, fmt.Errorf("special value %q is only available for integer and bool types", value)
+	}
+
+	res, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid width %q: %w", value, err)
+	}
+
+	return res, nil
 }
 
 func (ds *dataSource) Columns() (*columns.Columns[DataTuple], error) {
@@ -74,7 +102,7 @@ func (ds *dataSource) Columns() (*columns.Columns[DataTuple], error) {
 		// extract attributes from annotations
 		for k, v := range f.Annotations {
 			switch k {
-			case "columns.alignment":
+			case metadatav1.ColumnsAlignmentAnnotation:
 				switch metadatav1.Alignment(v) {
 				case metadatav1.AlignmentLeft:
 					attributes.Alignment = columns.AlignLeft
@@ -83,7 +111,7 @@ func (ds *dataSource) Columns() (*columns.Columns[DataTuple], error) {
 				default:
 					return nil, fmt.Errorf("invalid alignment type for column %q: %s", f.Name, v)
 				}
-			case "columns.ellipsis":
+			case metadatav1.ColumnsEllipsisAnnotation:
 				switch metadatav1.EllipsisType(v) {
 				case metadatav1.EllipsisNone:
 					attributes.EllipsisType = ellipsis.None
@@ -96,31 +124,47 @@ func (ds *dataSource) Columns() (*columns.Columns[DataTuple], error) {
 				default:
 					return nil, fmt.Errorf("invalid ellipsis type for column %q: %s", f.Name, v)
 				}
-			case "columns.width":
+			case metadatav1.ColumnsWidthAnnotation:
 				var err error
-				attributes.Width, err = strconv.Atoi(v)
+				attributes.Width, err = getWidth(f.ReflectType(), v)
 				if err != nil {
 					return nil, fmt.Errorf("reading width for column %q: %w", f.Name, err)
 				}
-			case "columns.minWidth":
+			case metadatav1.ColumnsMinWidthAnnotation:
 				var err error
-				attributes.MinWidth, err = strconv.Atoi(v)
+				attributes.MinWidth, err = getWidth(f.ReflectType(), v)
 				if err != nil {
 					return nil, fmt.Errorf("reading minWidth for column %q: %w", f.Name, err)
 				}
-			case "columns.maxWidth":
+			case metadatav1.ColumnsMaxWidthAnnotation:
 				var err error
-				attributes.MaxWidth, err = strconv.Atoi(v)
+				attributes.MaxWidth, err = getWidth(f.ReflectType(), v)
 				if err != nil {
 					return nil, fmt.Errorf("reading maxWidth for column %q: %w", f.Name, err)
 				}
-			case "columns.template":
-				attributes.Template = v
-				df.Template = v
-			case "columns.fixed":
+			case metadatav1.ColumnsFixedAnnotation:
 				if v == "true" {
 					attributes.FixedWidth = true
 				}
+			case metadatav1.ColumnsHexAnnotation:
+				if v == "true" {
+					attributes.Hex = true
+				}
+			case metadatav1.ColumnsAliasAnnotation:
+				attributes.Alias = v
+			case metadatav1.ColumnsPrecisionAnnotation:
+				attributes.Precision, err = strconv.Atoi(v)
+				if err != nil {
+					return nil, fmt.Errorf("reading precision for column %q: %w", f.Name, err)
+				}
+			}
+		}
+
+		// Use replace field if it's defined
+		if replacementField, ok := f.Annotations[ColumnsReplaceAnnotation]; ok {
+			f, ok = ds.fieldMap[replacementField]
+			if !ok {
+				return nil, fmt.Errorf("replacement field %q not found", replacementField)
 			}
 		}
 
@@ -164,8 +208,16 @@ func (ds *dataSource) Columns() (*columns.Columns[DataTuple], error) {
 			continue
 		}
 
-		if attributes.Width == 0 {
-			attributes.Width = columns.GetWidthFromType(f.ReflectType().Kind())
+		if attributes.Width == 0 || attributes.MaxWidth == 0 {
+			w := columns.GetWidthFromType(f.ReflectType().Kind())
+			if w > 0 {
+				if attributes.Width == 0 {
+					attributes.Width = w
+				}
+				if attributes.MaxWidth == 0 {
+					attributes.MaxWidth = w
+				}
+			}
 		}
 
 		df.Type = f.ReflectType()
@@ -182,4 +234,10 @@ func (ds *dataSource) Columns() (*columns.Columns[DataTuple], error) {
 		}
 	}
 	return cols, nil
+}
+
+var defaultFieldAnnotations = map[string]string{
+	metadatav1.ColumnsWidthAnnotation:     "16",
+	metadatav1.ColumnsEllipsisAnnotation:  string(metadatav1.EllipsisEnd),
+	metadatav1.ColumnsAlignmentAnnotation: string(metadatav1.AlignmentLeft),
 }

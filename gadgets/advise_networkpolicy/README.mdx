@@ -1,0 +1,194 @@
+---
+title: advise networkpolicy
+sidebar_position: 0
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+The advise networkpolicy gadget monitors the network activity in the specified namespaces
+and records a summary of TCP and UDP traffic. This is then used to generate Kubernetes
+network policies.
+
+## Requirements
+
+- Minimum Kernel Version : *5.4
+
+*This is the minimal kernel version we have tried for this Gadget, however it's possible that it works with earlier versions.
+
+## Getting started
+
+
+```bash
+$ kubectl gadget run ghcr.io/inspektor-gadget/gadget/advise_networkpolicy:%IG_TAG%
+```
+
+## Flags
+
+- `--policy-format`: Output format for generated policies.
+  - `k8s` (default): `networking.k8s.io/v1` `NetworkPolicy`
+  - `cilium`: `cilium.io/v2` `CiliumNetworkPolicy`
+
+## Guide
+
+First, we need to create an nginx deployment which can respond to our test requests.
+
+```bash
+$ kubectl create service nodeport nginx --tcp=80:80
+service/nginx created
+$ kubectl create deployment nginx --image=nginx
+deployment.apps/nginx created
+```
+
+Then, start the advise_networkpolicy gadget in another terminal.
+
+```bash
+$ kubectl gadget run advise_networkpolicy:%IG_TAG%
+```
+
+Now we can deploy our client pod, send a request to our nginx deployment and `1.1.1.1` and then quit.
+
+```bash
+$ kubectl run --rm -ti --image busybox test-pod
+If you don't see a command prompt, try pressing enter.
+/ # wget nginx
+Connecting to nginx (10.105.129.249:80)
+saving to 'index.html'
+index.html           100% |********************************|   615  0:00:00 ETA
+'index.html' saved
+/ # wget 1.1.1.1
+Connecting to 1.1.1.1 (1.1.1.1:80)
+Connecting to 1.1.1.1 (1.1.1.1:443)
+wget: note: TLS certificate validation not implemented
+Connecting to one.one.one.one (1.1.1.1:443)
+wget: can't open 'index.html': File exists
+/ # exit
+Session ended, resume using 'kubectl attach test-pod -c test-pod -i -t' command when the pod is running
+pod "test-pod" deleted
+```
+
+Let's switch back to the gadget terminal, stop our gadget. The policy will then be printed:
+
+```bash
+$ kubectl gadget run advise_networkpolicy:%IG_TAG%
+...
+^C
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  creationTimestamp: null
+  name: nginx-network
+  namespace: default
+spec:
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          run: test-pod
+    ports:
+    - port: 80
+      protocol: TCP
+  podSelector:
+    matchLabels:
+      app: nginx
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  creationTimestamp: null
+  name: test-pod-network
+  namespace: default
+spec:
+  egress:
+  - ports:
+    - port: 80
+      protocol: TCP
+    to:
+    - ipBlock:
+        cidr: 1.1.1.1/32
+  - ports:
+    - port: 80
+      protocol: TCP
+    to:
+    - podSelector:
+        matchLabels:
+          app: nginx
+  - ports:
+    - port: 443
+      protocol: TCP
+    to:
+    - ipBlock:
+        cidr: 1.1.1.1/32
+  - ports:
+    - port: 53
+      protocol: UDP
+    to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+          kubernetes.io/cluster-service: "true"
+          kubernetes.io/name: CoreDNS
+  podSelector:
+    matchLabels:
+      run: test-pod
+  policyTypes:
+  - Ingress
+  - Egress
+```
+
+To generate Cilium policies instead, run the gadget with
+`--policy-format cilium`:
+
+```bash
+$ kubectl gadget run advise_networkpolicy:%IG_TAG% --policy-format cilium
+```
+
+Finally, clean the system:
+
+```bash
+$ kubectl delete deployment nginx
+deployment.apps "nginx" deleted
+$ kubectl delete service nginx
+service "nginx" deleted
+```
+
+## Limitations
+
+The gadget ignores the following non-identity pod labels when generating policy
+selectors:
+
+- `controller-revision-hash`
+- `pod-template-generation`
+- `pod-template-hash`
+- `topology.kubernetes.io/region`
+- `topology.kubernetes.io/zone`
+- `failure-domain.beta.kubernetes.io/region`
+- `failure-domain.beta.kubernetes.io/zone`
+
+Traffic to/from a peer running with `hostNetwork: true` (or a node's own address)
+can't be reliably attributed to a specific pod, since that IP is shared by the
+node and possibly other host-network pods.
+
+For the default Kubernetes NetworkPolicy output, traffic from the pod's own
+resident node, including kubelet health checks, is ignored because Kubernetes
+NetworkPolicy always allows it. For remote or unidentified node peers, no
+portable ingress/egress rule is generated; instead, the generated policy carries
+a `network-policy.inspektor-gadget.io/host-network-note` annotation explaining
+the limitation.
+
+For CiliumNetworkPolicy output, traffic using a node address is represented
+with Cilium's `host` identity for the resident node and `remote-node` for other
+nodes. These identities match the whole node category rather than a specific
+host-network pod. In overlay networks, node-originated traffic such as kubelet
+probes can use the CNI's bridge or router address instead of the node address.
+Because this address isn't part of Kubernetes Node metadata, it is resolved as
+a raw address and emitted as a `fromCIDR` or `toCIDR` rule rather than a `host`
+or `remote-node` entity rule. If you know which application the traffic belongs
+to, replace the generated entity or CIDR rule with a more specific selector
+supported by your CNI.

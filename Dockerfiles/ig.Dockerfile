@@ -1,14 +1,14 @@
-ARG BUILDER_IMAGE=golang:1.22
-ARG BASE_IMAGE=gcr.io/distroless/static-debian11
+ARG BUILDER_IMAGE=golang:1.26.10-trixie@sha256:909771fef53e3dcb0950255f0c9a8b4728c3b841e61509c7b29b098de7ee02d4
+ARG BASE_IMAGE=gcr.io/distroless/static-debian11:latest@sha256:1dbe426d60caed5d19597532a2d74c8056cd7b1674042b88f7328690b5ead8ed
 
-FROM --platform=${BUILDPLATFORM} ${BUILDER_IMAGE} as builder
+FROM --platform=${BUILDPLATFORM} ${BUILDER_IMAGE} AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=v0.0.0
 ENV VERSION=${VERSION}
-ARG EBPF_BUILDER=ghcr.io/inspektor-gadget/ebpf-builder:latest
-ENV EBPF_BUILDER=${EBPF_BUILDER}
+ARG GADGET_BUILDER=ghcr.io/inspektor-gadget/gadget-builder:main
+ENV GADGET_BUILDER=${GADGET_BUILDER}
 ARG GOPROXY
 ENV GOPROXY=${GOPROXY}
 
@@ -18,13 +18,16 @@ ADD . /go/src/github.com/inspektor-gadget/inspektor-gadget
 
 WORKDIR /go/src/github.com/inspektor-gadget/inspektor-gadget
 
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
-		-ldflags "-X github.com/inspektor-gadget/inspektor-gadget/internal/version.version=${VERSION} \
-                  -X github.com/inspektor-gadget/inspektor-gadget/cmd/common/image.builderImage=${EBPF_BUILDER} \
-                  -extldflags '-static'" \
-		-tags "netgo" \
-		-o ig-${TARGETOS}-${TARGETARCH} \
-		github.com/inspektor-gadget/inspektor-gadget/cmd/ig
+RUN \
+      --mount=type=cache,target=/root/.cache/go-build \
+      --mount=type=cache,target=/go/pkg \
+      CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+        -ldflags "-X github.com/inspektor-gadget/inspektor-gadget/internal/version.version=${VERSION} \
+        -X github.com/inspektor-gadget/inspektor-gadget/cmd/common/image.builderImage=${GADGET_BUILDER} \
+        -extldflags '-static'" \
+        -tags "netgo" \
+        -o ig-${TARGETOS}-${TARGETARCH} \
+        github.com/inspektor-gadget/inspektor-gadget/cmd/ig
 
 FROM ${BASE_IMAGE}
 

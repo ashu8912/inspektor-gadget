@@ -16,6 +16,7 @@ package datasource
 
 import (
 	"crypto/rand"
+	"math"
 	"slices"
 	"testing"
 
@@ -32,19 +33,123 @@ import (
 func TestDataSourceDuplicatedField(t *testing.T) {
 	t.Parallel()
 
-	ds := New(TypeSingle, "event")
+	ds, err := New(TypeSingle, "event")
+	require.NoError(t, err)
 
-	_, err := ds.AddField("foo", api.Kind_Int8)
+	_, err = ds.AddField("foo", api.Kind_Int8)
 	require.NoError(t, err)
 
 	_, err = ds.AddField("foo", api.Kind_Int32)
 	require.Error(t, err)
 }
 
+func TestFieldAccessorGetBounds(t *testing.T) {
+	t.Parallel()
+
+	type testCase struct {
+		name         string
+		payloadIndex uint32
+		offs         uint32
+		size         uint32
+		payload      [][]byte
+		expected     []byte
+	}
+
+	tests := []testCase{
+		{
+			name:         "payload index out of range",
+			payloadIndex: 1,
+			size:         4,
+			payload:      [][]byte{{1, 2, 3, 4}},
+		},
+		{
+			name:    "nil payload",
+			size:    4,
+			payload: nil,
+		},
+		{
+			name:    "truncated payload",
+			offs:    2,
+			size:    4,
+			payload: [][]byte{{1, 2, 3, 4}},
+		},
+		{
+			name:    "nil buffer for fixed-size field",
+			size:    4,
+			payload: [][]byte{nil},
+		},
+		{
+			name:    "offset plus size overflow",
+			offs:    math.MaxUint32,
+			size:    1,
+			payload: [][]byte{{1, 2, 3, 4}},
+		},
+		{
+			name:     "exact boundary",
+			offs:     4,
+			size:     4,
+			payload:  [][]byte{{0, 1, 2, 3, 4, 5, 6, 7}},
+			expected: []byte{4, 5, 6, 7},
+		},
+		{
+			name:     "field in the middle of the buffer",
+			offs:     2,
+			size:     2,
+			payload:  [][]byte{{0, 1, 2, 3, 4, 5, 6, 7}},
+			expected: []byte{2, 3},
+		},
+		{
+			name:     "dynamic field",
+			payload:  [][]byte{{1, 2, 3}},
+			expected: []byte{1, 2, 3},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			acc := &fieldAccessor{f: &field{
+				PayloadIndex: tc.payloadIndex,
+				Offs:         tc.offs,
+				Size:         tc.size,
+			}}
+			d := &data{Data: &api.DataElement{Payload: tc.payload}}
+
+			var got []byte
+			require.NotPanics(t, func() { got = acc.Get(d) })
+
+			if tc.expected == nil {
+				assert.Nil(t, got)
+				return
+			}
+
+			require.Equal(t, tc.expected, got)
+			if tc.size == 0 {
+				return
+			}
+
+			assert.Equal(t, len(got), cap(got))
+
+			orig := slices.Clone(tc.payload[tc.payloadIndex])
+			_ = append(got, 0xff)
+			assert.Equal(t, orig, tc.payload[tc.payloadIndex])
+		})
+	}
+}
+
+func TestDataSourceBadType(t *testing.T) {
+	t.Parallel()
+
+	_, err := New(Type(100), "event")
+	require.Error(t, err)
+}
+
 func TestDataSourceNonExistingField(t *testing.T) {
 	t.Parallel()
 
-	ds := New(TypeSingle, "event")
+	ds, err := New(TypeSingle, "event")
+	require.NoError(t, err)
 
 	acc := ds.GetField("foo")
 	require.Nil(t, acc)
@@ -53,7 +158,8 @@ func TestDataSourceNonExistingField(t *testing.T) {
 func TestDataSourceEmptyField(t *testing.T) {
 	t.Parallel()
 
-	ds := New(TypeSingle, "event")
+	ds, err := New(TypeSingle, "event")
+	require.NoError(t, err)
 
 	// See https://github.com/inspektor-gadget/inspektor-gadget/issues/2817
 	acc, err := ds.AddField("foo", api.Kind_Invalid, WithFlags(FieldFlagEmpty))
@@ -100,7 +206,9 @@ func TestDataSourceAddFields(t *testing.T) {
 		t.Run(f.name, func(t *testing.T) {
 			t.Parallel()
 
-			ds := New(TypeSingle, "event")
+			ds, err := New(TypeSingle, "event")
+			require.NoError(t, err)
+
 			acc, err := ds.AddField(f.name, f.typ)
 			require.NoError(t, err)
 
@@ -213,7 +321,9 @@ func TestBadAccesors(t *testing.T) {
 		t.Run(f.name, func(t *testing.T) {
 			t.Parallel()
 
-			ds := New(TypeSingle, "event")
+			ds, err := New(TypeSingle, "event")
+			require.NoError(t, err)
+
 			acc, err := ds.AddField(f.name, f.typ)
 			require.NoError(t, err)
 
@@ -242,7 +352,8 @@ func TestBadAccesors(t *testing.T) {
 func TestDataSourceStaticFields(t *testing.T) {
 	t.Parallel()
 
-	ds := New(TypeSingle, "event")
+	ds, err := New(TypeSingle, "event")
+	require.NoError(t, err)
 
 	fields := []StaticField{
 		&dummyField{
@@ -315,9 +426,10 @@ func TestDataSourceStaticFields(t *testing.T) {
 func TestDataSourceStaticFieldsTooBig(t *testing.T) {
 	t.Parallel()
 
-	ds := New(TypeSingle, "event")
+	ds, err := New(TypeSingle, "event")
+	require.NoError(t, err)
 
-	_, err := ds.AddStaticFields(2, []StaticField{
+	_, err = ds.AddStaticFields(2, []StaticField{
 		&dummyField{
 			name:   "f1",
 			size:   4,
@@ -332,12 +444,38 @@ func TestDataSourceStaticFieldsTooBig(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestDataSourceStaticFieldsSameOrderAs(t *testing.T) {
+	t.Parallel()
+
+	ds, err := New(TypeSingle, "event")
+	require.NoError(t, err)
+
+	_, err = ds.AddStaticFields(16, []StaticField{
+		&dummyField{name: "f1", size: 8, offset: 0, kind: api.Kind_Uint64},
+		&dummyField{name: "f2", size: 8, offset: 8, kind: api.Kind_Uint64},
+	})
+	require.NoError(t, err)
+
+	f1 := ds.GetField("f1")
+	require.NotNil(t, f1)
+	_, err = ds.AddField("f1_str", api.Kind_String, WithSameOrderAs(f1))
+	require.NoError(t, err)
+
+	order := map[string]int32{}
+	for _, f := range ds.Fields() {
+		order[f.Name] = f.Order
+	}
+	require.Equal(t, order["f1"], order["f1_str"])
+	require.Less(t, order["f1_str"], order["f2"])
+}
+
 func TestDataSourceStaticFieldsStrings(t *testing.T) {
 	t.Parallel()
 
 	const strSize = 16
 
-	ds := New(TypeSingle, "event")
+	ds, err := New(TypeSingle, "event")
+	require.NoError(t, err)
 
 	fieldsAcc, err := ds.AddStaticFields(strSize, []StaticField{
 		&dummyField{
@@ -389,7 +527,8 @@ func TestDataSourceStaticFieldsStrings(t *testing.T) {
 func TestDataSourceSubscribePriorities(t *testing.T) {
 	t.Parallel()
 
-	ds := New(TypeSingle, "event")
+	ds, err := New(TypeSingle, "event")
+	require.NoError(t, err)
 
 	// random list of priorities
 	priorities := []int{30, 90, 54, 78, 71, 67, 90, 7, 92, 87}
@@ -422,9 +561,10 @@ func TestDataSourceSubscribePriorities(t *testing.T) {
 func TestDataSourceSubscribeTypes(t *testing.T) {
 	t.Parallel()
 
-	ds := New(TypeSingle, "event")
+	ds, err := New(TypeSingle, "event")
+	require.NoError(t, err)
 
-	err := ds.Subscribe(func(ds DataSource, d Data) error { return nil }, 50)
+	err = ds.Subscribe(func(ds DataSource, d Data) error { return nil }, 50)
 	require.NoError(t, err)
 
 	err = ds.SubscribeArray(func(ds DataSource, da DataArray) error { return nil }, 50)
@@ -433,7 +573,8 @@ func TestDataSourceSubscribeTypes(t *testing.T) {
 	err = ds.SubscribePacket(func(ds DataSource, p Packet) error { return nil }, 50)
 	require.NoError(t, err)
 
-	ds = New(TypeArray, "events")
+	ds, err = New(TypeArray, "events")
+	require.NoError(t, err)
 
 	err = ds.Subscribe(func(ds DataSource, d Data) error { return nil }, 50)
 	require.NoError(t, err)
@@ -448,9 +589,10 @@ func TestDataSourceSubscribeTypes(t *testing.T) {
 func TestDataSourceSubscribeNilCb(t *testing.T) {
 	t.Parallel()
 
-	ds := New(TypeSingle, "event")
+	ds, err := New(TypeSingle, "event")
+	require.NoError(t, err)
 
-	err := ds.Subscribe(nil, 50)
+	err = ds.Subscribe(nil, 50)
 	require.Error(t, err)
 
 	err = ds.SubscribeArray(nil, 50)
@@ -459,7 +601,8 @@ func TestDataSourceSubscribeNilCb(t *testing.T) {
 	err = ds.SubscribePacket(nil, 50)
 	require.Error(t, err)
 
-	ds = New(TypeArray, "events")
+	ds, err = New(TypeArray, "events")
+	require.NoError(t, err)
 
 	err = ds.Subscribe(nil, 50)
 	require.Error(t, err)
@@ -474,7 +617,8 @@ func TestDataSourceSubscribeNilCb(t *testing.T) {
 func TestDataSourceNewPacket(t *testing.T) {
 	t.Parallel()
 
-	ds := New(TypeSingle, "event")
+	ds, err := New(TypeSingle, "event")
+	require.NoError(t, err)
 
 	data, err := ds.NewPacketSingle()
 	require.NoError(t, err)
@@ -484,7 +628,8 @@ func TestDataSourceNewPacket(t *testing.T) {
 	require.Error(t, err)
 	ds.Release(dataArray)
 
-	ds = New(TypeArray, "events")
+	ds, err = New(TypeArray, "events")
+	require.NoError(t, err)
 
 	data, err = ds.NewPacketSingle()
 	require.Error(t, err)
@@ -500,7 +645,9 @@ func TestDataSourcePacketArray(t *testing.T) {
 
 	const val = int8(123)
 
-	ds := New(TypeArray, "events")
+	ds, err := New(TypeArray, "events")
+	require.NoError(t, err)
+
 	acc, err := ds.AddField("foo", api.Kind_Int8)
 	require.NoError(t, err)
 
@@ -535,7 +682,8 @@ func TestDataSourceSubscribeSingle(t *testing.T) {
 
 	const value = int8(123)
 
-	ds := New(TypeSingle, "event")
+	ds, err := New(TypeSingle, "event")
+	require.NoError(t, err)
 
 	acc, err := ds.AddField("foo", api.Kind_Int8)
 	require.NoError(t, err)
@@ -579,7 +727,8 @@ func TestDataSourceSubscribeSingle(t *testing.T) {
 func TestDataSourceSubscribeArray(t *testing.T) {
 	t.Parallel()
 
-	ds := New(TypeArray, "events")
+	ds, err := New(TypeArray, "events")
+	require.NoError(t, err)
 
 	pArray, err := ds.NewPacketArray()
 	require.NoError(t, err)
@@ -640,6 +789,105 @@ func TestDataSourceSubscribeArray(t *testing.T) {
 	require.Equal(t, values, valuesFromData)
 	require.Equal(t, values, valuesFromArray)
 	require.Equal(t, values, valuesFromPacket)
+}
+
+func TestDataSourceResizeArray(t *testing.T) {
+	t.Parallel()
+
+	ds, err := New(TypeArray, "events")
+	require.NoError(t, err)
+
+	pArray, err := ds.NewPacketArray()
+	require.NoError(t, err)
+	defer ds.Release(pArray)
+
+	acc, err := ds.AddField("foo", api.Kind_Int8)
+	require.NoError(t, err)
+
+	// Add some values to the array
+	values := []int8{30, 54, 90}
+	for _, val := range values {
+		data := pArray.New()
+		acc.PutInt8(data, val)
+		pArray.Append(data)
+	}
+
+	// Subscribe to the array to verify we receive the values in the same order
+	valuesBeforeResize := []int8{}
+	err = ds.SubscribeArray(func(fs DataSource, da DataArray) error {
+		for i := 0; i < da.Len(); i++ {
+			ret, err := acc.Int8(da.Get(i))
+			require.NoError(t, err)
+			valuesBeforeResize = append(valuesBeforeResize, ret)
+		}
+		return nil
+	}, 1)
+	require.NoError(t, err)
+
+	// Subscribe to the array to resize it
+	err = ds.SubscribeArray(func(fs DataSource, da DataArray) error {
+		// Resize to invalid size
+		err := da.Resize(-1)
+		require.Error(t, err)
+
+		// Resize to a bigger size (not implemented yet)
+		err = da.Resize(5)
+		require.Error(t, err)
+
+		// Resize to a smaller size
+		err = da.Resize(1)
+		require.NoError(t, err)
+
+		return nil
+	}, 2)
+	require.NoError(t, err)
+
+	// Subscribe, with lower priority, to check that the resize was done
+	valuesAfterResize := []int8{}
+	err = ds.Subscribe(func(fs DataSource, d Data) error {
+		ret, err := acc.Int8(d)
+		require.NoError(t, err)
+		valuesAfterResize = append(valuesAfterResize, ret)
+		return nil
+	}, 3)
+	require.NoError(t, err)
+	require.NoError(t, err)
+
+	// Emit the packet
+	err = ds.EmitAndRelease(pArray)
+	require.NoError(t, err)
+
+	// Check that the resize was done correctly
+	require.Equal(t, values, valuesBeforeResize)
+	require.Equal(t, values[:1], valuesAfterResize)
+}
+
+func TestSiblings(t *testing.T) {
+	ds, err := New(TypeArray, "events")
+	require.NoError(t, err)
+	parent, err := ds.AddField("parent", api.Kind_Invalid, WithFlags(FieldFlagContainer|FieldFlagEmpty))
+	require.NoError(t, err)
+	child1, err := parent.AddSubField("child1", api.Kind_Int8)
+	require.NoError(t, err)
+	child2, err := ds.AddField("child2", api.Kind_Int8, WithSameParentAs(child1))
+	require.NoError(t, err)
+	require.NotNil(t, child1.Parent())
+	require.NotNil(t, child2.Parent())
+	require.Equal(t, child1.Parent().(*fieldAccessor).f, child2.Parent().(*fieldAccessor).f)
+	require.Equal(t, "parent.child1", child1.(*fieldAccessor).f.FullName)
+	require.Equal(t, "parent.child2", child2.(*fieldAccessor).f.FullName)
+}
+
+func TestSiblingsRoot(t *testing.T) {
+	ds, err := New(TypeArray, "events")
+	require.NoError(t, err)
+	child1, err := ds.AddField("child1", api.Kind_Int8)
+	require.NoError(t, err)
+	child2, err := ds.AddField("child2", api.Kind_Int8, WithSameParentAs(child1))
+	require.NoError(t, err)
+	require.NotNil(t, ds.GetField("child2"))
+	require.Equal(t, "child1", child1.(*fieldAccessor).f.FullName)
+	require.Equal(t, "child2", child2.(*fieldAccessor).f.FullName)
 }
 
 type dummyField struct {

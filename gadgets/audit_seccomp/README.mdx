@@ -1,0 +1,219 @@
+---
+title: audit_seccomp
+sidebar_position: 0
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+The audit seccomp gadget provides a stream of events with syscalls that had
+their seccomp filters generating an audit log. An audit log can be generated in
+one of these two conditions:
+
+* The Seccomp profile has the flag `SECCOMP_FILTER_FLAG_LOG` (supported from
+  [runc v1.2.0](https://github.com/opencontainers/runc/releases/tag/v1.2.0),
+  see [runc#3390](https://github.com/opencontainers/runc/pull/3390)) and returns
+  any action other than `SECCOMP_RET_ALLOW`.
+* The Seccomp profile does not have the flag `SECCOMP_FILTER_FLAG_LOG` but
+  returns `SCMP_ACT_LOG` or `SCMP_ACT_KILL*`.
+
+## Getting started
+
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl gadget run ghcr.io/inspektor-gadget/gadget/audit_seccomp:%IG_TAG% [flags]
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ sudo ig run ghcr.io/inspektor-gadget/gadget/audit_seccomp:%IG_TAG% [flags]
+        ```
+    </TabItem>
+</Tabs>
+
+## Flags
+
+No flags.
+
+## Guide
+
+First, we need to create a pod / container with a seccomp profile that executes
+some fordibben syscalls.
+
+<Tabs groupId="env">
+<TabItem value="kubectl-gadget" label="kubectl gadget">
+
+We'll use the [Security Profiles
+Operator](https://github.com/kubernetes-sigs/security-profiles-operator) to
+handle seccomp profiles, however them can be handled manually as explained in
+[Restrict a Container's Syscalls with
+seccomp](https://kubernetes.io/docs/tutorials/security/seccomp/)
+
+1. [Install](https://github.com/kubernetes-sigs/security-profiles-operator/blob/main/installation-usage.md#install-operator) the Security Profiles Operator
+2. Install a SeccompProfile that logs the `mkdir` and blocks the `unshare` syscalls.
+
+```yaml
+# seccompprofile.yaml
+apiVersion: security-profiles-operator.x-k8s.io/v1beta1
+kind: SeccompProfile
+metadata:
+  name: log
+  annotations:
+    description: "Log some syscalls"
+spec:
+  defaultAction: SCMP_ACT_ALLOW
+  syscalls:
+  - action: SCMP_ACT_KILL
+    names:
+    - unshare
+  - action: SCMP_ACT_LOG
+    names:
+    - mkdir
+```
+
+```bash
+$ kubectl apply -f seccompprofile.yaml
+```
+
+3. Start a pod with that SeccompProfile.
+
+```yaml
+# mypod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mypod
+spec:
+  securityContext:
+    seccompProfile:
+      type: Localhost
+      localhostProfile: operator/default/log.json
+  restartPolicy: Never
+  containers:
+  - name: container1
+    image: busybox
+    command: ["sh"]
+    args: ["-c", "while true ; do mkdir /tmp/dir42 ; unshare -i; sleep 1; done"]
+```
+
+```yaml
+$ kubectl apply -f mypod.yaml
+```
+
+</TabItem>
+
+<TabItem value="ig" label="ig">
+
+* Prepare a Seccomp Profile.
+
+```json
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "syscalls": [
+    {
+      "action": "SCMP_ACT_KILL",
+      "names": [
+        "unshare"
+      ]
+    }
+  ]
+}
+```
+
+Create a container using that profile:
+
+```bash
+$ docker run --name test-audit-seccomp -d --security-opt seccomp=profile.json \
+  busybox /bin/sh -c 'while true ; do unshare -i; sleep 1 ; done'
+```
+
+</TabItem>
+</Tabs>
+
+Then, start the audit_seccomp gadget and observe how it logs the `unshare` syscall being denied.
+
+<Tabs groupId="env">
+<TabItem value="kubectl-gadget" label="kubectl gadget">
+
+```bash
+$ kubectl gadget run audit_seccomp:%IG_TAG%
+K8S.NODE          K8S.NAMESPACE   K8S.PODNAME     K8S.CONTAINERN… COMM          PID     TID SYSCALL        CODE
+minikube-docker   default         mypod           container1      mkdir       60482   60482 SYS_MKDIR      …_RET_LOG
+minikube-docker   default         mypod           container1      unshare     60483   60483 SYS_UNSH…      …L_THREAD
+minikube-docker   default         mypod           container1      mkdir       60553   60553 SYS_MKDIR      …_RET_LOG
+minikube-docker   default         mypod           container1      unshare     60554   60554 SYS_UNSH…      …L_THREAD
+^C
+```
+
+</TabItem>
+
+<TabItem value="ig" label="ig">
+
+```bash
+$ sudo ig run audit_seccomp:%IG_TAG%
+RUNTIME.CONTAINERNAME COMM                  PID         TID SYSCALL             CODE
+test-audit-seccomp    unshare            485855      485855 SYS_UNSHARE         …_KILL_THREAD
+test-audit-seccomp    unshare            485865      485865 SYS_UNSHARE         …_KILL_THREAD
+test-audit-seccomp    unshare            485868      485868 SYS_UNSHARE         …_KILL_THREAD
+test-audit-seccomp    unshare            485888      485888 SYS_UNSHARE         …_KILL_THREAD
+^C
+```
+
+</TabItem>
+</Tabs>
+
+In the previous examples, it is straightforward why the application is
+performing the syscall. The unshare program executes the unshare syscall and
+the mkdir program executes the mkdir syscall. For bigger applications, it can
+be useful to show the user stack trace.
+
+<Tabs groupId="env">
+<TabItem value="kubectl-gadget" label="kubectl gadget">
+
+```bash
+$ kubectl gadget run audit_seccomp:%IG_TAG% --collect-ustack -o jsonpretty
+...
+  "ustack": {
+    "addresses": "[0]0x000000000040332e; [1]0x00000000004771e6; [2]0x000000000047752e; [3]0x000000000048250b; [4]0x00000000004829ae; [5]0x0000000000482a7e; [6]0x0000000000482afe; [7]0x0000000000482b7e; [8]0x0000000000435a9d; [9]0x00000000004625a1; ",
+    ...
+    "symbols": "[0]runtime/internal/syscall.Syscall6; [1]syscall.Syscall; [2]syscall.Syscall.abi0; [3]golang.org/x/sys/unix.Chroot; [4]main.level3; [5]main.level2; [6]main.level1; [7]main.main; [8]runtime.main; [9]runtime.goexit.abi0; "
+  }
+^C
+```
+
+</TabItem>
+
+<TabItem value="ig" label="ig">
+
+```bash
+$ sudo ig run audit_seccomp:%IG_TAG% --collect-ustack -o jsonpretty
+...
+  "ustack": {
+    "addresses": "[0]0x000000000040332e; [1]0x00000000004771e6; [2]0x000000000047752e; [3]0x000000000048250b; [4]0x00000000004829ae; [5]0x0000000000482a7e; [6]0x0000000000482afe; [7]0x0000000000482b7e; [8]0x0000000000435a9d; [9]0x00000000004625a1; ",
+    ...
+    "symbols": "[0]runtime/internal/syscall.Syscall6; [1]syscall.Syscall; [2]syscall.Syscall.abi0; [3]golang.org/x/sys/unix.Chroot; [4]main.level3; [5]main.level2; [6]main.level1; [7]main.main; [8]runtime.main; [9]runtime.goexit.abi0; "
+  }
+^C
+```
+
+</TabItem>
+</Tabs>
+
+Finally, clean the system:
+
+<Tabs groupId="env">
+<TabItem value="kubectl-gadget" label="kubectl gadget">
+```bash
+$ kubectl delete -f mypod.yaml
+$ kubectl delete -f seccompprofile.yaml
+```
+</TabItem>
+
+<TabItem value="ig" label="ig">
+```bash
+$ docker rm -f test-trace-bind
+```
+</TabItem>
+</Tabs>

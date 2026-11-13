@@ -17,6 +17,11 @@
 package apihelpers
 
 import (
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/params"
 )
@@ -28,6 +33,7 @@ func ParamDescsToParams(descs params.ParamDescs) (res api.Params) {
 	for _, desc := range descs {
 		res = append(res, &api.Param{
 			Key:            desc.Key,
+			AlternativeKey: desc.AlternativeKey,
 			Description:    desc.Description,
 			DefaultValue:   desc.DefaultValue,
 			TypeHint:       string(desc.TypeHint),
@@ -45,6 +51,7 @@ func ParamDescsToParams(descs params.ParamDescs) (res api.Params) {
 func ParamToParamDesc(p *api.Param) *params.ParamDesc {
 	return &params.ParamDesc{
 		Key:            p.Key,
+		AlternativeKey: p.AlternativeKey,
 		Alias:          p.Alias,
 		Title:          p.Title,
 		DefaultValue:   p.DefaultValue,
@@ -66,6 +73,28 @@ func ToParamDescs(p api.Params) params.ParamDescs {
 	return res
 }
 
+// NormalizeWithDefaults sets the default value for parameters that are not set
+func NormalizeWithDefaults(p api.Params, v api.ParamValues) error {
+	for _, param := range p {
+		if _, ok := v[param.Key]; !ok {
+			v[param.Key] = param.DefaultValue
+		}
+	}
+	return nil
+}
+
+// MergeWithAlternativeKeys will merge values from AlternativeKey into Key if Key is not set
+func MergeWithAlternativeKeys(p api.Params, v api.ParamValues) {
+	for _, param := range p {
+		if _, ok := v[param.Key]; !ok && param.AlternativeKey != "" {
+			if val, ok := v[param.AlternativeKey]; ok {
+				v[param.Key] = val
+				delete(v, param.AlternativeKey)
+			}
+		}
+	}
+}
+
 func Validate(p api.Params, v api.ParamValues) error {
 	for _, param := range p {
 		if v[param.Key] == "" {
@@ -77,4 +106,67 @@ func Validate(p api.Params, v api.ParamValues) error {
 		}
 	}
 	return nil
+}
+
+// GetStringValuesPerDataSource will separate a string and extract per-datasource values. It expects a string like
+// `datasource1:value,datasource2:value` or `value` (datasource is optional - this will lead to an empty key)
+func GetStringValuesPerDataSource(s string) (map[string]string, error) {
+	if s == "" {
+		return map[string]string{}, nil
+	}
+	res := make(map[string]string)
+	for _, interval := range strings.Split(s, ",") {
+		if interval == "" {
+			continue
+		}
+		info := strings.SplitN(interval, ":", 2)
+		dsName := ""
+		val := info[0]
+		if len(info) > 1 {
+			dsName = info[0]
+			val = info[1]
+		}
+		res[dsName] = val
+	}
+	// Check edge cases
+	if _, ok := res[""]; ok {
+		if len(res) > 1 {
+			return nil, fmt.Errorf("mixed values with and without specifying data source")
+		}
+	}
+	return res, nil
+}
+
+// GetIntValuesPerDataSource works like GetStringValuesPerDataSource, but will return int values instead
+func GetIntValuesPerDataSource(s string) (map[string]int, error) {
+	var err error
+	m, err := GetStringValuesPerDataSource(s)
+	if err != nil {
+		return nil, fmt.Errorf("getting string values per data source: %w", err)
+	}
+	res := make(map[string]int, len(m))
+	for k, v := range m {
+		res[k], err = strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("converting %s to int: %w", v, err)
+		}
+	}
+	return res, nil
+}
+
+// GetDurationValuesPerDataSource works like GetStringValuesPerDataSource, but will return time.Duration values instead
+func GetDurationValuesPerDataSource(s string) (map[string]time.Duration, error) {
+	var err error
+	m, err := GetStringValuesPerDataSource(s)
+	if err != nil {
+		return nil, fmt.Errorf("getting string values per data source: %w", err)
+	}
+	res := make(map[string]time.Duration, len(m))
+	for k, v := range m {
+		res[k], err = time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("converting %s to duration: %w", v, err)
+		}
+	}
+	return res, nil
 }

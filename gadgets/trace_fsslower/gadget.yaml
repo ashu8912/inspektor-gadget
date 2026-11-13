@@ -1,0 +1,56 @@
+name: trace fsslower
+description: Trace open, read, write and fsync operations slower than a threshold
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/trace_fsslower
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/trace_fsslower
+datasources:
+  malloc:
+    fields:
+      delta_raw:
+        annotations:
+          description: Time spent by the operation in nanoseconds
+      delta:
+        annotations:
+          description: Time spent by the operation
+          columns.width: 8
+          columns.alignment: right
+      file:
+        annotations:
+          description: Name of the file being operated on
+          columns.width:: 48
+      offset:
+        annotations:
+          description: Offset of the operation
+          columns.width: 8
+          columns.alignment: right
+      size_raw:
+        annotations:
+          description: Size of the operation in bytes
+      size:
+        annotations:
+          description: Size of the operation
+          columns.width: 8
+          columns.alignment: right
+      op_raw:
+        annotations:
+          description: Type of operation (raw)
+          columns.hidden: true
+      op:
+        annotations:
+          description: Type of operation
+          columns.maxwidth: 10
+          columns.width: 10
+params:
+  ebpf:
+    min_lat_us:
+      key: min
+      alias: m
+      title: Minimum Latency
+      defaultValue: "10000"
+      description: Minimum latency in µs to trace
+  wasm:
+    filesystem:
+      key: filesystem
+      defaultValue: ext4
+      description: 'Filesystem to trace. Possible values are: btrfs, ext4, fuse, nfs, nfts3 or xfs.'
+      title: Filesystem

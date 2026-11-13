@@ -1,7 +1,7 @@
-ARG BUILDER_IMAGE=golang:1.22-bullseye
-ARG BASE_IMAGE=gcr.io/distroless/static-debian11
+ARG BUILDER_IMAGE=golang:1.26.10-trixie@sha256:909771fef53e3dcb0950255f0c9a8b4728c3b841e61509c7b29b098de7ee02d4
+ARG BASE_IMAGE=gcr.io/distroless/static-debian11:latest@sha256:1dbe426d60caed5d19597532a2d74c8056cd7b1674042b88f7328690b5ead8ed
 
-FROM --platform=${BUILDPLATFORM} ${BUILDER_IMAGE} as builder
+FROM --platform=${BUILDPLATFORM} ${BUILDER_IMAGE} AS builder
 
 ARG TARGETARCH
 ARG BUILDARCH
@@ -14,7 +14,11 @@ RUN cd /cache && \
 	go mod download
 ADD . /go/src/github.com/inspektor-gadget/inspektor-gadget
 WORKDIR /go/src/github.com/inspektor-gadget/inspektor-gadget/integration/k8s
-RUN CGO_ENABLED=0 GOARCH=${TARGETARCH} go test -c -o ig-integration-${TARGETARCH}.test ./...
+RUN \
+    --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg \
+    CGO_ENABLED=0 GOARCH=${TARGETARCH} go test \
+      -c -o ig-integration-${TARGETARCH}.test ./...
 
 FROM ${BASE_IMAGE}
 

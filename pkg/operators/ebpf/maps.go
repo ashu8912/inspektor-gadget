@@ -1,4 +1,4 @@
-// Copyright 2024 The Inspektor Gadget authors
+// Copyright 2024-2025 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,44 @@
 package ebpfoperator
 
 import (
+	"errors"
+	"fmt"
 	"reflect"
+	"strings"
+	"time"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
+	"golang.org/x/sys/unix"
+
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
+	apihelpers "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api-helpers"
 )
+
+const (
+	ParamMapIterInterval = "map-fetch-interval"
+	ParamMapIterCount    = "map-fetch-count"
+
+	mapIterIntervalDefault = "1000ms"
+)
+
+type mapIter struct {
+	name          string
+	mapName       string
+	keyStructName string
+	valStructName string
+
+	ds          datasource.DataSource
+	keyAccessor datasource.FieldAccessor
+	valAccessor datasource.FieldAccessor
+
+	interval time.Duration
+	count    int
+
+	flushOnStop bool
+}
 
 func (i *ebpfInstance) populateMap(t btf.Type, varName string) error {
 	i.logger.Debugf("populating map %q", varName)
@@ -35,5 +68,334 @@ func (i *ebpfInstance) populateMap(t btf.Type, varName string) error {
 	// Set variable to nil pointer to map, so it's present
 	var nilVal *ebpf.Map
 	i.gadgetCtx.SetVar(varName, nilVal)
+	return nil
+}
+
+func (i *ebpfInstance) mapParams() api.Params {
+	if len(i.mapIters) == 0 {
+		return nil
+	}
+	return api.Params{
+		{
+			Key:          ParamMapIterInterval,
+			Description:  "interval in which to iterate over maps",
+			DefaultValue: mapIterIntervalDefault,
+			TypeHint:     api.TypeString,
+			Title:        "Map fetch interval",
+			Tags:         []string{api.TagGroupDataCollection},
+		},
+		{
+			Key:          ParamMapIterCount,
+			Description:  "number of map fetch cycles - use 0 for unlimited",
+			DefaultValue: "0",
+			TypeHint:     api.TypeInt,
+			Title:        "Map fetch count",
+			Tags:         []string{api.TagGroupDataCollection},
+		},
+	}
+}
+
+func (i *ebpfInstance) evaluateMapParams(paramValues api.ParamValues) error {
+	if len(i.mapIters) == 0 {
+		return nil
+	}
+
+	globalDuration := time.Duration(0)
+	globalCount := 0
+
+	mapIterInterval := paramValues[ParamMapIterInterval]
+	// It's possible that in the param is empty in some cases, like running the
+	// gadget from a gadget spec file. In this case we need to set the param to
+	// the default value.
+	if mapIterInterval == "" {
+		mapIterInterval = mapIterIntervalDefault
+	}
+	durations, err := apihelpers.GetDurationValuesPerDataSource(mapIterInterval)
+	if err != nil {
+		return fmt.Errorf("evaluating map fetch interval: %w", err)
+	}
+	for dsName, duration := range durations {
+		if dsName == "" {
+			globalDuration = duration
+			continue
+		}
+		iter, ok := i.mapIters[dsName]
+		if !ok {
+			return fmt.Errorf("map fetch interval found for non-existing iterator %q", dsName)
+		}
+		iter.interval = duration
+	}
+
+	counts, err := apihelpers.GetIntValuesPerDataSource(paramValues[ParamMapIterCount])
+	if err != nil {
+		return fmt.Errorf("evaluating map fetch interval: %w", err)
+	}
+	for dsName, count := range counts {
+		if dsName == "" {
+			globalCount = count
+			continue
+		}
+		iter, ok := i.mapIters[dsName]
+		if !ok {
+			return fmt.Errorf("map fetch count found for non-existing iterator %q", dsName)
+		}
+		iter.count = count
+	}
+
+	for _, iter := range i.mapIters {
+		if iter.interval == 0 {
+			iter.interval = globalDuration
+		}
+		if iter.count == 0 {
+			iter.count = globalCount
+		}
+		iter.ds.AddAnnotation(api.FetchCountAnnotation, fmt.Sprintf("%d", iter.count))
+		iter.ds.AddAnnotation(api.FetchIntervalAnnotation, iter.interval.String())
+	}
+	return nil
+}
+
+func (i *ebpfInstance) runMapIterators() error {
+	for _, iter := range i.mapIters {
+		if iter.interval == 0 && iter.count > 1 {
+			return fmt.Errorf("map iterator %q has count > 1 but interval is zero", iter.name)
+		}
+
+		iterMap, ok := i.collection.Maps[iter.mapName]
+		if !ok {
+			return fmt.Errorf("map %q not found", iter.mapName)
+		}
+		fetch := func() {
+			p, err := iter.ds.NewPacketArray()
+			if err != nil {
+				i.logger.Errorf("error creating packet for map iterator: %v", err)
+				return
+			}
+
+			var prevKey []byte
+
+			batchSize := 100 // discuss
+
+			keySize := int(iterMap.KeySize())
+			valSize := int(iterMap.ValueSize())
+			for {
+				keys := make([]byte, keySize*batchSize)
+				vals := make([]byte, valSize*batchSize)
+				keysPtr := Pointer{ptr: unsafe.Pointer(&keys[0])}
+				valuesPtr := Pointer{ptr: unsafe.Pointer(&vals[0])}
+
+				// TODO: use cilium lib once raw byte access has been added
+				// TODO: open PR to actually make that happen
+				nk := make([]byte, keySize)
+				attr := MapLookupBatchAttr{
+					MapFd:    uint32(iterMap.FD()),
+					Keys:     keysPtr,
+					Values:   valuesPtr,
+					Count:    uint32(batchSize),
+					OutBatch: Pointer{ptr: unsafe.Pointer(&nk[0])},
+				}
+				if prevKey != nil {
+					attr.InBatch = Pointer{ptr: unsafe.Pointer(&prevKey[0])}
+				}
+
+				_, err := BPF(BPF_MAP_LOOKUP_AND_DELETE_BATCH, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+				if err != nil && !errors.Is(err, unix.ENOENT) {
+					i.logger.Warnf("error from map iterator: %v", err)
+					break
+				}
+				n := int(attr.Count)
+
+				prevKey = nk
+				for c := range n {
+					d := p.New()
+					iter.keyAccessor.Set(d, keys[keySize*c:keySize*(c+1)])
+					iter.valAccessor.Set(d, vals[valSize*c:valSize*(c+1)])
+					p.Append(d)
+				}
+				if errors.Is(err, unix.ENOENT) { // ebpf.ErrKeyNotExist when doing this with cilium/ebpf later on
+					break
+				}
+			}
+			if err := iter.ds.EmitAndRelease(p); err != nil {
+				i.logger.Errorf("emitting and releasing %q data: %v", iter.name, err)
+				return
+			}
+		}
+		i.wg.Add(1)
+		go func() {
+			defer i.wg.Done()
+			if iter.interval == 0 && iter.count == 1 {
+				// Only a single time if interval is zero and count is 1
+				fetch()
+				return
+			}
+			ctr := 0
+
+			tickerChan := make(<-chan time.Time)
+			if iter.interval > 0 {
+				tickerChan = time.NewTicker(iter.interval).C
+			}
+			for {
+				select {
+				case <-i.done:
+					if iter.flushOnStop {
+						i.logger.Debugf("flushing map")
+						fetch()
+					}
+					return
+				case <-tickerChan:
+					fetch()
+					ctr++
+					if iter.count > 0 && ctr >= iter.count {
+						// TODO: close DS
+						return
+					}
+				}
+			}
+		}()
+	}
+	return nil
+}
+
+func (i *ebpfInstance) populateMapIter(t btf.Type, varName string) error {
+	i.logger.Debugf("populating mapiter %q", varName)
+
+	info := strings.Split(varName, typeSplitter)
+	if len(info) != 2 {
+		return fmt.Errorf("invalid name for gadget_mapiter type: %q", varName)
+	}
+
+	name := info[0]
+	mapName := info[1]
+
+	if _, ok := i.mapIters[name]; ok {
+		return fmt.Errorf("duplicate map iterator %q", varName)
+	}
+
+	// Get types
+	iterMap, ok := i.collectionSpec.Maps[mapName]
+	if !ok {
+		return fmt.Errorf("map %q not found in eBPF object", mapName)
+	}
+
+	if iterMap.Type != ebpf.Hash {
+		return fmt.Errorf("map %q is not a hash map", mapName)
+	}
+
+	keyStruct, ok := iterMap.Key.(*btf.Struct)
+	if !ok {
+		return fmt.Errorf("map %q key is not a struct", mapName)
+	}
+
+	valStruct, ok := iterMap.Value.(*btf.Struct)
+	if !ok {
+		return fmt.Errorf("map %q value is not a struct", mapName)
+	}
+
+	if iterMap.KeySize != keyStruct.Size || iterMap.ValueSize != valStruct.Size {
+		return fmt.Errorf("key/value sizes of map %q does not match size of structs", mapName)
+	}
+
+	err := i.populateStructDirect(keyStruct)
+	if err != nil {
+		return fmt.Errorf("populating key struct for map iter %q: %w", varName, err)
+	}
+
+	err = i.populateStructDirect(valStruct)
+	if err != nil {
+		return fmt.Errorf("populating value struct for map iter %q: %w", varName, err)
+	}
+
+	iter := &mapIter{
+		name:          name,
+		mapName:       mapName,
+		keyStructName: keyStruct.Name,
+		valStructName: valStruct.Name,
+	}
+	i.mapIters[name] = iter
+	return nil
+}
+
+// populateIterTargetMap handles GADGET_ITER_TARGET_MAP(prog_name, mapname).
+// It binds a SEC("iter/bpf_map_elem") BPF program to the map it should
+// iterate over; the bound map FD is later passed at attach time via
+// link.IterOptions.Map (see attach.go).
+func (i *ebpfInstance) populateIterTargetMap(t btf.Type, varName string) error {
+	i.logger.Debugf("populating iter target map %q", varName)
+
+	info := strings.Split(varName, typeSplitter)
+	if len(info) != 2 {
+		return fmt.Errorf("invalid name for %s type: %q (expected <prog_name>%s<map_name>)",
+			iterTargetMapPrefix, varName, typeSplitter)
+	}
+
+	progName := info[0]
+	mapName := info[1]
+
+	if existing, ok := i.iterTargetMaps[progName]; ok {
+		return fmt.Errorf("duplicate iter target map for program %q (already bound to %q)",
+			progName, existing)
+	}
+
+	// Validate the program exists and is a bpf_map_elem iter.
+	prog, ok := i.collectionSpec.Programs[progName]
+	if !ok {
+		return fmt.Errorf("iter target map references unknown program %q", progName)
+	}
+	if prog.Type != ebpf.Tracing || prog.AttachType != ebpf.AttachTraceIter {
+		return fmt.Errorf("program %q is not a tracing iter (got type=%s attach=%s); use SEC(\"iter/bpf_map_elem\")",
+			progName, prog.Type, prog.AttachType)
+	}
+	if prog.AttachTo != "bpf_map_elem" {
+		return fmt.Errorf("program %q is not iter/bpf_map_elem (got iter/%s); GADGET_ITER_TARGET_MAP only applies to bpf_map_elem iter",
+			progName, prog.AttachTo)
+	}
+
+	// Validate the map exists.
+	if _, ok := i.collectionSpec.Maps[mapName]; !ok {
+		return fmt.Errorf("iter target map references unknown map %q (for program %q)",
+			mapName, progName)
+	}
+
+	i.iterTargetMaps[progName] = mapName
+	return nil
+}
+
+func (i *ebpfInstance) populateSKTargetMap(t btf.Type, varName string) error {
+	i.logger.Debugf("populating sk target map %q", varName)
+
+	info := strings.Split(varName, typeSplitter)
+	if len(info) != 2 {
+		return fmt.Errorf("invalid name for %s type: %q (expected <prog_name>%s<map_name>)",
+			skTargetMapPrefix, varName, typeSplitter)
+	}
+
+	progName := info[0]
+	mapName := info[1]
+
+	if existing, ok := i.skTargetMaps[progName]; ok {
+		return fmt.Errorf("duplicate sk target map for program %q (already bound to %q)",
+			progName, existing)
+	}
+
+	prog, ok := i.collectionSpec.Programs[progName]
+	if !ok {
+		return fmt.Errorf("sk target map references unknown program %q", progName)
+	}
+	if prog.Type != ebpf.SkSKB && prog.Type != ebpf.SkMsg {
+		return fmt.Errorf("program %q has type %s; GADGET_SK_TARGET_MAP only applies to sk_skb and sk_msg programs",
+			progName, prog.Type)
+	}
+
+	targetMap, ok := i.collectionSpec.Maps[mapName]
+	if !ok {
+		return fmt.Errorf("sk target map references unknown map %q (for program %q)", mapName, progName)
+	}
+	if targetMap.Type != ebpf.SockMap && targetMap.Type != ebpf.SockHash {
+		return fmt.Errorf("map %q has type %s; GADGET_SK_TARGET_MAP requires a sockmap or sockhash",
+			mapName, targetMap.Type)
+	}
+
+	i.skTargetMaps[progName] = mapName
 	return nil
 }

@@ -1,5 +1,5 @@
 HELM ?= helm
-HELM_DOCS_IMAGE ?= jnorwood/helm-docs:v1.11.0
+HELM_DOCS_IMAGE ?= jnorwood/helm-docs:v1.14.2
 BUILD_DIR ?= bin
 OUTPUT_DIR ?= $(BUILD_DIR)
 CHART_DIR := $(BUILD_DIR)/gadget
@@ -11,6 +11,8 @@ SED_VERSION := $(shell sed --version 2>&1)
 
 .DEFAULT_GOAL := help
 
+include ../rootless.mk
+
 clean:
 	rm -rf $(BUILD_DIR)
 
@@ -18,7 +20,6 @@ build: clean
 	@echo "Building chart:"
 	mkdir -p $(BUILD_DIR)
 	cp -r gadget $(BUILD_DIR)
-	cp -r ../pkg/resources/crd/bases $(CHART_DIR)/crds
 	mv $(CHART_DIR)/Chart.yaml.tmpl $(CHART_DIR)/Chart.yaml
 ifeq ($(findstring GNU,$(SED_VERSION)),GNU)
 	@echo "Using GNU sed"
@@ -30,27 +31,24 @@ else
 	sed -i "" "s/%APP_VERSION%/$(APP_VERSION)/g" $(CHART_DIR)/Chart.yaml
 endif
 	@echo "Preparing docs"
-	docker run --user $(shell id -u):$(shell id -g) -v $(shell pwd)/$(CHART_DIR):/helm-docs $(HELM_DOCS_IMAGE) -s file
+	docker run $(DOCKER_USER_FLAG) -v $(shell pwd)/$(CHART_DIR):/helm-docs $(HELM_DOCS_IMAGE) -s file
 	@echo "Charts available at: $(CHART_DIR)"
 
-# install uses 'helm upgrade --install' to make chart installation idempotent,
-# also helm upgrade does not update CRDs so we need to apply them separately
+# install uses 'helm upgrade --install' to make chart installation idempotent.
 install: build
-	$(HELM) upgrade --install gadget $(CHART_DIR) --namespace gadget --create-namespace
-	kubectl apply -f $(CHART_DIR)/crds/*
+	$(HELM) upgrade --install gadget $(CHART_DIR) --namespace gadget --create-namespace $$HELM_PARAMS
 
 uninstall:
-	kubectl delete -f $(CHART_DIR)/crds/*
-	$(HELM) uninstall gadget --namespace gadget
+	$(HELM) uninstall gadget --namespace gadget $$HELM_PARAMS
 
 lint: build
-	$(HELM) lint $(CHART_DIR)
+	$(HELM) lint $(CHART_DIR) $$HELM_PARAMS
 
 template: build
-	$(HELM) template gadget $(CHART_DIR) --namespace gadget --skip-crds | tee $(OUTPUT_DIR)/deploy.yaml
+	$(HELM) template gadget $(CHART_DIR) --namespace gadget --skip-crds $$HELM_PARAMS | tee $(OUTPUT_DIR)/deploy.yaml
 
 package: build
-	$(HELM) package $(CHART_DIR) -d $(BUILD_DIR)
+	$(HELM) package $(CHART_DIR) -d $(BUILD_DIR) $$HELM_PARAMS
 
 help:
 	@echo "Usage: make <target>"

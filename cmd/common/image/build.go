@@ -16,40 +16,29 @@ package image
 
 import (
 	"context"
-	_ "embed"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
-	"github.com/moby/moby/pkg/jsonmessage"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/client/pkg/jsonmessage"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
 
 	"github.com/inspektor-gadget/inspektor-gadget/cmd/common"
-	"github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/oci"
 )
 
-//go:embed Makefile.build
-var makefile []byte
-
-//go:embed Makefile.build.btfgen
-var makefileBtfgen []byte
-
 // It can be overridden at build time
-var builderImage = "ghcr.io/inspektor-gadget/ebpf-builder:latest"
+var builderImage = "ghcr.io/inspektor-gadget/gadget-builder:main"
 
 const (
 	DEFAULT_EBPF_SOURCE = "program.bpf.c"
@@ -61,7 +50,6 @@ type buildFile struct {
 	EBPFSource string `yaml:"ebpfsource"`
 	Wasm       string `yaml:"wasm"`
 	Metadata   string `yaml:"metadata"`
-	CFlags     string `yaml:"cflags"`
 }
 
 type cmdOpts struct {
@@ -72,6 +60,7 @@ type cmdOpts struct {
 	local            bool
 	outputDir        string
 	builderImage     string
+	builderImagePull string
 	updateMetadata   bool
 	validateMetadata bool
 	btfgen           bool
@@ -91,6 +80,12 @@ func NewBuildCmd() *cobra.Command {
 				return fmt.Errorf("--local and --builder-image cannot be used at the same time")
 			}
 
+			// Validate builderImagePull flag by checking it against a list of valid values
+			validValues := []string{"always", "missing", "never"}
+			if !slices.Contains(validValues, opts.builderImagePull) {
+				return fmt.Errorf("invalid value for --builder-image-pull: %s. Valid values are %s", opts.builderImagePull, strings.Join(validValues, ","))
+			}
+
 			fFlag := cmd.Flags().Lookup("file")
 			opts.fileChanged = fFlag.Changed
 
@@ -105,13 +100,94 @@ func NewBuildCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&opts.outputDir, "output", "o", "", "Path to a folder to store generated files while building")
 	cmd.Flags().StringVarP(&opts.image, "tag", "t", "", "Name for the built image (format name:tag)")
 	cmd.Flags().StringVar(&opts.builderImage, "builder-image", builderImage, "Builder image to use")
+	cmd.Flags().StringVar(&opts.builderImagePull, "builder-image-pull", "always", "Specify when the builder image should be pulled [always, missing, never]")
 	cmd.Flags().BoolVar(&opts.updateMetadata, "update-metadata", false, "Update the metadata according to the eBPF code")
 	cmd.Flags().BoolVar(&opts.validateMetadata, "validate-metadata", true, "Validate the metadata file before building the gadget image")
 
 	cmd.Flags().BoolVar(&opts.btfgen, "btfgen", false, "Enable btfgen")
 	cmd.Flags().StringVar(&opts.btfhubarchive, "btfhub-archive", "", "Path to the location of the btfhub-archive files")
 
-	return utils.MarkExperimental(cmd)
+	return cmd
+}
+
+type buildOptions struct {
+	outputDir         string
+	ebpfSourcePath    string
+	wasmSourcePath    string
+	btfHubArchivePath string
+	btfgen            bool
+	forceColorsFlag   bool
+	useInTreeHeaders  bool
+}
+
+func isFlag(str string) bool {
+	return strings.HasPrefix(str, "-")
+}
+
+func isResponseFile(str string) bool {
+	// Response file starts with @, see:
+	// https://gcc.gnu.org/wiki/Response_Files
+	return strings.HasPrefix(str, "@")
+}
+
+// Ensure the string build options are path to avoid flags injection.
+func checkBuildOptions(buildOpts buildOptions) error {
+	for _, opt := range []string{buildOpts.outputDir, buildOpts.ebpfSourcePath, buildOpts.wasmSourcePath, buildOpts.btfHubArchivePath} {
+		opt = strings.TrimSpace(opt)
+		if isFlag(opt) {
+			return fmt.Errorf("flags are not accepted: %q", opt)
+		}
+
+		if isResponseFile(opt) {
+			return fmt.Errorf("response file are not accepted: %q", opt)
+		}
+	}
+
+	return nil
+}
+
+func buildPipeline(opts buildOptions) ([]buildStep, error) {
+	if err := checkBuildOptions(opts); err != nil {
+		return nil, fmt.Errorf("wrong build option detected: %w", err)
+	}
+
+	var steps []buildStep
+
+	if opts.ebpfSourcePath != "" {
+		for _, arch := range []string{oci.ArchAmd64, oci.ArchArm64} {
+			steps = append(steps, newClangCompileStep(arch, opts))
+		}
+	}
+
+	if opts.wasmSourcePath != "" {
+		switch {
+		case strings.HasSuffix(opts.wasmSourcePath, ".go"):
+			steps = append(steps, newGoBuildStep(opts))
+		case strings.HasSuffix(opts.wasmSourcePath, ".rs"):
+			steps = append(steps, newCargoBuildStep(opts))
+		case strings.HasSuffix(opts.wasmSourcePath, ".wasm"):
+			// Already compiled, nothing to do.
+		default:
+			return nil, fmt.Errorf("unsupported wasm file type: %s", opts.wasmSourcePath)
+		}
+	}
+
+	if opts.btfgen {
+		for _, arch := range []string{oci.ArchAmd64, oci.ArchArm64} {
+			steps = append(steps, newBtfgenStep(arch, opts))
+		}
+	}
+
+	return steps, nil
+}
+
+func runPipeline(runner commandRunner, steps []buildStep) error {
+	for _, step := range steps {
+		if err := step.run(runner); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runBuild(cmd *cobra.Command, opts *cmdOpts) error {
@@ -177,16 +253,75 @@ func runBuild(cmd *cobra.Command, opts *cmdOpts) error {
 	}
 
 	if _, err := os.Stat(conf.EBPFSource); errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("source file %q not found", conf.EBPFSource)
+		if conf.EBPFSource != DEFAULT_EBPF_SOURCE {
+			return fmt.Errorf("source file %q not found", conf.EBPFSource)
+		}
+		conf.EBPFSource = ""
 	}
 
-	if opts.local {
-		if err := buildLocal(opts, conf); err != nil {
-			return err
+	var hasEBPFSource, hasMetadata, hasWasm, hasGo bool
+	if conf.EBPFSource != "" {
+		if _, err := os.Stat(conf.EBPFSource); err == nil {
+			hasEBPFSource = true
 		}
-	} else {
-		if err := buildInContainer(opts, conf); err != nil {
-			return err
+	}
+	if conf.Metadata != "" {
+		if _, err := os.Stat(conf.Metadata); err == nil {
+			hasMetadata = true
+		}
+	}
+	if conf.Wasm != "" {
+		if _, err := os.Stat(conf.Wasm); err == nil {
+			hasWasm = true
+		}
+	}
+
+	goFolder := "./go"
+
+	if _, err := os.Stat(goFolder); err == nil {
+		_ = filepath.Walk(goFolder, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() && strings.HasSuffix(info.Name(), ".go") {
+				hasGo = true
+				return filepath.SkipDir
+			}
+			return nil
+		})
+	}
+
+	if !hasEBPFSource && !hasMetadata && !hasWasm && !hasGo {
+		return fmt.Errorf("at least one of ebpf source (program.bpf.c), metadata (gadget.yaml), .go files (present in go folder) or wasm module is required")
+	}
+
+	if conf.EBPFSource != "" || conf.Wasm != "" {
+		if opts.local {
+			steps, err := buildPipeline(buildOptions{
+				outputDir:         opts.outputDir,
+				ebpfSourcePath:    conf.EBPFSource,
+				wasmSourcePath:    conf.Wasm,
+				btfHubArchivePath: opts.btfhubarchive,
+				btfgen:            opts.btfgen,
+			})
+			if err != nil {
+				return fmt.Errorf("building build pipeline: %w", err)
+			}
+
+			runner := &localRunner{verbose: common.Verbose}
+			if common.Verbose {
+				fmt.Printf("Build logs start:\n")
+			}
+			if err := runPipeline(runner, steps); err != nil {
+				return fmt.Errorf("local build: %w", err)
+			}
+			if common.Verbose {
+				fmt.Printf("Build logs end\n")
+			}
+		} else {
+			if err := buildInContainer(opts, conf); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -195,8 +330,10 @@ func runBuild(cmd *cobra.Command, opts *cmdOpts) error {
 	objectsPaths := map[string]*oci.ObjectPath{}
 
 	for _, arch := range archs {
-		obj := &oci.ObjectPath{
-			EBPF: filepath.Join(opts.outputDir, arch+".bpf.o"),
+		obj := &oci.ObjectPath{}
+
+		if conf.EBPFSource != "" {
+			obj.EBPF = filepath.Join(opts.outputDir, arch+".bpf.o")
 		}
 
 		// TODO: the same wasm file is provided for all architectures. Should we allow per-arch
@@ -227,7 +364,16 @@ func runBuild(cmd *cobra.Command, opts *cmdOpts) error {
 		MetadataPath:     conf.Metadata,
 		UpdateMetadata:   opts.updateMetadata,
 		ValidateMetadata: opts.validateMetadata,
-		CreatedDate:      time.Now().Format(time.RFC3339),
+	}
+
+	if sourceDateEpoch, ok := os.LookupEnv("SOURCE_DATE_EPOCH"); ok {
+		sde, err := strconv.ParseInt(sourceDateEpoch, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid SOURCE_DATE_EPOCH: %w", err)
+		}
+		buildOpts.CreatedDate = time.Unix(sde, 0).UTC().Format(time.RFC3339)
+	} else {
+		buildOpts.CreatedDate = time.Now().Format(time.RFC3339)
 	}
 
 	desc, err := oci.BuildGadgetImage(context.TODO(), buildOpts, opts.image)
@@ -240,58 +386,9 @@ func runBuild(cmd *cobra.Command, opts *cmdOpts) error {
 	return nil
 }
 
-func buildLocal(opts *cmdOpts, conf *buildFile) error {
-	makefilePath := filepath.Join(opts.outputDir, "Makefile")
-	if err := os.WriteFile(makefilePath, makefile, 0o644); err != nil {
-		return fmt.Errorf("writing Makefile: %w", err)
-	}
-
-	buildCmd := exec.Command(
-		"make", "-f", makefilePath,
-		"-j", fmt.Sprintf("%d", runtime.NumCPU()),
-		"EBPFSOURCE="+conf.EBPFSource,
-		"WASM="+conf.Wasm,
-		"OUTPUTDIR="+opts.outputDir,
-		"CFLAGS="+conf.CFlags,
-		"all",
-	)
-
-	if opts.btfgen {
-		makefileBtfgenPath := filepath.Join(opts.outputDir, "Makefile.build.btfgen")
-		if err := os.WriteFile(makefileBtfgenPath, makefileBtfgen, 0o644); err != nil {
-			return fmt.Errorf("writing Makefile: %w", err)
-		}
-
-		buildCmd.Args = append(buildCmd.Args, "BTFHUB_ARCHIVE="+opts.btfhubarchive)
-		buildCmd.Args = append(buildCmd.Args, "btfgen")
-	}
-
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("build script: %w: %s", err, out)
-	}
-
-	return nil
-}
-
-func ensureBuilderImage(ctx context.Context, cli *client.Client, builderImage string) error {
-	f := filters.NewArgs()
-	f.Add("reference", builderImage)
-
-	images, err := cli.ImageList(ctx, image.ListOptions{Filters: f})
-	if err != nil {
-		return fmt.Errorf("listing images: %w", err)
-	}
-
-	for _, img := range images {
-		for _, tag := range img.RepoTags {
-			if tag == builderImage {
-				return nil
-			}
-		}
-	}
-
-	fmt.Printf("Pulling builder image %s\n", builderImage)
-	reader, err := cli.ImagePull(ctx, builderImage, image.PullOptions{})
+func pullImage(ctx context.Context, cli *client.Client, imageReference string) error {
+	fmt.Printf("Pulling builder image %s\n", imageReference)
+	reader, err := cli.ImagePull(ctx, imageReference, client.ImagePullOptions{})
 	if err != nil {
 		return fmt.Errorf("pulling builder image: %w", err)
 	}
@@ -303,6 +400,69 @@ func ensureBuilderImage(ctx context.Context, cli *client.Client, builderImage st
 	return jsonmessage.DisplayJSONMessagesStream(reader, out, outFd, isTTY, nil)
 }
 
+func isImageLocallyAvailable(ctx context.Context, cli *client.Client, imageReference string) (bool, error) {
+	f := make(client.Filters).Add("reference", imageReference)
+
+	result, err := cli.ImageList(ctx, client.ImageListOptions{Filters: f})
+	if err != nil {
+		return false, fmt.Errorf("listing images: %w", err)
+	}
+
+	for _, img := range result.Items {
+		for _, tag := range img.RepoTags {
+			if tag == imageReference {
+				return true, nil
+			}
+		}
+		for _, digest := range img.RepoDigests {
+			if digest == imageReference {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func ensureBuilderImage(ctx context.Context, cli *client.Client, builderImage string, builderImagePull string) error {
+	switch builderImagePull {
+	case "always":
+		return pullImage(ctx, cli, builderImage)
+	case "missing":
+		localAvailable, err := isImageLocallyAvailable(ctx, cli, builderImage)
+		if err != nil {
+			return err
+		}
+		if !localAvailable {
+			return pullImage(ctx, cli, builderImage)
+		}
+	case "never":
+		localAvailable, err := isImageLocallyAvailable(ctx, cli, builderImage)
+		if err != nil {
+			return err
+		}
+		if !localAvailable {
+			return fmt.Errorf("image %s is not available locally and pull is disabled", builderImage)
+		}
+	default:
+		return fmt.Errorf("invalid --builder-image-pull value: %s", builderImagePull)
+	}
+	return nil
+}
+
+func isRootlessEngine(ctx context.Context, cli *client.Client) (bool, error) {
+	info, err := cli.Info(ctx, client.InfoOptions{})
+	if err != nil {
+		return false, fmt.Errorf("getting engine info: %w", err)
+	}
+
+	for _, opt := range info.Info.SecurityOptions {
+		if strings.Contains(opt, "name=rootless") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func buildInContainer(opts *cmdOpts, conf *buildFile) error {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -310,36 +470,66 @@ func buildInContainer(opts *cmdOpts, conf *buildFile) error {
 	}
 
 	ctx := context.TODO()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return fmt.Errorf("creating docker client: %w", err)
 	}
 	defer cli.Close()
 
-	if err := ensureBuilderImage(ctx, cli, opts.builderImage); err != nil {
+	if err := ensureBuilderImage(ctx, cli, opts.builderImage, opts.builderImagePull); err != nil {
 		return err
 	}
 
-	wasmFullPath := ""
+	// where the gadget source code is mounted in the container
+	gadgetSourcePath := "/work"
+	pathHost := cwd
+
+	inspektorGadetSrcPath := os.Getenv("IG_SOURCE_PATH")
+	useInTreeHeaders := false
+	if inspektorGadetSrcPath != "" {
+		pathHost = inspektorGadetSrcPath
+		// find the gadget relative path to the inspektor-gadget source
+		if !strings.HasPrefix(cwd, inspektorGadetSrcPath) {
+			return fmt.Errorf("the current directory %q is not under the inspektor-gadget source path %q", cwd, inspektorGadetSrcPath)
+		}
+		gadgetRelativePath := strings.TrimPrefix(cwd, inspektorGadetSrcPath)
+		gadgetSourcePath = filepath.Join("/work", gadgetRelativePath)
+
+		// use in-tree headers too
+		useInTreeHeaders = true
+	}
+
+	buildOpts := buildOptions{
+		outputDir:         "/out",
+		btfgen:            opts.btfgen,
+		btfHubArchivePath: "/btfhub-archive",
+		useInTreeHeaders:  useInTreeHeaders,
+	}
+
 	if conf.Wasm != "" {
-		wasmFullPath = filepath.Join("/work", conf.Wasm)
+		buildOpts.wasmSourcePath = filepath.Join(gadgetSourcePath, conf.Wasm)
 	}
 
-	cmd := []string{
-		"make", "-f", "/Makefile", "-j", fmt.Sprintf("%d", runtime.NumCPU()),
-		"EBPFSOURCE=" + filepath.Join("/work", conf.EBPFSource),
-		"WASM=" + wasmFullPath,
-		"OUTPUTDIR=/out",
-		"CFLAGS=" + conf.CFlags,
-		"all",
+	if conf.EBPFSource != "" {
+		buildOpts.ebpfSourcePath = filepath.Join(gadgetSourcePath, conf.EBPFSource)
 	}
 
+	if term.IsTerminal(int(os.Stdout.Fd())) && term.IsTerminal(int(os.Stderr.Fd())) {
+		buildOpts.forceColorsFlag = true
+	}
+
+	steps, err := buildPipeline(buildOpts)
+	if err != nil {
+		return fmt.Errorf("building build pipeline: %w", err)
+	}
+
+	// The work mount ReadOnly field is updated as false, to allow Cargo.lock to compiled in /work folder for rust source code.
 	mounts := []mount.Mount{
 		{
 			Type:     mount.TypeBind,
 			Target:   "/work",
-			Source:   cwd,
-			ReadOnly: true,
+			Source:   pathHost,
+			ReadOnly: false,
 		},
 		{
 			Type:   mount.TypeBind,
@@ -349,9 +539,6 @@ func buildInContainer(opts *cmdOpts, conf *buildFile) error {
 	}
 
 	if opts.btfgen {
-		cmd = append(cmd, "BTFHUB_ARCHIVE=/btfhub-archive")
-		cmd = append(cmd, "btfgen")
-
 		mounts = append(mounts, mount.Mount{
 			Type:   mount.TypeBind,
 			Target: "/btfhub-archive",
@@ -359,56 +546,58 @@ func buildInContainer(opts *cmdOpts, conf *buildFile) error {
 		})
 	}
 
-	resp, err := cli.ContainerCreate(
-		ctx,
-		&container.Config{
-			Image: opts.builderImage,
-			Cmd:   cmd,
-			User:  fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+	containerCreateOptions := client.ContainerCreateOptions{
+		Config: &container.Config{
+			Image:      opts.builderImage,
+			Cmd:        []string{"sleep", "inf"},
+			WorkingDir: gadgetSourcePath,
 		},
-		&container.HostConfig{
+		HostConfig: &container.HostConfig{
 			Mounts: mounts,
 		},
-		nil, nil, "",
-	)
+	}
+
+	isRootless, err := isRootlessEngine(ctx, cli)
+	if err != nil {
+		return fmt.Errorf("getting container engine information: %w", err)
+	}
+	if isRootless {
+		if os.Geteuid() == 0 {
+			return errors.New("running build as root user with rootless container engine is not possible, run build as your user")
+		}
+	} else {
+		containerCreateOptions.Config.User = fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	}
+
+	resp, err := cli.ContainerCreate(ctx, containerCreateOptions)
 	if err != nil {
 		return fmt.Errorf("creating builder container: %w", err)
 	}
 	defer func() {
-		if err := cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{}); err != nil {
+		if _, err := cli.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true}); err != nil {
 			fmt.Printf("Failed to remove builder container: %s\n", err)
 		}
 	}()
 
-	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+	if _, err := cli.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
 		return fmt.Errorf("starting builder container: %w", err)
 	}
 
-	var status container.WaitResponse
-
-	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return fmt.Errorf("waiting for builder container: %w", err)
-		}
-	case status = <-statusCh:
+	runner := &containerRunner{
+		ctx:         ctx,
+		cli:         cli,
+		containerID: resp.ID,
+		verbose:     common.Verbose,
 	}
 
-	if status.StatusCode != 0 || common.Verbose {
-		opts := container.LogsOptions{ShowStdout: true, ShowStderr: true}
-		out, err := cli.ContainerLogs(ctx, resp.ID, opts)
-		if err != nil {
-			return fmt.Errorf("getting builder container logs: %w", err)
-		}
-
-		fmt.Printf("Builder container logs start:\n")
-		stdcopy.StdCopy(os.Stdout, os.Stderr, out)
-		fmt.Printf("Builder container logs end\n")
+	if common.Verbose {
+		fmt.Println("Build logs start:")
 	}
-
-	if status.StatusCode != 0 {
-		return fmt.Errorf("builder container exited with status %d", status.StatusCode)
+	if err := runPipeline(runner, steps); err != nil {
+		return fmt.Errorf("container build: %w", err)
+	}
+	if common.Verbose {
+		fmt.Println("Build logs end")
 	}
 
 	return nil

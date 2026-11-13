@@ -1,4 +1,4 @@
-// Copyright 2022-2023 The Inspektor Gadget authors
+// Copyright 2022-2025 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -134,6 +134,12 @@ func TestParamAs(t *testing.T) {
 			name:     "StringSlice()_Empty",
 			value:    "",
 			expected: []string{},
+			getter:   func(p *Param) any { return p.AsStringSlice() },
+		},
+		{
+			name:     "StringSlice()_EscapedCommas",
+			value:    "foo,bar,zas\\,foob,olo\\lol,fro\\\\bedeedoo",
+			expected: []string{"foo", "bar", "zas,foob", "olo\\lol", "fro\\bedeedoo"},
 			getter:   func(p *Param) any { return p.AsStringSlice() },
 		},
 		{
@@ -462,6 +468,30 @@ func TestBytesHandling(t *testing.T) {
 	require.Equal(t, testString, string(params[0].AsBytes()), "decompression + B64 decoding failed")
 }
 
+func TestStringSlice(t *testing.T) {
+	const testStringSlice = "foo,bar,quux,abc\\,def"
+	testStringSliceExpected := []string{"foo", "bar", "quux", "abc,def"}
+	params := Params{
+		&Param{
+			ParamDesc: &ParamDesc{
+				Key:      "[]string",
+				TypeHint: TypeStringSlice,
+			},
+		},
+	}
+	params[0].Set(testStringSlice)
+
+	// CopyToMapExt
+	testMapExt := map[string]any{}
+	params.CopyToMapExt(testMapExt, "")
+	require.Equal(t, testStringSliceExpected, testMapExt["[]string"], "converting to []string failed")
+
+	// CopyToMap
+	testMap := map[string]string{}
+	params.CopyToMap(testMap, "")
+	require.Equal(t, testStringSlice, testMap["[]string"], "converting to string failed")
+}
+
 func TestIsSet(t *testing.T) {
 	pd := ParamDesc{
 		DefaultValue: "foo",
@@ -482,4 +512,18 @@ func TestIsDefault(t *testing.T) {
 	require.True(t, p.IsDefault())
 	p.Set("bar")
 	require.False(t, p.IsDefault())
+}
+
+func TestAlternativeKey(t *testing.T) {
+	pd := &ParamDesc{
+		Key:            "foo",
+		AlternativeKey: "bar",
+	}
+	params := Params{pd.ToParam()}
+	require.Equal(t, "foo", params[0].Key)
+	require.Equal(t, "bar", params[0].AlternativeKey)
+	params.Set("foo", "baz")
+	require.Equal(t, "baz", params.Get("bar").AsString())
+	params.Set("bar", "quux")
+	require.Equal(t, "quux", params.Get("foo").AsString())
 }

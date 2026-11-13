@@ -44,21 +44,33 @@ func (r *Runtime) GetGadgetInfo(gadgetCtx runtime.GadgetContext, runtimeParams *
 	client := api.NewGadgetManagerClient(conn)
 
 	in := &api.GetGadgetInfoRequest{
-		ParamValues: paramValues,
-		ImageName:   gadgetCtx.ImageName(),
-		Version:     api.VersionGadgetInfo,
+		ParamValues:      paramValues,
+		ImageName:        gadgetCtx.ImageName(),
+		Version:          api.VersionGadgetInfo,
+		RequestExtraInfo: gadgetCtx.ExtraInfo(),
 	}
+
+	// specify that ImageName will contain a gadget instance ID
+	if gadgetCtx.UseInstance() {
+		in.Flags |= api.GadgetInfoRequestFlagUseInstance
+	}
+
 	out, err := client.GetGadgetInfo(gadgetCtx.Context(), in)
 	if err != nil {
 		return nil, fmt.Errorf("getting gadget info: %w", err)
 	}
+	extraInfo := &api.ExtraInfo{}
 
-	err = gadgetCtx.LoadGadgetInfo(out.GadgetInfo, paramValues, false)
+	if gadgetCtx.ExtraInfo() {
+		extraInfo = out.GadgetInfo.ExtraInfo
+	}
+
+	err = gadgetCtx.LoadGadgetInfo(out.GadgetInfo, paramValues, false, extraInfo)
 	if err != nil {
 		return nil, fmt.Errorf("initializing local operators: %w", err)
 	}
 
-	return gadgetCtx.SerializeGadgetInfo()
+	return gadgetCtx.SerializeGadgetInfo(gadgetCtx.ExtraInfo())
 }
 
 func (r *Runtime) RunGadget(gadgetCtx runtime.GadgetContext, runtimeParams *params.Params, paramValues api.ParamValues) error {
@@ -71,10 +83,17 @@ func (r *Runtime) RunGadget(gadgetCtx runtime.GadgetContext, runtimeParams *para
 		gadgetCtx.Logger().Debugf("- %s: %q", k, v)
 	}
 
+	if p := runtimeParams.Get(ParamDetach); p != nil && p.AsBool() {
+		return r.createGadgetInstance(gadgetCtx, runtimeParams, paramValues)
+	}
+
 	targets, err := r.getTargets(gadgetCtx.Context(), runtimeParams)
 	if err != nil {
 		return fmt.Errorf("getting target nodes: %w", err)
 	}
+
+	gadgetCtx.SetVar(runtime.NumRunTargets, len(targets))
+
 	_, err = r.runGadgetOnTargets(gadgetCtx, paramValues, targets)
 	return err
 }
@@ -104,6 +123,9 @@ func (r *Runtime) runGadgetOnTargets(
 	}
 
 	wg.Wait()
+	// Stop local operators after all remote targets
+	// have stopped their operators and "returned"
+	gadgetCtx.StopLocalOperators()
 	return results, results.Err()
 }
 
@@ -125,21 +147,40 @@ func (r *Runtime) runGadget(gadgetCtx runtime.GadgetContext, target target, allP
 	defer conn.Close()
 	client := api.NewGadgetManagerClient(conn)
 
-	runRequest := &api.GadgetRunRequest{
-		ImageName:   gadgetCtx.ImageName(),
-		ParamValues: allParams,
-		Args:        gadgetCtx.Args(),
-		LogLevel:    uint32(gadgetCtx.Logger().GetLevel()),
-		Timeout:     int64(gadgetCtx.Timeout()),
-		Version:     api.VersionGadgetRunProtocol,
-	}
-
 	runClient, err := client.RunGadget(connCtx)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		return nil, err
 	}
 
-	controlRequest := &api.GadgetControlRequest{Event: &api.GadgetControlRequest_RunRequest{RunRequest: runRequest}}
+	var controlRequest *api.GadgetControlRequest
+
+	interactive := true
+	if gadgetCtx.UseInstance() {
+		gadgetCtx.Logger().Debugf("attaching to gadget instance %s", gadgetCtx.ImageName())
+		controlRequest = &api.GadgetControlRequest{
+			Event: &api.GadgetControlRequest_AttachRequest{
+				AttachRequest: &api.GadgetAttachRequest{
+					Id:      gadgetCtx.ImageName(),
+					Version: api.VersionGadgetRunProtocol,
+				},
+			},
+		}
+		interactive = false
+	} else {
+		controlRequest = &api.GadgetControlRequest{
+			Event: &api.GadgetControlRequest_RunRequest{
+				RunRequest: &api.GadgetRunRequest{
+					ImageName:   gadgetCtx.ImageName(),
+					ParamValues: allParams,
+					Args:        gadgetCtx.Args(),
+					LogLevel:    uint32(gadgetCtx.Logger().GetLevel()),
+					Timeout:     int64(gadgetCtx.Timeout()),
+					Version:     api.VersionGadgetRunProtocol,
+				},
+			},
+		}
+	}
+
 	err = runClient.Send(controlRequest)
 	if err != nil {
 		return nil, err
@@ -209,15 +250,19 @@ func (r *Runtime) runGadget(gadgetCtx runtime.GadgetContext, target target, allP
 
 				// Try to load gadget info; if gadget info has already been loaded and this one
 				// doesn't match, this will terminate this particular client session
-				err = gadgetCtx.LoadGadgetInfo(gi, allParams, true)
+				err = gadgetCtx.LoadGadgetInfo(gi, allParams, true, nil)
 				if err != nil {
 					gadgetCtx.Logger().Warnf("deserizalize gadget info: %v", err)
 					continue
 				}
 				gadgetCtx.Logger().Debugf("loaded gadget info")
-				for _, ds := range gadgetCtx.GetDataSources() {
+				for _, ds := range gadgetCtx.GetAllDataSources() {
 					gadgetCtx.Logger().Debugf("registered ds %s", ds.Name())
-					dsMap[dsNameMap[ds.Name()]] = ds
+					if dsId, ok := dsNameMap[ds.Name()]; ok {
+						dsMap[dsId] = ds
+					} else {
+						gadgetCtx.Logger().Debugf("datasource %s not found in gadget info", ds.Name())
+					}
 				}
 				initialized = true
 			default:
@@ -236,19 +281,25 @@ func (r *Runtime) runGadget(gadgetCtx runtime.GadgetContext, target target, allP
 		gadgetCtx.Logger().Debugf("%-20s | done from server side (%v)", target.node, doneErr)
 		runErr = doneErr
 	case <-gadgetCtx.Context().Done():
-		// Send stop request
-		gadgetCtx.Logger().Debugf("%-20s | sending stop request", target.node)
-		controlRequest := &api.GadgetControlRequest{Event: &api.GadgetControlRequest_StopRequest{StopRequest: &api.GadgetStopRequest{}}}
-		runClient.Send(controlRequest)
+		if interactive {
+			// Send stop request
+			gadgetCtx.Logger().Debugf("%-20s | sending stop request", target.node)
+			controlRequest := &api.GadgetControlRequest{Event: &api.GadgetControlRequest_StopRequest{StopRequest: &api.GadgetStopRequest{}}}
+			runClient.Send(controlRequest)
 
-		// Wait for done or timeout
-		select {
-		case doneErr := <-doneChan:
-			gadgetCtx.Logger().Debugf("%-20s | done after cancel request (%v)", target.node, doneErr)
-			runErr = doneErr
-		case <-time.After(ResultTimeout * time.Second):
-			return nil, fmt.Errorf("timed out while getting result")
+			// Wait for done or timeout
+			select {
+			case doneErr := <-doneChan:
+				gadgetCtx.Logger().Debugf("%-20s | done after cancel request (%v)", target.node, doneErr)
+				runErr = doneErr
+			case <-time.After(ResultTimeout * time.Second):
+				return nil, fmt.Errorf("timed out while getting result")
+			}
 		}
 	}
 	return result, runErr
+}
+
+func (r *Runtime) IsClient() bool {
+	return true
 }

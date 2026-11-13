@@ -1,0 +1,28 @@
+name: Links check
+permissions: read-all
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *'
+
+jobs:
+  check-link:
+    name: Links check
+    if: github.repository == 'inspektor-gadget/inspektor-gadget'
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Check that there are not broken links
+      uses: gaurav-nelson/github-action-markdown-link-check@3c3b66f1f7d0900e37b71eca45b63ea9eedfce31 # v1.0.17
+      with:
+        config-file: .github/workflows/mlc_config.json
+        use-quiet-mode: 'yes'
+        # check if a web page has been deleted or moved, so we can update our documentation accordingly
+        check-modified-files-only: 'no'
+        base-branch: 'main'

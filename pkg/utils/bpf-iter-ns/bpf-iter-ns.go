@@ -17,6 +17,7 @@ package bpfiterns
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf/link"
@@ -50,16 +52,52 @@ func Read(iter *link.Iter) ([]byte, error) {
 
 // ReadOnCurrentPidNs reads the iterator in the current pid namespace.
 func ReadOnCurrentPidNs(iter *link.Iter) ([]byte, error) {
+	var b bytes.Buffer
+	err := ReadOnCurrentPidNsInto(iter, &b)
+	if err != nil {
+		return nil, err
+	}
+	return b.Bytes(), nil
+}
+
+// DiscardOnCurrentPidNs reads the iterator in the current pid namespace and discards the output.
+func DiscardOnCurrentPidNs(iter *link.Iter) error {
+	return ReadOnCurrentPidNsInto(iter, io.Discard)
+}
+
+// ReadOnCurrentPidNsInto reads the iterator in the current pid namespace and writes it to w.
+func ReadOnCurrentPidNsInto(iter *link.Iter, w io.Writer) error {
 	file, err := iter.Open()
 	if err != nil {
-		return nil, fmt.Errorf("open BPF iterator: %w", err)
+		return fmt.Errorf("open BPF iterator: %w", err)
 	}
 	defer file.Close()
-	buf, err := io.ReadAll(file)
-	if err != nil {
-		return nil, fmt.Errorf("read BPF iterator: %w", err)
+
+	r := bufio.NewReader(file)
+	buf := make([]byte, 8192)
+	// we cannot use io.ReadAll() since reading from the BPF iterator file could return more than
+	// one million records are iterated on and the OS will return EAGAIN.
+	// We need to continue reading with another sys call and accumulating data.
+	// Rootcause: https://github.com/torvalds/linux/commit/e679654a704e5bd676ea6446fa7b764cbabf168a
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			_, err := w.Write(buf[:n])
+			if err != nil {
+				return fmt.Errorf("write BPF iterator output: %w", err)
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if errors.Is(err, syscall.EAGAIN) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read BPF iterator: %w", err)
+		}
 	}
-	return buf, err
+	return nil
 }
 
 // ReadOnHostPidNs reads the iterator in the host pid namespace.

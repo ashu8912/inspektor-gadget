@@ -1,4 +1,4 @@
-// Copyright 2022-2023 The Inspektor Gadget authors
+// Copyright 2022-2025 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -49,6 +49,9 @@ type ParamDesc struct {
 	// Key is the name under which this param is registered; this will also be the key when
 	// getting a key/value map
 	Key string `json:"key" yaml:"key"`
+
+	// AlternativeKey is an optional alternative key for this parameter
+	AlternativeKey string `json:"alternativeKey" yaml:"alternativeKey,omitempty"`
 
 	// Alias is a shortcut for this parameter, usually a single character used for command line
 	// interfaces
@@ -172,7 +175,7 @@ func (p *ParamDescs) Add(other ...*ParamDesc) {
 // Get returns the parameter with the given key or nil
 func (p *ParamDescs) Get(key string) *ParamDesc {
 	for _, param := range *p {
-		if key == param.Key {
+		if key == param.Key || key == param.AlternativeKey {
 			return param
 		}
 	}
@@ -205,7 +208,7 @@ func (p *Params) AddKeyValuePair(key, value string) {
 // Get returns the parameter with the given key or nil
 func (p *Params) Get(key string) *Param {
 	for _, param := range *p {
-		if key == param.Key {
+		if key == param.Key || key == param.AlternativeKey {
 			return param
 		}
 	}
@@ -214,7 +217,7 @@ func (p *Params) Get(key string) *Param {
 
 func (p *Params) Set(key, val string) error {
 	for _, e := range *p {
-		if e.Key == key {
+		if e.Key == key || e.AlternativeKey == key {
 			return e.Set(val)
 		}
 	}
@@ -279,9 +282,28 @@ func b64DecodeAndDecompress(s string) ([]byte, error) {
 
 func (p *Params) CopyToMap(target map[string]string, prefix string) {
 	for _, param := range *p {
+		if target[prefix+param.Key] != "" {
+			continue
+		}
+
 		if param.TypeHint == TypeBytes {
 			target[prefix+param.Key] = compressAndB64Encode(param.String())
 		} else {
+			target[prefix+param.Key] = param.String()
+		}
+	}
+}
+
+// CopyToMapExt works like CopyToMap but additionally can return string slices
+// given the TypeHint is set to TypeStringSlice
+func (p *Params) CopyToMapExt(target map[string]any, prefix string) {
+	for _, param := range *p {
+		switch param.TypeHint {
+		case TypeBytes:
+			target[prefix+param.Key] = compressAndB64Encode(param.String())
+		case TypeStringSlice:
+			target[prefix+param.Key] = SplitStringSlice(param.String())
+		default:
 			target[prefix+param.Key] = param.String()
 		}
 	}
@@ -474,10 +496,7 @@ func (p *Param) AsBytes() []byte {
 }
 
 func (p *Param) AsStringSlice() []string {
-	if p.value == "" {
-		return []string{}
-	}
-	return strings.Split(p.value, ",")
+	return SplitStringSlice(p.value)
 }
 
 func (p *Param) AsBool() bool {
@@ -528,4 +547,39 @@ func (p *Param) AsDuration() time.Duration {
 
 func (p *Param) AsIP() net.IP {
 	return net.ParseIP(p.value)
+}
+
+// SplitStringSlice splits a string into multiple strings that were
+// delimited by comma characters.
+func SplitStringSlice(s string) []string {
+	if len(s) == 0 {
+		return []string{}
+	}
+	var result []string
+	var b strings.Builder
+	var escape bool
+	for _, c := range s {
+		if escape {
+			escape = false
+			if c != ',' && c != '\\' {
+				// Leave escape char alone if not a comma or backslash
+				b.WriteByte('\\')
+			}
+			b.WriteRune(c)
+			continue
+		}
+		switch c {
+		case '\\':
+			escape = true
+		case ',':
+			result = append(result, b.String())
+			b.Reset()
+		default:
+			b.WriteRune(c)
+		}
+	}
+	if b.Len() > 0 {
+		result = append(result, b.String())
+	}
+	return result
 }

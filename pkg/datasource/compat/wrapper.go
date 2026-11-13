@@ -20,14 +20,19 @@ import (
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/environment"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
+	metadatav1 "github.com/inspektor-gadget/inspektor-gadget/pkg/metadata/v1"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
+	ebpftypes "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/ebpf/types"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 )
 
-// Keep this aligned with include/gadget/types.h
+func init() {
+	datasource.RegisterAnnotationTemplateCallback(metadatav1.ApplyAnnotationsTemplate)
+}
+
 const (
-	MntNsIdType = "type:gadget_mntns_id"
-	NetNsIdType = "type:gadget_netns_id"
+	MntNsIdType = "type:" + ebpftypes.MntNsTypeName
+	NetNsIdType = "type:" + ebpftypes.NetNsTypeName
 )
 
 type EventWrapperBase struct {
@@ -41,14 +46,19 @@ type EventWrapperBase struct {
 	containernameAccessor        datasource.FieldAccessor
 	runtimenameAccessor          datasource.FieldAccessor
 	containeridAccessor          datasource.FieldAccessor
+	containerpidAccessor         datasource.FieldAccessor
 	containerimagenameAccessor   datasource.FieldAccessor
 	containerimagedigestAccessor datasource.FieldAccessor
+	containerStartedAtAccessor   datasource.FieldAccessor
 	hostNetworkAccessor          datasource.FieldAccessor
+	podLabelsAccessor            datasource.FieldAccessor
+	ownerKindAccessor            datasource.FieldAccessor
+	ownerNameAccessor            datasource.FieldAccessor
 }
 
 type (
-	MntNsEnrichFunc func(event operators.ContainerInfoFromMountNSID)
-	NetNsEnrichFunc func(event operators.ContainerInfoFromNetNSID)
+	MntNsEnrichFunc func(event operators.ContainerInfoFromMountNSID) bool
+	NetNsEnrichFunc func(event operators.ContainerInfoFromNetNSID) bool
 )
 
 // GetEventWrappers checks for data sources containing references to mntns/netns that we could enrich data for
@@ -110,11 +120,18 @@ func Subscribe(
 			EventWrapperBase: wrapper,
 		}
 		ds.Subscribe(func(ds datasource.DataSource, data datasource.Data) error {
+			// We collect the mount and network namespace of the container to
+			// perform the enrichment. Depending on the gadget, one of them
+			// could not be available. In K8s, the mount namespace is more
+			// specific than the network namespace as multiple containers in the
+			// same pod share the same network namespace. So, if the enrichment
+			// by mount ns is successful, we skip the enrichment by net ns.
+			enriched := false
 			wr.Data = data
 			if wrapper.MntnsidAccessor != nil {
-				mntNsEnrichFunc(&wr)
+				enriched = mntNsEnrichFunc(&wr)
 			}
-			if wrapper.NetnsidAccessor != nil {
+			if !enriched && wrapper.NetnsidAccessor != nil {
 				netNsEnrichFunc(&wr)
 			}
 			return nil
@@ -134,7 +151,14 @@ func WrapAccessors(source datasource.DataSource, mntnsidAccessor datasource.Fiel
 		return nil, err
 	}
 
-	ev.nodeAccessor, err = k8s.AddSubField("node", api.Kind_String, datasource.WithTags("kubernetes"))
+	ev.nodeAccessor, err = k8s.AddSubField("node",
+		api.Kind_String,
+		datasource.WithTags("kubernetes"),
+		datasource.WithAnnotations(map[string]string{
+			metadatav1.TemplateAnnotation: "node",
+		}),
+		datasource.WithOrder(-31),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +167,7 @@ func WrapAccessors(source datasource.DataSource, mntnsidAccessor datasource.Fiel
 		api.Kind_String,
 		datasource.WithTags("kubernetes"),
 		datasource.WithAnnotations(map[string]string{
-			"columns.template": "namespace",
+			metadatav1.TemplateAnnotation: "namespace",
 		}),
 		datasource.WithOrder(-30),
 	)
@@ -151,11 +175,11 @@ func WrapAccessors(source datasource.DataSource, mntnsidAccessor datasource.Fiel
 		return nil, err
 	}
 	ev.podnameAccessor, err = k8s.AddSubField(
-		"pod",
+		"podName",
 		api.Kind_String,
 		datasource.WithTags("kubernetes"),
 		datasource.WithAnnotations(map[string]string{
-			"columns.template": "pod",
+			metadatav1.TemplateAnnotation: "pod",
 		}),
 		datasource.WithOrder(-29),
 	)
@@ -163,11 +187,11 @@ func WrapAccessors(source datasource.DataSource, mntnsidAccessor datasource.Fiel
 		return nil, err
 	}
 	ev.containernameAccessorK8s, err = k8s.AddSubField(
-		"container",
+		"containerName",
 		api.Kind_String,
 		datasource.WithTags("kubernetes"),
 		datasource.WithAnnotations(map[string]string{
-			"columns.template": "container",
+			metadatav1.TemplateAnnotation: "container",
 		}),
 		datasource.WithOrder(-28),
 	)
@@ -180,6 +204,39 @@ func WrapAccessors(source datasource.DataSource, mntnsidAccessor datasource.Fiel
 		datasource.WithTags("kubernetes"),
 		datasource.WithFlags(datasource.FieldFlagHidden),
 		datasource.WithOrder(-27),
+	)
+	if err != nil {
+		return nil, err
+	}
+	ev.podLabelsAccessor, err = k8s.AddSubField(
+		"podLabels",
+		api.Kind_String,
+		datasource.WithTags("kubernetes"),
+		datasource.WithFlags(datasource.FieldFlagHidden),
+		datasource.WithOrder(-26),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	owner, err := k8s.AddSubField("owner", api.Kind_Invalid, datasource.WithFlags(datasource.FieldFlagEmpty))
+	if err != nil {
+		return nil, err
+	}
+	ev.ownerKindAccessor, err = owner.AddSubField(
+		"kind",
+		api.Kind_String,
+		datasource.WithTags("kubernetes"),
+		datasource.WithFlags(datasource.FieldFlagHidden),
+	)
+	if err != nil {
+		return nil, err
+	}
+	ev.ownerNameAccessor, err = owner.AddSubField(
+		"name",
+		api.Kind_String,
+		datasource.WithTags("kubernetes"),
+		datasource.WithFlags(datasource.FieldFlagHidden),
 	)
 	if err != nil {
 		return nil, err
@@ -199,9 +256,9 @@ func WrapAccessors(source datasource.DataSource, mntnsidAccessor datasource.Fiel
 		"containerName",
 		api.Kind_String,
 		datasource.WithAnnotations(map[string]string{
-			"columns.template": "container",
+			metadatav1.TemplateAnnotation: "container",
 		}),
-		datasource.WithOrder(-26),
+		datasource.WithOrder(-27),
 	)
 	if err != nil {
 		return nil, err
@@ -210,11 +267,11 @@ func WrapAccessors(source datasource.DataSource, mntnsidAccessor datasource.Fiel
 		"runtimeName",
 		api.Kind_String,
 		datasource.WithAnnotations(map[string]string{
-			"columns.width": "19",
-			"columns.fixed": "true",
+			metadatav1.ColumnsWidthAnnotation: "19",
+			metadatav1.ColumnsFixedAnnotation: "true",
 		}),
 		datasource.WithFlags(datasource.FieldFlagHidden),
-		datasource.WithOrder(-25),
+		datasource.WithOrder(-26),
 	)
 	if err != nil {
 		return nil, err
@@ -223,10 +280,21 @@ func WrapAccessors(source datasource.DataSource, mntnsidAccessor datasource.Fiel
 		"containerId",
 		api.Kind_String,
 		datasource.WithAnnotations(map[string]string{
-			"columns.width":    "13",
-			"columns.maxWidth": "64",
+			metadatav1.ColumnsWidthAnnotation:    "13",
+			metadatav1.ColumnsMaxWidthAnnotation: "64",
 		}),
 		datasource.WithFlags(datasource.FieldFlagHidden),
+		datasource.WithOrder(-25),
+	)
+	if err != nil {
+		return nil, err
+	}
+	ev.containerpidAccessor, err = runtime.AddSubField(
+		"containerPid",
+		api.Kind_Uint32,
+		datasource.WithAnnotations(map[string]string{
+			metadatav1.TemplateAnnotation: "containerPid",
+		}),
 		datasource.WithOrder(-24),
 	)
 	if err != nil {
@@ -246,6 +314,15 @@ func WrapAccessors(source datasource.DataSource, mntnsidAccessor datasource.Fiel
 		api.Kind_String,
 		datasource.WithFlags(datasource.FieldFlagHidden),
 		datasource.WithOrder(-22),
+	)
+	if err != nil {
+		return nil, err
+	}
+	ev.containerStartedAtAccessor, err = runtime.AddSubField(
+		"containerStartedAt",
+		api.Kind_Int64,
+		datasource.WithFlags(datasource.FieldFlagHidden),
+		datasource.WithOrder(-21),
 	)
 	if err != nil {
 		return nil, err
@@ -303,6 +380,20 @@ func (ev *EventWrapper) SetPodMetadata(container types.Container) {
 				ev.hostNetworkAccessor.PutInt8(ev.Data, 1)
 			}
 		}
+		ownerKindRequest := ev.ownerKindAccessor.IsRequested()
+		ownerNameRequest := ev.ownerNameAccessor.IsRequested()
+		if ownerKindRequest || ownerNameRequest {
+			owner := container.K8sOwnerReference()
+			if ownerKindRequest {
+				ev.ownerKindAccessor.PutString(ev.Data, owner.Kind)
+			}
+			if ownerNameRequest {
+				ev.ownerNameAccessor.PutString(ev.Data, owner.Name)
+			}
+		}
+		if ev.podLabelsAccessor.IsRequested() {
+			ev.podLabelsAccessor.PutString(ev.Data, container.K8sPodLabelsAsString())
+		}
 	}
 	rt := container.RuntimeMetadata()
 	if rt != nil {
@@ -321,10 +412,17 @@ func (ev *EventWrapper) SetPodMetadata(container types.Container) {
 		if ev.containerimagedigestAccessor.IsRequested() {
 			ev.containerimagedigestAccessor.Set(ev.Data, []byte(rt.ContainerImageDigest))
 		}
+		if ev.containerStartedAtAccessor.IsRequested() {
+			ev.containerStartedAtAccessor.PutInt64(ev.Data, int64(rt.ContainerStartedAt))
+		}
 	}
 }
 
 func (ev *EventWrapper) SetContainerMetadata(container types.Container) {
+	if ev.containerpidAccessor.IsRequested() {
+		ev.containerpidAccessor.PutUint32(ev.Data, container.ContainerPid())
+	}
+
 	ev.SetPodMetadata(container)
 }
 

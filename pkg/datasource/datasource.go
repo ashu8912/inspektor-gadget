@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"io"
 
+	"github.com/spf13/viper"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
@@ -30,7 +31,18 @@ const (
 	TypeUndefined Type = iota
 	TypeSingle
 	TypeArray
-	TypeMetrics
+)
+
+type dsError string
+
+func (err dsError) Error() string {
+	return string(err)
+}
+
+const (
+	// ErrDiscard can be returned on subscription callbacks to tell the datasource to discard the entity (packet, array
+	// or single event, depending on the subscription)
+	ErrDiscard = dsError("discarded")
 )
 
 type Data interface {
@@ -53,6 +65,15 @@ type DataArray interface {
 
 	// Get returns the element at the given index
 	Get(int) Data
+
+	// Swap swaps two elements of the array by their index
+	Swap(i, j int)
+
+	// Resize resizes the array to the given size. If the new size is smaller
+	// than the current size, the array will be truncated and the elements
+	// beyond the new size will be released. Currently, it does not support
+	// resizing to a larger size.
+	Resize(int) error
 }
 
 type Packet interface {
@@ -151,14 +172,25 @@ type DataSource interface {
 
 	Accessors(rootOnly bool) []FieldAccessor
 
-	IsRequested() bool
+	Unreference()
+	IsReferenced() bool
 
 	// ByteOrder returns a binary accessor using the byte order of the creator of the DataSource
 	ByteOrder() binary.ByteOrder
 
 	AddAnnotation(key, value string)
-	AddTag(tag string)
+	AddTags(tags ...string)
 
 	Annotations() map[string]string
 	Tags() []string
+
+	CopyFieldsTo(DataSource) error
+}
+
+type DataSourceOption func(*dataSource)
+
+func WithConfig(v *viper.Viper) DataSourceOption {
+	return func(source *dataSource) {
+		source.config = v
+	}
 }

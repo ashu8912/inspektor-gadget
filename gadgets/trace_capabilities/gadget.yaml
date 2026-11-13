@@ -1,0 +1,73 @@
+name: trace capabilities
+description: trace security capability checks
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/trace_capabilities
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/trace_capabilities
+datasources:
+  capabilities:
+    fields:
+      current_userns:
+        annotations:
+          template: ns
+      target_userns:
+        annotations:
+          template: ns
+      cap_effective_raw:
+        annotations:
+          columns.hidden: true
+      cap_effective:
+        annotations:
+          columns.width: 20
+          columns.hidden: true
+      cap_raw:
+        annotations:
+          columns.hidden: true
+      cap:
+        annotations:
+          description: capability name in a human friendly format
+          value.one-of: 'CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID,
+            CAP_KILL, CAP_SETGID, CAP_SETUID, CAP_SETPCAP, CAP_LINUX_IMMUTABLE, CAP_NET_BIND_SERVICE,
+            CAP_NET_BROADCAST, CAP_NET_ADMIN, CAP_NET_RAW, CAP_IPC_LOCK, CAP_IPC_OWNER, CAP_SYS_MODULE,
+            CAP_SYS_RAWIO, CAP_SYS_CHROOT, CAP_SYS_PTRACE, CAP_SYS_PACCT, CAP_SYS_ADMIN, CAP_SYS_BOOT,
+            CAP_SYS_NICE, CAP_SYS_RESOURCE, CAP_SYS_TIME, CAP_SYS_TTY_CONFIG, CAP_MKNOD, CAP_LEASE,
+            CAP_AUDIT_WRITE, CAP_AUDIT_CONTROL, CAP_SETFCAP, CAP_MAC_OVERRIDE, CAP_MAC_ADMIN, CAP_SYSLOG,
+            CAP_WAKE_ALARM, CAP_BLOCK_SUSPEND, CAP_AUDIT_READ, CAP_PERFMON, CAP_BPF, CAP_CHECKPOINT_RESTORE'
+      audit:
+        annotations:
+          columns.width: 11
+      insetid:
+        annotations:
+          columns.width: 11
+          columns.hidden: true
+      syscall_raw:
+        annotations:
+          columns.hidden: true
+      syscall:
+        annotations:
+          columns.width: 20
+      kstack_raw:
+        annotations:
+          columns.hidden: true
+      kstack:
+        annotations:
+          description: kernel stack
+          columns.width: 10
+          columns.hidden: true
+      capable:
+        annotations:
+          description: if the process has the requested capability
+          columns.width: 10
+params:
+  ebpf:
+    audit_only:
+      key: audit-only
+      defaultValue: "false"
+      description: Only show audit checks
+    collect_kstack:
+      key: collect-kstack
+      defaultValue: "true"
+      description: Collect kernel stack traces
+    unique:
+      key: unique
+      defaultValue: "false"
+      description: Only show a capability once on the same container

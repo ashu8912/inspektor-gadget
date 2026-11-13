@@ -1,101 +1,141 @@
 name: trace dns
 description: trace dns requests and responses
 homepageURL: https://inspektor-gadget.io/
-documentationURL: https://inspektor-gadget.io/docs/latest/
-sourceURL: https://github.com/inspektor-gadget/inspektor-gadget
-tracers:
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/trace_dns
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/trace_dns
+datasources:
   dns:
-    mapName: events
-    structName: event_t
-structs:
-  event_t:
+    annotations:
+      ebpf.rest.name: data
+      ebpf.rest.len: data_len
     fields:
-    - name: timestamp
-      attributes:
-        template: timestamp
-    - name: src
-      description: Source endpoint
-      attributes:
-        minWidth: 24
-        maxWidth: 50
-    - name: dst
-      description: Destination endpoint
-      attributes:
-        minWidth: 24
-        maxWidth: 50
-    - name: pid
-      description: PID of the process that sent the request
-      attributes:
-        template: pid
-    - name: task
-      attributes:
-        template: comm
-    - name: uid
-      attributes:
-        hidden: true
-        template: uid
-    - name: gid
-      attributes:
-        hidden: true
-        template: uid
-    - name: name
-      attributes:
-        width: 30
-    - name: qr
-      attributes:
-        width: 2
-    - name: pkt_type
-      attributes:
-        width: 8
-    - name: rcode
-      attributes:
-        width: 8
-    - name: latency_ns
-      attributes:
-        width: 8
-        hidden: true
-    - name: anaddr
-      attributes:
-        width: 16
-    - name: netns
-      description: Network namespace inode id
-      attributes:
-        template: ns
-    - name: mntns_id
-      description: Mount namespace inode id
-      attributes:
-        template: ns
-    - name: tid
-      description: 'TODO: Fill field description'
-      attributes:
-        width: 16
-        alignment: left
-        hidden: true
-        ellipsis: end
-    - name: id
-      description: 'TODO: Fill field description'
-      attributes:
-        width: 16
-        alignment: left
-        hidden: true
-        ellipsis: end
-    - name: qtype
-      description: 'TODO: Fill field description'
-      attributes:
-        width: 16
-        alignment: left
-        ellipsis: end
-    - name: ancount
-      description: 'TODO: Fill field description'
-      attributes:
-        width: 16
-        alignment: left
-        hidden: true
-        ellipsis: end
-    - name: anaddrcount
-      description: 'TODO: Fill field description'
-      attributes:
-        width: 16
-        alignment: left
-        hidden: true
-        ellipsis: end
+      cwd:
+        annotations:
+          description: The current working directory of the process (require --paths flag)
+          columns.width: 64
+          columns.hidden: "true"
+          columns.alignment: left
+      exepath:
+        annotations:
+          description: The executable file of the process (require --paths flag)
+          columns.width: 64
+          columns.hidden: "true"
+          columns.alignment: left
+      addresses:
+        annotations:
+          description: >-
+            Comma-separated list of IP addresses returned in the DNS responses
+            (A and AAAA records, see qtype field). This field is populated only
+            on DNS response packets; it will be empty for pure queries.
+      data:
+        annotations:
+          description: DNS packet data. It's only for internal use and not intended for user consumption.
+          columns.hidden: "true"
+          json.skip: "true"
+      data_len:
+        annotations:
+          description: Length of the DNS packet data. It's only for internal use and not intended for user consumption.
+          columns.hidden: "true"
+          json.skip: "true"
+      dns_off:
+        annotations:
+          description: Offset of the DNS packet data in the network packet. It's only for internal use and not intended for user consumption.
+          columns.hidden: "true"
+          json.skip: "true"
+      dst:
+        annotations:
+          description: Destination endpoint
+          template: l4endpoint
+      id:
+        annotations:
+          description: DNS query/response ID, used to match queries with responses
+          columns.hidden: "true"
+      latency_ns:
+        annotations:
+          description: DNS latency in nanoseconds, calculated as the difference between the DNS response and the corresponding query.
+      latency_ns_raw:
+        annotations:
+          columns.hidden: "true"
+          description: Raw numeric latency_ns value
+      name:
+        annotations:
+          description: Domain name being queried in the DNS request or response.
+          columns.width: "30"
+      num_answers:
+        annotations:
+          columns.hidden: "true"
+          description: Number of answers in the DNS response. Empty for DNS queries.
+      pkt_type:
+        annotations:
+          description: >-
+            Packet direction as classified by the kernel's skb->pkt_type. For
+            DNS packets, the most common pkt_type values are HOST and OUTGOING.
+            HOST indicates a DNS query or response arriving at the container (or
+            host), while OUTGOING represents a DNS packet leaving the container
+            (or host). Other pkt_type values (e.g. BROADCAST, MULTICAST) may
+            appear when using mDNS or LLMNR.
+          columns.hidden: "true"
+          columns.width: "8"
+          value.one-of: "HOST, BROADCAST, MULTICAST, OTHERHOST, OUTGOING, LOOPBACK, USER, KERNEL"
+      pkt_type_raw:
+        annotations:
+          description: Raw numeric pkt_type value (0=HOST, 1=BROADCAST, 2=MULTICAST, 3=OTHERHOST, 4=OUTGOING, 5=LOOPBACK, 6=USER, 7=KERNEL)
+          value.one-of: "0, 1, 2, 3, 4, 5, 6, 7"
+          columns.hidden: "true"
+      qr:
+        annotations:
+          description: Specifies whether this message is a query (Q), or a response (R).
+          value.one-of: "Q, R"
+          columns.minwidth: "2"
+          columns.width: "2"
+      qr_raw:
+        annotations:
+          description: Raw numeric qr value (0=Q, 1=R)
+          value.one-of: "0, 1"
+          columns.hidden: "true"
+      qtype:
+        annotations:
+          description: Query type
+          value.one-of: "A, NS, CNAME, SOA, PTR, MX, TXT, AAAA, SRV, OPT, WKS, HINFO, MINFO, AXFR, ALL"
+      qtype_raw:
+        annotations:
+          description: Raw numeric qtype value (1=A, 2=NS, 5=CNAME, 6=SOA, 12=PTR, 15=MX, 16=TXT, 28=AAAA, 33=SRV, 41=OPT, 44=WKS, 13=HINFO, 14=MINFO, 252=AXFR, 255=ALL)
+          value.one-of: "1, 2, 5, 6, 12, 15, 16, 28, 33, 41, 44, 13, 14, 252, 255"
+          columns.hidden: "true"
+      rcode:
+        annotations:
+          description: Response code indicating the status of the DNS response. Empty for queries.
+          value.one-of: "Success, FormatError, ServerFailure, NameError, NotImplemented, Refused"
+          columns.minwidth: "8"
+          columns.width: "8"
+      rcode_raw:
+        annotations:
+          description: Raw numeric rcode value (0=Success, 1=FormatError, 2=ServerFailure, 3=NameError, 4=NotImplemented, 5=Refused)
+          value.one-of: "0, 1, 2, 3, 4, 5"
+          columns.hidden: "true"
+      src:
+        annotations:
+          description: Source endpoint
+          template: l4endpoint
+      tc:
+        annotations:
+          columns.hidden: "true"
+          description: Truncated Flag
+      ra:
+        annotations:
+          columns.hidden: "true"
+          description: Recursion Available Flag
+      rd:
+        annotations:
+          columns.hidden: "true"
+          description: Recursion Desired Flag
+      nameserver:
+        annotations:
+          description: Nameserver for the DNS request
+
+params:
+  ebpf:
+    paths:
+      key: paths
+      defaultValue: "false"
+      description: Show current working directory and executable path.

@@ -13,75 +13,104 @@
 /cmd/common/ @flyth
 /cmd/ig/ @blanquicet
 /Dockerfiles/ @eiffel-fl @mqasimsarfraz
+
+# docs
 /docs/ @mauriciovasquezbernal
+/docs/gadget-devel/ @mauriciovasquezbernal
 /docs/images/architecture/ @eiffel-fl
+/docs/reference/ @blanquicet
+/docs/reference/restricting-gadgets.mdx @eiffel-fl
+/docs/reference/verify-assets.mdx @eiffel-fl
+
 /examples/ @mauriciovasquezbernal
 /examples/container-collection/ @alban
 /examples/container-hook/ @alban
 /examples/kube-container-collection/ @alban
 /examples/runc-hook/ @alban
 /gadget-container/hooks/ @alban
-/gadgets/ @mauriciovasquezbernal
+
+# gadgets
+/gadgets/audit_seccomp/ @alban
+/gadgets/ci/ @mauriciovasquezbernal
+/gadgets/deadlock/ @alban
+/gadgets/fsnotify/ @alban
+/gadgets/profile_blockio/ @eiffel-fl @flyth
+/gadgets/profile_tcprtt/ @blanquicet
+/gadgets/snapshot_process/ @alban @mauriciovasquezbernal
+/gadgets/snapshot_socket/ @alban @blanquicet
+/gadgets/testing/ @mauriciovasquezbernal @matthyx
+/gadgets/top_blockio/ @burak-ok
+/gadgets/top_file/ @blanquicet @mauriciovasquezbernal
+/gadgets/top_tcp/ @burak-ok
+/gadgets/trace_bind/ @mauriciovasquezbernal
+/gadgets/trace_capabilities/ @alban
+/gadgets/trace_dns/ @alban @mauriciovasquezbernal
+/gadgets/trace_exec/ @alban
+/gadgets/trace_fsslower/ @mauriciovasquezbernal
+/gadgets/trace_lsm/ @alban
+/gadgets/trace_malloc/ @alban
+/gadgets/trace_mount/ @eiffel-fl
+/gadgets/trace_oomkill/ @eiffel-fl
+/gadgets/trace_open/ @mauriciovasquezbernal
+/gadgets/trace_signal/ @eiffel-fl
+/gadgets/trace_sni/ @alban @blanquicet
+/gadgets/trace_ssl/ @alban
+/gadgets/trace_tcp/ @mauriciovasquezbernal
+/gadgets/trace_tcpconnect/ @mauriciovasquezbernal
+/gadgets/trace_tcpdrop/ @alban
+/gadgets/trace_tcpretrans/ @alban
+
 /integration/ @blanquicet @mqasimsarfraz
-/integration/inspektor-gadget/ @eiffel-fl
-/internal/benchmarks/ @alban
-/pkg/amd64/ @eiffel-fl
-/pkg/arm64/ @eiffel-fl
+/internal/test/ @mauriciovasquezbernal
 /pkg/columns/ @flyth
 /pkg/container-collection/ @alban @blanquicet @mqasimsarfraz
-/pkg/container-hook/ @alban
+/pkg/container-hook/ @alban @matthyx
 /pkg/container-utils/ @blanquicet @mqasimsarfraz
 /pkg/container-utils/containerd/ @burak-ok
+/pkg/datasource/ @flyth @matthyx
 /pkg/gadget-context/ @flyth
-/pkg/gadget-registry/ @flyth
 /pkg/gadget-service/ @flyth
-/pkg/gadgets/advise/networkpolicy/ @alban
-/pkg/gadgets/advise/seccomp/ @alban
-/pkg/gadgets/audit/seccomp/ @alban
-/pkg/gadgets/common/ @mauriciovasquezbernal
-/pkg/gadgets/profile/tcprtt/ @blanquicet
-/pkg/gadgets/prometheus/ @mauriciovasquezbernal
-/pkg/gadgets/run/ @burak-ok @mauriciovasquezbernal
-/pkg/gadgets/script/ @mauriciovasquezbernal
-/pkg/gadgets/snapshot/process/ @alban @mauriciovasquezbernal
-/pkg/gadgets/snapshot/socket/ @alban @blanquicet
-/pkg/gadgets/test/ @mauriciovasquezbernal
-/pkg/gadgets/top/file/ @mauriciovasquezbernal
-/pkg/gadgets/trace/capabilities/ @alban
-/pkg/gadgets/trace/dns/ @alban @blanquicet
-/pkg/gadgets/trace/exec/ @mauriciovasquezbernal
-/pkg/gadgets/trace/network/ @alban @blanquicet
-/pkg/gadgets/trace/oomkill/ @eiffel-fl
-/pkg/gadgets/trace/open/ @mauriciovasquezbernal
-/pkg/gadgets/trace/signal/ @eiffel-fl
-/pkg/gadgets/trace/sni/ @alban @blanquicet
-/pkg/gadgets/trace/tcp/ @mauriciovasquezbernal
-/pkg/gadgets/trace/tcpconnect/ @mauriciovasquezbernal
-/pkg/gadgets/trace/tcpdrop/ @alban
-/pkg/gadgets/traceloop/ @eiffel-fl
 /pkg/gadgettracermanager/ @mauriciovasquezbernal
 /pkg/histogram/ @blanquicet
-/pkg/ig-manager/ @blanquicet
 /pkg/kallsyms/ @alban
 /pkg/kfilefields/ @alban @mqasimsarfraz
-/pkg/netnsenter/ @alban
 /pkg/networktracer/ @alban @blanquicet
+
+# operators
 /pkg/operators/ @flyth
-/pkg/operators/kubeipresolver/ @burak-ok
+/pkg/operators/btfgen/ @mauriciovasquezbernal
+/pkg/operators/cli/ @blanquicet @flyth
+/pkg/operators/combiner/ @blanquicet
+/pkg/operators/common/ @burak-ok
+/pkg/operators/ebpf/ @alban @mauriciovasquezbernal @flyth
+/pkg/operators/filter/ @flyth
+/pkg/operators/formatters/ @flyth @mauriciovasquezbernal
+/pkg/operators/kubeipresolver/ @burak-ok @mqasimsarfraz
+/pkg/operators/kubemanager/ @mauriciovasquezbernal @flyth
 /pkg/operators/kubenameresolver/ @burak-ok
+/pkg/operators/limiter/ @blanquicet
+/pkg/operators/localmanager/ @mauriciovasquezbernal @flyth
+/pkg/operators/oci-handler/ @flyth
+/pkg/operators/otel-metrics/ @blanquicet @flyth
+/pkg/operators/otel-logs/ @matthyx
+/pkg/operators/simple/ @flyth
+/pkg/operators/socketenricher/ @alban
+/pkg/operators/sort/ @flyth
+/pkg/operators/uidgidresolver/ @burak-ok
+/pkg/operators/wasm/ @flyth @mauriciovasquezbernal
+
 /pkg/params/ @flyth @mauriciovasquezbernal
-/pkg/prometheus/ @mauriciovasquezbernal
 /pkg/rawsock/ @alban
 /pkg/resources/manifests/ @eiffel-fl
 /pkg/resources/rbac/ @eiffel-fl
-/pkg/runcfanotify/ @alban
 /pkg/runtime/ @flyth @mauriciovasquezbernal
+/pkg/signature/ @eiffel-fl
 /pkg/socketenricher/ @alban
 /pkg/standardgadgets/ @mauriciovasquezbernal
 /pkg/tracer-collection/ @alban
 /pkg/types/ @blanquicet
-/pkg/uprobetracer/ @alban @i-Pear
+/pkg/uprobetracer/ @alban
 /pkg/utils/bpf-iter-ns/ @alban
 /pkg/utils/host/ @alban
+/pkg/utils/nsenter/ @alban
 /tools/ @mqasimsarfraz
-/tools/demos/ @alban

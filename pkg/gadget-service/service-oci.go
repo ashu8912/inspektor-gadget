@@ -1,4 +1,4 @@
-// Copyright 2024 The Inspektor Gadget authors
+// Copyright 2024-2025 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,32 +16,96 @@ package gadgetservice
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
 	gadgetcontext "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-context"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/auth"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
+	kubemanagerpolicy "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/kubemanager/policy"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators/simple"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/params"
 )
 
+func (s *Service) initOperators() error {
+	for op, globalParams := range s.operators {
+		err := op.Init(globalParams)
+		if err != nil {
+			return fmt.Errorf("initializing operator %s: %w", op.Name(), err)
+		}
+	}
+	return nil
+}
+
+func (s *Service) GetOperatorMap() map[operators.DataOperator]*params.Params {
+	return s.operators
+}
+
 func (s *Service) GetGadgetInfo(ctx context.Context, req *api.GetGadgetInfoRequest) (*api.GetGadgetInfoResponse, error) {
+	metricAttribs := attribute.NewSet(
+		attribute.KeyValue{Key: "gadget_image", Value: attribute.StringValue(req.ImageName)},
+	)
+	defer s.ctrGetGadgetInfo.Add(context.Background(), 1, metric.WithAttributeSet(metricAttribs))
+
 	if req.Version != api.VersionGadgetInfo {
 		return nil, fmt.Errorf("expected version to be %d, got %d", api.VersionGadgetInfo, req.Version)
 	}
 
+	p, ok := peer.FromContext(ctx)
+	if ok && p.AuthInfo != nil {
+		tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
+		if !ok {
+			return nil, fmt.Errorf("authentication information is not TLS: %v", p.AuthInfo)
+		}
+
+		subject := tlsInfo.State.VerifiedChains[0][0].Subject
+		s.logger.Infof("[%s] GetGadgetInfo(%q)", subject, req.ImageName)
+	}
+
+	if req.Flags&api.GadgetInfoRequestFlagUseInstance != 0 {
+		if s.instanceMgr == nil {
+			return nil, fmt.Errorf("instance manager not initialized")
+		}
+		gi := s.instanceMgr.LookupInstance(req.ImageName)
+		if gi == nil {
+			return nil, fmt.Errorf("instance %s not found", req.ImageName)
+		}
+		if err := kubemanagerpolicy.AuthorizeParamValues(ctx, gi.ParamValues()); err != nil {
+			return nil, err
+		}
+		gadgetInfo, err := gi.GadgetInfo()
+		if err != nil {
+			return nil, err
+		}
+		return &api.GetGadgetInfoResponse{GadgetInfo: gadgetInfo}, nil
+	}
+
 	// Get all available operators
 	ops := make([]operators.DataOperator, 0)
-	for _, op := range operators.GetDataOperators() {
+	for op := range s.operators {
 		ops = append(ops, op)
 	}
 
-	gadgetCtx := gadgetcontext.New(ctx, req.ImageName, gadgetcontext.WithDataOperators(ops...))
+	// Image metadata is not namespace-scoped, and final namespace parameters are
+	// unavailable while the client discovers the gadget's parameters.
+	gadgetCtx := gadgetcontext.New(
+		auth.WithoutPolicyScope(ctx),
+		req.ImageName,
+		gadgetcontext.WithDataOperators(ops...),
+		gadgetcontext.WithAsRemoteCall(true),
+		gadgetcontext.IncludeExtraInfo(req.RequestExtraInfo),
+	)
 
 	gi, err := s.runtime.GetGadgetInfo(gadgetCtx, s.runtime.ParamDescs().ToParams(), req.ParamValues)
 	if err != nil {
@@ -56,18 +120,64 @@ func (s *Service) RunGadget(runGadget api.GadgetManager_RunGadgetServer) error {
 		return err
 	}
 
+	attachRequest := ctrl.GetAttachRequest()
+	if attachRequest != nil {
+		if attachRequest.Version != api.VersionGadgetRunProtocol {
+			return fmt.Errorf("expected version to be %d, got %d", api.VersionGadgetRunProtocol, attachRequest.Version)
+		}
+		if s.instanceMgr == nil {
+			return errors.New("instance manager not initialized")
+		}
+		gi := s.instanceMgr.LookupInstance(attachRequest.Id)
+		if gi == nil {
+			return fmt.Errorf("instance %s not found", attachRequest.Id)
+		}
+		if err := kubemanagerpolicy.AuthorizeParamValues(runGadget.Context(), gi.ParamValues()); err != nil {
+			return err
+		}
+
+		s.ctrAttachGadget.Add(context.Background(), 1)
+		return s.instanceMgr.AttachToGadgetInstance(attachRequest.Id, runGadget)
+	}
+
 	ociRequest := ctrl.GetRunRequest()
 	if ociRequest == nil {
 		return fmt.Errorf("expected first control message to be gadget run request")
+	}
+
+	metricAttribs := attribute.NewSet(
+		attribute.KeyValue{Key: "gadget_image", Value: attribute.StringValue(ociRequest.ImageName)},
+	)
+	defer s.ctrRunGadget.Add(context.Background(), 1, metric.WithAttributeSet(metricAttribs))
+
+	p, ok := peer.FromContext(runGadget.Context())
+	if ok && p.AuthInfo != nil {
+		tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
+		if !ok {
+			return fmt.Errorf("authentication information are not TLS: %v", p.AuthInfo)
+		}
+
+		subject := tlsInfo.State.VerifiedChains[0][0].Subject
+		s.logger.Infof("[%s] RunGadget(%q)", subject, ociRequest.ImageName)
 	}
 
 	if ociRequest.Version != api.VersionGadgetRunProtocol {
 		return fmt.Errorf("expected version to be %d, got %d", api.VersionGadgetRunProtocol, ociRequest.Version)
 	}
 
+	// Create payload buffer
+	outputBuffer := make(chan *api.GadgetEvent, s.eventBufferLength)
+
 	// Create a new logger that logs to gRPC and falls back to the standard logger when it failed to send the message
 	logger := logger.NewFromGenericLogger(&Logger{
-		send:           runGadget.Send,
+		send: func(event *api.GadgetEvent) error {
+			select {
+			case outputBuffer <- event:
+			default:
+				return fmt.Errorf("output buffer full")
+			}
+			return nil
+		},
 		level:          logger.Level(ociRequest.LogLevel),
 		fallbackLogger: s.logger,
 	})
@@ -78,16 +188,13 @@ func (s *Service) RunGadget(runGadget api.GadgetManager_RunGadgetServer) error {
 
 	done := make(chan bool)
 	defer func() {
-		done <- true
+		close(done)
 	}()
 
 	// Build a simple operator that subscribes to all events and forwards them
 	svc := simple.New("svc",
 		simple.WithPriority(50000),
 		simple.OnInit(func(gadgetCtx operators.GadgetContext) error {
-			// Create payload buffer
-			outputBuffer := make(chan *api.GadgetEvent, s.eventBufferLength)
-
 			log := gadgetCtx.Logger()
 
 			go func() {
@@ -125,7 +232,7 @@ func (s *Service) RunGadget(runGadget api.GadgetManager_RunGadgetServer) error {
 			seq := uint32(0)
 			var seqLock sync.Mutex
 
-			gi, err := gadgetCtx.SerializeGadgetInfo()
+			gi, err := gadgetCtx.SerializeGadgetInfo(false)
 			if err != nil {
 				return fmt.Errorf("serializing gadget info: %w", err)
 			}
@@ -183,7 +290,7 @@ func (s *Service) RunGadget(runGadget api.GadgetManager_RunGadgetServer) error {
 	)
 
 	ops := make([]operators.DataOperator, 0)
-	for _, op := range operators.GetDataOperators() {
+	for op := range s.operators {
 		ops = append(ops, op)
 	}
 	ops = append(ops, svc)
@@ -194,6 +301,7 @@ func (s *Service) RunGadget(runGadget api.GadgetManager_RunGadgetServer) error {
 		gadgetcontext.WithLogger(logger),
 		gadgetcontext.WithDataOperators(ops...),
 		gadgetcontext.WithTimeout(time.Duration(ociRequest.Timeout)),
+		gadgetcontext.WithAsRemoteCall(true),
 	)
 
 	runtimeParams := s.runtime.ParamDescs().ToParams()

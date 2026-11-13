@@ -27,10 +27,13 @@ func (r *Runtime) GetGadgetInfo(gadgetCtx runtime.GadgetContext, runtimeParams *
 	if err != nil {
 		return nil, fmt.Errorf("initializing and preparing operators: %w", err)
 	}
-
-	return gadgetCtx.SerializeGadgetInfo()
+	return gadgetCtx.SerializeGadgetInfo(gadgetCtx.ExtraInfo())
 }
 
 func (r *Runtime) RunGadget(gadgetCtx runtime.GadgetContext, runtimeParams *params.Params, paramValues api.ParamValues) error {
 	return gadgetCtx.Run(paramValues)
+}
+
+func (r *Runtime) IsClient() bool {
+	return false
 }

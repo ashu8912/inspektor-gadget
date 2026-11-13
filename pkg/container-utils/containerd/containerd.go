@@ -20,9 +20,9 @@ import (
 	"time"
 
 	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/pkg/cri/constants"
+	"github.com/containerd/errdefs"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -72,6 +72,7 @@ func NewContainerdClient(socketPath string, protocol string, config *containerut
 
 	dialCtx, cancelFunc := context.WithTimeout(context.TODO(), DefaultTimeout)
 	defer cancelFunc()
+	//nolint:staticcheck
 	grpcConn, err := grpc.DialContext(
 		dialCtx,
 		"unix:"+socketPath,
@@ -313,6 +314,14 @@ func (c *ContainerdClient) buildContainerData(container containerd.Container, ta
 		return nil, fmt.Errorf("getting image of container %q: %w", container.ID(), err)
 	}
 
+	containerImageDigest := image.Target().Digest.String()
+	containerImageID := containerImageDigest
+	if imageConfig, err := image.Config(c.ctx); err == nil {
+		containerImageID = imageConfig.Digest.String()
+	} else {
+		log.Debugf("getting image config for container %q: %s. Falling back to using the image digest as the image ID", container.ID(), err)
+	}
+
 	// When `task` is nil, state is getting set to `Running` for the following reasons:
 	// 1. `buildContainerData` is called by `GetContainer`, which is only getting called on
 	//    new created containers
@@ -325,14 +334,13 @@ func (c *ContainerdClient) buildContainerData(container containerd.Container, ta
 
 	containerData := &runtimeclient.ContainerData{
 		Runtime: runtimeclient.RuntimeContainerData{
-			BasicRuntimeMetadata: types.BasicRuntimeMetadata{
-				ContainerID:          container.ID(),
-				ContainerName:        getContainerName(container, labels),
-				RuntimeName:          types.RuntimeNameContainerd,
-				ContainerImageName:   image.Name(),
-				ContainerImageDigest: image.Metadata().Target.Digest.String(),
-			},
-			State: taskState,
+			ContainerID:          container.ID(),
+			ContainerName:        getContainerName(container, labels),
+			RuntimeName:          types.RuntimeNameContainerd,
+			ContainerImageName:   image.Name(),
+			ContainerImageID:     containerImageID,
+			ContainerImageDigest: containerImageDigest,
+			State:                taskState,
 		},
 	}
 	runtimeclient.EnrichWithK8sMetadata(containerData, labels)

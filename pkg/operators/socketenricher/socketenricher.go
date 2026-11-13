@@ -20,13 +20,14 @@ package socketenricher
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/cilium/ebpf"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
+	apihelpers "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api-helpers"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/params"
 	tracer "github.com/inspektor-gadget/inspektor-gadget/pkg/socketenricher"
@@ -34,6 +35,9 @@ import (
 
 const (
 	OperatorName = "SocketEnricher"
+	BTFSpecKey   = "socketEnricherbtf"
+	BTFStructKey = "socketEnricherStruct"
+	fieldsParam  = "socket-enricher-fields"
 )
 
 type SocketEnricherInterface interface {
@@ -44,6 +48,7 @@ type SocketEnricher struct {
 	mu             sync.Mutex
 	socketEnricher *tracer.SocketEnricher
 	refCount       int
+	seConfig       *tracer.Config
 }
 
 func (s *SocketEnricher) Name() string {
@@ -55,34 +60,54 @@ func (s *SocketEnricher) Description() string {
 }
 
 func (s *SocketEnricher) GlobalParamDescs() params.ParamDescs {
-	return nil
+	return params.ParamDescs{
+		{
+			Key:   fieldsParam,
+			Title: "Socket enricher fields",
+			Description: "List of optional fields and their sizes to be enabled on the socket enricher using the `field0=size,field1=size,...` format. " +
+				"Disabling or reducing the size of the optional fields can reduce the memory and CPU usage of Inspektor Gadget. " +
+				"Passing 0 as the size will use the default size of 512 bytes. If a field is not present on the list, then it's disabled.",
+			DefaultValue: "cwd=512,exepath=512",
+			TypeHint:     params.TypeStringSlice,
+		},
+	}
 }
 
 func (s *SocketEnricher) ParamDescs() params.ParamDescs {
 	return nil
 }
 
-func (s *SocketEnricher) Dependencies() []string {
-	return nil
-}
-
-func (s *SocketEnricher) CanOperateOn(gadget gadgets.GadgetDesc) bool {
-	gi, ok := gadget.(gadgets.GadgetInstantiate)
-	if !ok {
-		return false
-	}
-
-	instance, err := gi.NewInstance()
-	if err != nil {
-		log.Warnf("failed to create dummy %s instance: %s", OperatorName, err)
-		return false
-	}
-
-	_, hasSocketEnricherInterface := instance.(SocketEnricherInterface)
-	return hasSocketEnricherInterface
-}
-
 func (s *SocketEnricher) Init(params *params.Params) error {
+	fields := params.Get(fieldsParam).AsStringSlice()
+
+	s.seConfig = &tracer.Config{}
+
+	for _, field := range fields {
+		sizeStr := "512"
+
+		parts := strings.SplitN(field, "=", 2)
+		field := parts[0]
+		if len(parts) >= 2 {
+			sizeStr = parts[1]
+		}
+
+		size, err := strconv.ParseUint(sizeStr, 10, 32)
+		if err != nil {
+			return fmt.Errorf("invalid size for field %s: %w", field, err)
+		}
+
+		switch field {
+		case "cwd":
+			s.seConfig.Cwd.Enabled = true
+			s.seConfig.Cwd.Size = uint32(size)
+		case "exepath":
+			s.seConfig.Exepath.Enabled = true
+			s.seConfig.Exepath.Size = uint32(size)
+		default:
+			return fmt.Errorf("unsupported field: %s", field)
+		}
+	}
+
 	return nil
 }
 
@@ -95,14 +120,6 @@ func (s *SocketEnricher) Close() error {
 		s.socketEnricher = nil
 	}
 	return nil
-}
-
-func (s *SocketEnricher) Instantiate(gadgetCtx operators.GadgetContext, gadgetInstance any, params *params.Params) (operators.OperatorInstance, error) {
-	return &SocketEnricherInstance{
-		gadgetCtx:      gadgetCtx,
-		manager:        s,
-		gadgetInstance: gadgetInstance,
-	}, nil
 }
 
 type SocketEnricherInstance struct {
@@ -125,7 +142,7 @@ func (i *SocketEnricherInstance) PreGadgetRun() error {
 	defer i.manager.mu.Unlock()
 
 	if i.manager.refCount == 0 {
-		t, err := tracer.NewSocketEnricher()
+		t, err := tracer.NewSocketEnricher(*i.manager.seConfig)
 		if err != nil {
 			return err
 		}
@@ -157,7 +174,7 @@ func (i *SocketEnricherInstance) EnrichEvent(ev any) error {
 }
 
 func (s *SocketEnricher) GlobalParams() api.Params {
-	return nil
+	return apihelpers.ParamDescsToParams(s.GlobalParamDescs())
 }
 
 func (s *SocketEnricher) InstanceParams() api.Params {
@@ -182,7 +199,19 @@ func (s *SocketEnricher) Priority() int {
 }
 
 func (i *SocketEnricherInstance) PreStart(gadgetCtx operators.GadgetContext) error {
-	return i.PreGadgetRun()
+	err := i.PreGadgetRun()
+	if err != nil {
+		return err
+	}
+
+	btfSpec, btfStruct, err := i.manager.socketEnricher.BTFSpec()
+	if err != nil {
+		return err
+	}
+
+	gadgetCtx.SetVar(BTFSpecKey, btfSpec)
+	gadgetCtx.SetVar(BTFStructKey, btfStruct)
+	return nil
 }
 
 func (i *SocketEnricherInstance) Start(gadgetCtx operators.GadgetContext) error {
@@ -193,6 +222,10 @@ func (i *SocketEnricherInstance) Stop(gadgetCtx operators.GadgetContext) error {
 	return i.PostGadgetRun()
 }
 
+func (i *SocketEnricherInstance) Close(gadgetCtx operators.GadgetContext) error {
+	return nil
+}
+
 func (i *SocketEnricherInstance) SetSocketEnricherMap(m *ebpf.Map) {
 	i.gadgetCtx.Logger().Debugf("setting sockets map")
 	i.gadgetCtx.SetVar(tracer.SocketsMapName, m)
@@ -200,6 +233,5 @@ func (i *SocketEnricherInstance) SetSocketEnricherMap(m *ebpf.Map) {
 
 func init() {
 	op := &SocketEnricher{}
-	operators.Register(op)
 	operators.RegisterDataOperator(op)
 }

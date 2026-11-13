@@ -62,6 +62,7 @@ func NewCachedMap[Key comparable, T any](oldEntryTTL time.Duration) CachedMap[Ke
 
 func (c *cachedMap[Key, T]) Close() {
 	close(c.exit)
+	c.Clear()
 }
 
 func (c *cachedMap[Key, T]) Clear() {
@@ -159,6 +160,9 @@ func (c *cachedMap[Key, T]) Get(key Key) (T, bool) {
 	return zeroValue, false
 }
 
+// GetCmp returns the first object for which the cmp function returns true
+// The cmp function is applied to both current and old objects until a match is found
+// This is an expensive operation and should be used with caution
 func (c *cachedMap[Key, T]) GetCmp(cmp func(T) bool) (T, bool) {
 	c.RLock()
 	defer c.RUnlock()

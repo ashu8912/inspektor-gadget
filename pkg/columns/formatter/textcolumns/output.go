@@ -17,6 +17,7 @@ package textcolumns
 import (
 	"bytes"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/columns"
@@ -25,7 +26,7 @@ import (
 )
 
 func (tf *TextColumnsFormatter[T]) setFormatter(column *Column[T]) {
-	ff := columns.GetFieldAsStringExt[T](column.col, 'f', column.col.Precision)
+	ff := columns.GetFieldAsStringExt[T](column.col, 'f', column.col.Precision, column.col.Hex)
 	column.formatter = func(entry *T) string {
 		return tf.buildFixedString(ff(entry), column.calculatedWidth, column.col.EllipsisType, column.col.Alignment)
 	}
@@ -36,6 +37,11 @@ func (tf *TextColumnsFormatter[T]) buildFixedString(s string, length int, ellips
 		return ""
 	}
 
+	// Escape the string to avoid the terminal to interpret escape sequence when
+	// printing and remove first and last character as they are quotes added by
+	// strconv.Quote().
+	s = strconv.Quote(s)
+	s = s[1 : len(s)-1]
 	if !tf.options.ShouldTruncate {
 		return s
 	}
@@ -77,6 +83,9 @@ func (tf *TextColumnsFormatter[T]) FormatHeader() string {
 			row.WriteString(tf.options.ColumnDivider)
 		}
 		name := column.col.Name
+		if column.col.Alias != "" {
+			name = column.col.Alias
+		}
 		switch tf.options.HeaderStyle {
 		case HeaderStyleUppercase:
 			name = strings.ToUpper(name)

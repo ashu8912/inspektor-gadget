@@ -8,11 +8,18 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
 
-type socketenricherSocketsKey struct {
+type socketenricherBufT struct {
+	_   structs.HostLayout
+	Buf [32768]uint8
+}
+
+type socketenricherGadgetSocketKey struct {
+	_      structs.HostLayout
 	Netns  uint32
 	Family uint16
 	Proto  uint8
@@ -21,16 +28,44 @@ type socketenricherSocketsKey struct {
 	_      [2]byte
 }
 
-type socketenricherSocketsValue struct {
-	Mntns             uint64
-	PidTgid           uint64
-	UidGid            uint64
-	Task              [16]int8
-	Sock              uint64
-	DeletionTimestamp uint64
-	Ipv6only          int8
-	_                 [7]byte
+type socketenricherGadgetSocketValue struct {
+	_                   structs.HostLayout
+	Mntns               uint64
+	PidTgid             uint64
+	UidGid              uint64
+	Task                [16]int8
+	Ptask               [16]int8
+	Sock                uint64
+	DeletionTimestamp   uint64
+	Ppid                uint32
+	Ptid                uint32
+	Ipv6only            int8
+	_                   [7]byte
+	OptionalFieldsStart [0]int8
+	Cwd                 [4096]int8
+	Exepath             [4096]int8
 }
+
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	socketenricherMapBufs                = "bufs"
+	socketenricherMapGadgetSockets       = "gadget_sockets"
+	socketenricherMapIgTmpSocketsValue   = "ig_tmp_sockets_value"
+	socketenricherMapStart               = "start"
+	socketenricherProgIgBindIpv4E        = "ig_bind_ipv4_e"
+	socketenricherProgIgBindIpv4X        = "ig_bind_ipv4_x"
+	socketenricherProgIgBindIpv6E        = "ig_bind_ipv6_e"
+	socketenricherProgIgBindIpv6X        = "ig_bind_ipv6_x"
+	socketenricherProgIgFreeIpv4E        = "ig_free_ipv4_e"
+	socketenricherProgIgFreeIpv6E        = "ig_free_ipv6_e"
+	socketenricherProgIgTcpCoE           = "ig_tcp_co_e"
+	socketenricherProgIgTcpCoX           = "ig_tcp_co_x"
+	socketenricherProgIgUdp6Sendmsg      = "ig_udp6_sendmsg"
+	socketenricherProgIgUdpSendmsg       = "ig_udp_sendmsg"
+	socketenricherVarDisableBpfIterators = "disable_bpf_iterators"
+)
 
 // loadSocketenricher returns the embedded CollectionSpec for socketenricher.
 func loadSocketenricher() (*ebpf.CollectionSpec, error) {
@@ -52,7 +87,7 @@ func loadSocketenricher() (*ebpf.CollectionSpec, error) {
 //	*socketenricherMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadSocketenricherObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadSocketenricherObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadSocketenricher()
 	if err != nil {
 		return err
@@ -67,9 +102,10 @@ func loadSocketenricherObjects(obj interface{}, opts *ebpf.CollectionOptions) er
 type socketenricherSpecs struct {
 	socketenricherProgramSpecs
 	socketenricherMapSpecs
+	socketenricherVariableSpecs
 }
 
-// socketenricherSpecs contains programs before they are loaded into the kernel.
+// socketenricherProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type socketenricherProgramSpecs struct {
@@ -89,8 +125,17 @@ type socketenricherProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type socketenricherMapSpecs struct {
-	GadgetSockets *ebpf.MapSpec `ebpf:"gadget_sockets"`
-	Start         *ebpf.MapSpec `ebpf:"start"`
+	Bufs              *ebpf.MapSpec `ebpf:"bufs"`
+	GadgetSockets     *ebpf.MapSpec `ebpf:"gadget_sockets"`
+	IgTmpSocketsValue *ebpf.MapSpec `ebpf:"ig_tmp_sockets_value"`
+	Start             *ebpf.MapSpec `ebpf:"start"`
+}
+
+// socketenricherVariableSpecs contains global variables before they are loaded into the kernel.
+//
+// It can be passed ebpf.CollectionSpec.Assign.
+type socketenricherVariableSpecs struct {
+	DisableBpfIterators *ebpf.VariableSpec `ebpf:"disable_bpf_iterators"`
 }
 
 // socketenricherObjects contains all objects after they have been loaded into the kernel.
@@ -99,6 +144,7 @@ type socketenricherMapSpecs struct {
 type socketenricherObjects struct {
 	socketenricherPrograms
 	socketenricherMaps
+	socketenricherVariables
 }
 
 func (o *socketenricherObjects) Close() error {
@@ -112,15 +158,26 @@ func (o *socketenricherObjects) Close() error {
 //
 // It can be passed to loadSocketenricherObjects or ebpf.CollectionSpec.LoadAndAssign.
 type socketenricherMaps struct {
-	GadgetSockets *ebpf.Map `ebpf:"gadget_sockets"`
-	Start         *ebpf.Map `ebpf:"start"`
+	Bufs              *ebpf.Map `ebpf:"bufs"`
+	GadgetSockets     *ebpf.Map `ebpf:"gadget_sockets"`
+	IgTmpSocketsValue *ebpf.Map `ebpf:"ig_tmp_sockets_value"`
+	Start             *ebpf.Map `ebpf:"start"`
 }
 
 func (m *socketenricherMaps) Close() error {
 	return _SocketenricherClose(
+		m.Bufs,
 		m.GadgetSockets,
+		m.IgTmpSocketsValue,
 		m.Start,
 	)
+}
+
+// socketenricherVariables contains all global variables after they have been loaded into the kernel.
+//
+// It can be passed to loadSocketenricherObjects or ebpf.CollectionSpec.LoadAndAssign.
+type socketenricherVariables struct {
+	DisableBpfIterators *ebpf.Variable `ebpf:"disable_bpf_iterators"`
 }
 
 // socketenricherPrograms contains all programs after they have been loaded into the kernel.

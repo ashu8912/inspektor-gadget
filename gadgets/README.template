@@ -1,0 +1,42 @@
+---
+title: {{ (datasource "gadget").name }}
+sidebar_position: 900
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# {{ (datasource "gadget").name }}
+
+{{ (datasource "gadget").description }}
+
+## Requirements
+
+TODO
+
+## Getting started
+
+Running the gadget:
+
+{{ $image := index (index (index (datasource "artifacthubpkg") "containersImages") 0) "image" -}}
+<Tabs groupId="env">
+    <TabItem value="kubectl-gadget" label="kubectl gadget">
+        ```bash
+        $ kubectl gadget run {{ $image }} [flags]
+        ```
+    </TabItem>
+
+    <TabItem value="ig" label="ig">
+        ```bash
+        $ sudo ig run {{ $image }} [flags]
+        ```
+    </TabItem>
+</Tabs>
+
+## Flags
+
+TODO
+
+## Guide
+
+TODO
